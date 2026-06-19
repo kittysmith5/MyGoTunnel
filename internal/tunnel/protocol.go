@@ -3,12 +3,27 @@ package tunnel
 import (
 	"bufio"
 	"fmt"
-	"net"
+	"io"
 	"strings"
 )
 
-func SendAuth(conn net.Conn, token string) error {
-	_, err := fmt.Fprintf(conn, "AUTH %s\n", token)
+func SendAuth(w io.Writer, token string) error {
+	_, err := fmt.Fprintf(w, "AUTH %s\n", token)
+	return err
+}
+
+func SendConnect(w io.Writer, targetAddr string) error {
+	_, err := fmt.Fprintf(w, "CONNECT %s\n", targetAddr)
+	return err
+}
+
+func SendOK(w io.Writer) error {
+	_, err := w.Write([]byte("OK\n"))
+	return err
+}
+
+func SendERR(w io.Writer) error {
+	_, err := w.Write([]byte("ERR\n"))
 	return err
 }
 
@@ -19,19 +34,4 @@ func ReadLine(reader *bufio.Reader) (string, error) {
 	}
 
 	return strings.TrimSpace(line), nil
-}
-
-func SendConnect(conn net.Conn, targetAddr string) error {
-	_, err := fmt.Fprintf(conn, "CONNECT %s\n", targetAddr)
-	return err
-}
-
-func SendOK(conn net.Conn) error {
-	_, err := conn.Write([]byte("OK\n"))
-	return err
-}
-
-func SendERR(conn net.Conn) error {
-	_, err := conn.Write([]byte("ERR\n"))
-	return err
 }

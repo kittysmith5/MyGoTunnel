@@ -2,32 +2,44 @@ package relay
 
 import (
 	"io"
-	"net"
 )
 
-// sha?
+type ReadWriteCloser interface {
+	io.Reader
+	io.Writer
+	io.Closer
+}
+
 type closeWriter interface {
 	CloseWrite() error
 }
 
-func closeWrite(conn net.Conn) {
-	if cw, ok := conn.(closeWriter); ok {
+func closeWriteOrClose(c io.Closer) {
+	if cw, ok := c.(closeWriter); ok {
 		_ = cw.CloseWrite()
+		return
 	}
+
+	_ = c.Close()
 }
 
-func CopyBidirectional(a net.Conn, aReader io.Reader, b net.Conn, bReader io.Reader) {
+func CopyBidirectional(
+	a ReadWriteCloser,
+	aReader io.Reader,
+	b ReadWriteCloser,
+	bReader io.Reader,
+) {
 	errCh := make(chan error, 2)
 
 	go func() {
 		_, err := io.Copy(b, aReader)
-		closeWrite(b)
+		closeWriteOrClose(b)
 		errCh <- err
 	}()
 
 	go func() {
 		_, err := io.Copy(a, bReader)
-		closeWrite(a)
+		closeWriteOrClose(a)
 		errCh <- err
 	}()
 

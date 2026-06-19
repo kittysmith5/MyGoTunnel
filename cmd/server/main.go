@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/mux"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/tunnel"
 )
@@ -61,46 +62,80 @@ func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig) {
 
 	reader := bufio.NewReader(tunnelConn)
 
+	// 1. TLS 连接建立后，先 AUTH 一次
 	if !checkAuth(tunnelConn, reader, cfg.AuthToken) {
 		fmt.Println("[server] auth failed:", remoteAddr)
 		return
 	}
 
+	fmt.Println("[server] auth success:", remoteAddr)
+
+	// 2. AUTH 成功后，这条 TLS 连接交给 mux 管理
+	sess := mux.NewSession(tunnelConn, mux.ModeServer)
+	defer sess.Close()
+
+	fmt.Println("[server] mux session started:", remoteAddr)
+
+	// 3. 一个 TLS 连接里循环接收多个逻辑 Stream
+	for {
+		stream, err := sess.AcceptStream()
+		if err != nil {
+			fmt.Println("[server] accept stream error:", err)
+			return
+		}
+
+		fmt.Println("[server] accept stream:", stream.ID())
+
+		go handleStream(stream)
+	}
+}
+
+func handleStream(stream *mux.Stream) {
+	defer stream.Close()
+
+	reader := bufio.NewReader(stream)
+
+	// 1. 每个 stream 里读取 CONNECT target
 	line, err := tunnel.ReadLine(reader)
 	if err != nil {
-		fmt.Println("[server] read connect line error:", err)
+		fmt.Println("[server] read stream connect error:", err)
 		return
 	}
 
 	if !strings.HasPrefix(line, "CONNECT ") {
-		fmt.Println("[server] invalid command:", line)
+		fmt.Println("[server] invalid stream command:", line)
+		_ = tunnel.SendERR(stream)
 		return
 	}
 
 	targetAddr := strings.TrimSpace(strings.TrimPrefix(line, "CONNECT "))
 	if targetAddr == "" {
 		fmt.Println("[server] empty target addr")
+		_ = tunnel.SendERR(stream)
 		return
 	}
 
-	fmt.Println("[server] connect target:", targetAddr)
+	fmt.Printf("[server] stream %d connect target: %s\n", stream.ID(), targetAddr)
 
+	// 2. 远端连接真实目标
 	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
 		fmt.Println("[server] dial target error:", err)
-		_ = tunnel.SendERR(tunnelConn)
+		_ = tunnel.SendERR(stream)
 		return
 	}
 	defer targetConn.Close()
 
-	if err := tunnel.SendOK(tunnelConn); err != nil {
+	// 3. 告诉 client：目标连接成功
+	if err := tunnel.SendOK(stream); err != nil {
 		fmt.Println("[server] send OK error:", err)
 		return
 	}
 
-	relay.CopyBidirectional(tunnelConn, reader, targetConn, targetConn)
+	// 4. stream <-> targetConn 双向转发
+	relay.CopyBidirectional(stream, reader, targetConn, targetConn)
 
-	fmt.Println("[server] tunnel closed:", remoteAddr)
+	fmt.Println("[server] stream closed:", stream.ID())
 }
 
 func checkAuth(conn net.Conn, reader *bufio.Reader, expectedToken string) bool {
