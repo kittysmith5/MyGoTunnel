@@ -36,7 +36,9 @@ func loadConfig(path string) (*Config, error) {
 	}
 
 	if cfg.LocalPort == "" {
-		cfg.LocalPort = ":9001"
+		listenAddr = ":9001"
+	} else {
+		listenAddr = cfg.LocalPort
 	}
 
 	if cfg.AuthToken == "" {
