@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -11,14 +12,17 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
 	LocalAddr  string `json:"local_addr"`
 	RemoteAddr string `json:"remote_addr"`
+	AuthToken  string `json:"auth_token"`
 }
 
 var remoteAddr string = ""
+var authToken string = ""
 
 func loadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -37,8 +41,15 @@ func loadConfig(path string) (*Config, error) {
 
 	if cfg.RemoteAddr == "" {
 		return nil, fmt.Errorf("remote_addr is empty")
+	} else {
+		remoteAddr = cfg.RemoteAddr
 	}
-	remoteAddr = cfg.RemoteAddr
+
+	if cfg.AuthToken == "" {
+		return nil, fmt.Errorf("auth_token is empty")
+	} else {
+		authToken = cfg.AuthToken
+	}
 	return &cfg, nil
 }
 
@@ -95,9 +106,11 @@ func handleClient(clientConn net.Conn) {
 	}
 
 	fmt.Println("[local] request target:", targetAddr)
-
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
 	// 3. 连接远端节点
-	remoteConn, err := net.Dial("tcp", remoteAddr)
+	remoteConn, err := tls.Dial("tcp", remoteAddr, tlsConfig)
 	if err != nil {
 		fmt.Println("[local] dial remote error:", err)
 		_ = socks5Reply(clientConn, 0x01)
@@ -106,7 +119,29 @@ func handleClient(clientConn net.Conn) {
 	defer remoteConn.Close()
 
 	// 4. 给远端节点发送自定义 tunnel 协议
-	_, err = fmt.Printf("CONNECT %s\n", targetAddr)
+	// 4.1. 先发送 AUTH
+	_, err = fmt.Fprintf(remoteConn, "AUTH %s\n", authToken)
+	if err != nil {
+		fmt.Println("[client] send AUTH error:", err)
+		return
+	}
+
+	remoteReader := bufio.NewReader(remoteConn)
+
+	// 4.2. 等服务端返回 OK
+	authResp, err := remoteReader.ReadString('\n')
+	if err != nil {
+		fmt.Println("[client] read AUTH response error:", err)
+		return
+	}
+
+	authResp = strings.TrimSpace(authResp)
+
+	if authResp != "OK" {
+		fmt.Println("[client] auth failed:", authResp)
+		return
+	}
+
 	_, err = fmt.Fprintf(remoteConn, "CONNECT %s\n", targetAddr)
 	if err != nil {
 		fmt.Println("[local] send CONNECT to remote error:", err)
@@ -114,7 +149,7 @@ func handleClient(clientConn net.Conn) {
 		return
 	}
 
-	remoteReader := bufio.NewReader(remoteConn)
+	// remoteReader := bufio.NewReader(remoteConn)
 
 	// 5. 等待远端返回 OK
 	line, err := remoteReader.ReadString('\n')
@@ -199,7 +234,7 @@ func socks5ReadRequest(conn net.Conn) (string, error) {
 	}
 
 	if cmd != 0x01 {
-		return "", errors.New("only CONNECT is supported")
+		return "", errors.New("only TCP CONNECT is supported")
 	}
 
 	var host string
