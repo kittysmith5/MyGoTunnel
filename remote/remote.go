@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -12,7 +13,16 @@ import (
 const listenAddr = ":19001"
 
 func main() {
-	ln, err := net.Listen("tcp", listenAddr)
+	cert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
+	if err != nil {
+		panic(err)
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+
+	ln, err := tls.Listen("tcp", ":9001", tlsConfig)
 	if err != nil {
 		panic(err)
 	}

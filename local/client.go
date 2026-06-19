@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -95,9 +96,11 @@ func handleClient(clientConn net.Conn) {
 	}
 
 	fmt.Println("[local] request target:", targetAddr)
-
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
 	// 3. 连接远端节点
-	remoteConn, err := net.Dial("tcp", remoteAddr)
+	remoteConn, err := tls.Dial("tcp", remoteAddr, tlsConfig)
 	if err != nil {
 		fmt.Println("[local] dial remote error:", err)
 		_ = socks5Reply(clientConn, 0x01)
