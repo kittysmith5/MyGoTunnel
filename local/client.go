@@ -142,7 +142,6 @@ func handleClient(clientConn net.Conn) {
 		return
 	}
 
-	_, err = fmt.Printf("CONNECT %s\n", targetAddr)
 	_, err = fmt.Fprintf(remoteConn, "CONNECT %s\n", targetAddr)
 	if err != nil {
 		fmt.Println("[local] send CONNECT to remote error:", err)
@@ -235,7 +234,7 @@ func socks5ReadRequest(conn net.Conn) (string, error) {
 	}
 
 	if cmd != 0x01 {
-		return "", errors.New("only CONNECT is supported")
+		return "", errors.New("only TCP CONNECT is supported")
 	}
 
 	var host string
