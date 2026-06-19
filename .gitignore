@@ -1,2 +1,2 @@
-configs/*
-certs/*
+configs/*.json
+certs/*.pem
