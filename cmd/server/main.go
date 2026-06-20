@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/subtle"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net"
@@ -47,6 +48,10 @@ func main() {
 		Addr:              cfg.ListenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		TLSConfig: &tls.Config{
+			NextProtos: []string{"http/1.1"},
+		},
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
 
 	fmt.Println("[server] WebSocket listening on", cfg.ListenAddr, "path", cfg.WSPath)
