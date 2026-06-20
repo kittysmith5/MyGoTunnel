@@ -11,6 +11,7 @@ type ClientConfig struct {
 	RemoteAddr string `json:"remote_addr"`
 	AuthToken  string `json:"auth_token"`
 	WSPath     string `json:"ws_path"`
+	SNI        string `json:"sni"`
 }
 
 func LoadClientConfig(path string) (*ClientConfig, error) {
@@ -39,6 +40,8 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	if cfg.WSPath == "" {
 		cfg.WSPath = "/tunnel"
 	}
-
+	if cfg.SNI == "" {
+		cfg.SNI = "www.apple.com"
+	}
 	return &cfg, nil
 }

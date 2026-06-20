@@ -28,6 +28,11 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc(cfg.WSPath, func(w http.ResponseWriter, r *http.Request) {
+		if !isWebSocketRequest(r) {
+			serveFallback(w, r)
+			return
+		}
+
 		conn, err := wsconn.Accept(w, r)
 		if err != nil {
 			fmt.Println("[server] websocket accept error:", err)
@@ -36,6 +41,7 @@ func main() {
 
 		go handleTunnel(conn, cfg)
 	})
+	mux.HandleFunc("/", serveFallback)
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -47,6 +53,27 @@ func main() {
 	if err := server.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile); err != nil {
 		panic(err)
 	}
+}
+
+func isWebSocketRequest(r *http.Request) bool {
+	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+}
+
+func serveFallback(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "max-age=300")
+	_, _ = w.Write([]byte(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Welcome</title>
+</head>
+<body>
+  <h1>Welcome</h1>
+</body>
+</html>`))
 }
 
 func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig) {

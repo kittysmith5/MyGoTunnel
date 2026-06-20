@@ -66,7 +66,7 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig) {
 	fmt.Println("[client] target:", targetAddr)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	remoteConn, err := wsconn.Dial(ctx, cfg.RemoteAddr, cfg.WSPath)
+	remoteConn, err := wsconn.Dial(ctx, cfg.RemoteAddr, cfg.WSPath, cfg.SNI)
 	cancel()
 	if err != nil {
 		fmt.Println("[client] dial remote WebSocket error:", err)
