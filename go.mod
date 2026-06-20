@@ -2,10 +2,7 @@ module mygotunnel
 
 go 1.24
 
-require (
-	github.com/coder/websocket v1.8.15
-	github.com/refraction-networking/utls v1.8.2
-)
+require github.com/refraction-networking/utls v1.8.2
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect

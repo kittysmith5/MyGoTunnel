@@ -12,7 +12,7 @@ import (
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
-	"mygotunnel/internal/wsconn"
+	"mygotunnel/internal/utlsconn"
 )
 
 func main() {
@@ -32,7 +32,7 @@ func main() {
 	defer ln.Close()
 
 	fmt.Println("[client] SOCKS5 listening on", cfg.LocalAddr)
-	fmt.Println("[client] remote WebSocket node:", cfg.RemoteAddr)
+	fmt.Println("[client] remote uTLS node:", cfg.RemoteAddr)
 
 	for {
 		conn, err := ln.Accept()
@@ -66,10 +66,10 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig) {
 	fmt.Println("[client] target:", targetAddr)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	remoteConn, err := wsconn.Dial(ctx, cfg.RemoteAddr, cfg.WSPath, cfg.SNI)
+	remoteConn, err := utlsconn.Dial(ctx, cfg.RemoteAddr, cfg.SNI)
 	cancel()
 	if err != nil {
-		fmt.Println("[client] dial remote WebSocket error:", err)
+		fmt.Println("[client] dial remote uTLS error:", err)
 		_ = socks5.Reply(clientConn, 0x01)
 		return
 	}

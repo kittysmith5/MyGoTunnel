@@ -7,14 +7,12 @@ import (
 	"flag"
 	"fmt"
 	"net"
-	"net/http"
 	"strings"
 	"time"
 
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/tunnel"
-	"mygotunnel/internal/wsconn"
 )
 
 func main() {
@@ -27,58 +25,33 @@ func main() {
 		return
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc(cfg.WSPath, func(w http.ResponseWriter, r *http.Request) {
-		if !isWebSocketRequest(r) {
-			serveFallback(w, r)
-			return
-		}
+	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		panic(err)
+	}
 
-		conn, err := wsconn.Accept(w, r)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1"},
+	}
+
+	ln, err := tls.Listen("tcp", cfg.ListenAddr, tlsConfig)
+	if err != nil {
+		panic(err)
+	}
+	defer ln.Close()
+
+	fmt.Println("[server] uTLS-compatible TLS listening on", cfg.ListenAddr)
+
+	for {
+		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Println("[server] websocket accept error:", err)
-			return
+			fmt.Println("[server] accept error:", err)
+			continue
 		}
 
 		go handleTunnel(conn, cfg)
-	})
-	mux.HandleFunc("/", serveFallback)
-
-	server := &http.Server{
-		Addr:              cfg.ListenAddr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		TLSConfig: &tls.Config{
-			NextProtos: []string{"http/1.1"},
-		},
-		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
-
-	fmt.Println("[server] WebSocket listening on", cfg.ListenAddr, "path", cfg.WSPath)
-	if err := server.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile); err != nil {
-		panic(err)
-	}
-}
-
-func isWebSocketRequest(r *http.Request) bool {
-	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
-		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
-}
-
-func serveFallback(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "max-age=300")
-	_, _ = w.Write([]byte(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Welcome</title>
-</head>
-<body>
-  <h1>Welcome</h1>
-</body>
-</html>`))
 }
 
 func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig) {
