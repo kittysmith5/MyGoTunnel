@@ -33,4 +33,5 @@ func CopyBidirectional(a io.WriteCloser, aReader io.Reader, b io.WriteCloser, bR
 	}()
 
 	<-errCh
+	<-errCh
 }
