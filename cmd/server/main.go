@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/subtle"
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -13,7 +15,11 @@ import (
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/tunnel"
+
+	"github.com/quic-go/quic-go"
 )
+
+const nextProto = "mygotunnel-quic"
 
 func main() {
 	configPath := flag.String("config", "configs/server.json", "config file path")
@@ -32,36 +38,55 @@ func main() {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{nextProto},
 	}
 
-	ln, err := tls.Listen("tcp", cfg.ListenAddr, tlsConfig)
+	ln, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, &quic.Config{
+		KeepAlivePeriod:    20 * time.Second,
+		MaxIdleTimeout:     60 * time.Second,
+		MaxIncomingStreams: 1024,
+	})
 	if err != nil {
 		panic(err)
 	}
 	defer ln.Close()
 
-	fmt.Println("[server] listening on", cfg.ListenAddr)
+	fmt.Println("[server] QUIC listening on", cfg.ListenAddr)
 
 	for {
-		conn, err := ln.Accept()
+		conn, err := ln.Accept(context.Background())
 		if err != nil {
 			fmt.Println("[server] accept error:", err)
 			continue
 		}
 
-		go handleTunnel(conn, cfg)
+		go handleConnection(conn, cfg)
 	}
 }
 
-func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig) {
-	defer tunnelConn.Close()
+func handleConnection(conn *quic.Conn, cfg *config.ServerConfig) {
+	remoteAddr := conn.RemoteAddr().String()
+	fmt.Println("[server] QUIC connected:", remoteAddr)
 
-	remoteAddr := tunnelConn.RemoteAddr().String()
-	fmt.Println("[server] tunnel connected:", remoteAddr)
+	for {
+		stream, err := conn.AcceptStream(context.Background())
+		if err != nil {
+			fmt.Println("[server] accept stream error:", err)
+			return
+		}
 
-	reader := bufio.NewReader(tunnelConn)
+		go handleTunnel(stream, remoteAddr, cfg)
+	}
+}
 
-	if !checkAuth(tunnelConn, reader, cfg.AuthToken) {
+func handleTunnel(tunnelStream *quic.Stream, remoteAddr string, cfg *config.ServerConfig) {
+	defer tunnelStream.Close()
+
+	fmt.Println("[server] tunnel stream connected:", remoteAddr)
+
+	reader := bufio.NewReader(tunnelStream)
+
+	if !checkAuth(tunnelStream, reader, cfg.AuthToken) {
 		fmt.Println("[server] auth failed:", remoteAddr)
 		return
 	}
@@ -88,24 +113,30 @@ func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig) {
 	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
 		fmt.Println("[server] dial target error:", err)
-		_ = tunnel.SendERR(tunnelConn)
+		_ = tunnel.SendERR(tunnelStream)
 		return
 	}
 	defer targetConn.Close()
 
-	if err := tunnel.SendOK(tunnelConn); err != nil {
+	if err := tunnel.SendOK(tunnelStream); err != nil {
 		fmt.Println("[server] send OK error:", err)
 		return
 	}
 
-	relay.CopyBidirectional(tunnelConn, reader, targetConn, targetConn)
+	relay.CopyBidirectional(tunnelStream, reader, targetConn, targetConn)
 
 	fmt.Println("[server] tunnel closed:", remoteAddr)
 }
 
-func checkAuth(conn net.Conn, reader *bufio.Reader, expectedToken string) bool {
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
+type readDeadlineSetter interface {
+	SetReadDeadline(time.Time) error
+}
+
+func checkAuth(w io.Writer, reader *bufio.Reader, expectedToken string) bool {
+	if ds, ok := w.(readDeadlineSetter); ok {
+		_ = ds.SetReadDeadline(time.Now().Add(5 * time.Second))
+		defer ds.SetReadDeadline(time.Time{})
+	}
 
 	line, err := tunnel.ReadLine(reader)
 	if err != nil {
@@ -113,17 +144,17 @@ func checkAuth(conn net.Conn, reader *bufio.Reader, expectedToken string) bool {
 	}
 
 	if !strings.HasPrefix(line, "AUTH ") {
-		_ = tunnel.SendERR(conn)
+		_ = tunnel.SendERR(w)
 		return false
 	}
 
 	clientToken := strings.TrimSpace(strings.TrimPrefix(line, "AUTH "))
 
 	if subtle.ConstantTimeCompare([]byte(clientToken), []byte(expectedToken)) != 1 {
-		_ = tunnel.SendERR(conn)
+		_ = tunnel.SendERR(w)
 		return false
 	}
 
-	_ = tunnel.SendOK(conn)
+	_ = tunnel.SendOK(w)
 	return true
 }

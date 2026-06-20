@@ -2,16 +2,22 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
 	"net"
+	"time"
 
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
+
+	"github.com/quic-go/quic-go"
 )
+
+const nextProto = "mygotunnel-quic"
 
 func main() {
 	configPath := flag.String("config", "configs/client.json", "config file path")
@@ -30,7 +36,7 @@ func main() {
 	defer ln.Close()
 
 	fmt.Println("[client] SOCKS5 listening on", cfg.LocalAddr)
-	fmt.Println("[client] remote node:", cfg.RemoteAddr)
+	fmt.Println("[client] remote QUIC node:", cfg.RemoteAddr)
 
 	for {
 		conn, err := ln.Accept()
@@ -65,19 +71,35 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig) {
 
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
+		NextProtos:         []string{nextProto},
 	}
 
-	remoteConn, err := tls.Dial("tcp", cfg.RemoteAddr, tlsConfig)
+	dialCtx, cancelDial := context.WithTimeout(context.Background(), 10*time.Second)
+	quicConn, err := quic.DialAddr(dialCtx, cfg.RemoteAddr, tlsConfig, &quic.Config{
+		KeepAlivePeriod: 20 * time.Second,
+		MaxIdleTimeout:  60 * time.Second,
+	})
+	cancelDial()
 	if err != nil {
-		fmt.Println("[client] dial remote error:", err)
+		fmt.Println("[client] dial remote QUIC error:", err)
 		_ = socks5.Reply(clientConn, 0x01)
 		return
 	}
-	defer remoteConn.Close()
+	defer quicConn.CloseWithError(0, "")
 
-	remoteReader := bufio.NewReader(remoteConn)
+	streamCtx, cancelStream := context.WithTimeout(context.Background(), 10*time.Second)
+	stream, err := quicConn.OpenStreamSync(streamCtx)
+	cancelStream()
+	if err != nil {
+		fmt.Println("[client] open QUIC stream error:", err)
+		_ = socks5.Reply(clientConn, 0x01)
+		return
+	}
+	defer stream.Close()
 
-	if err := tunnel.SendAuth(remoteConn, cfg.AuthToken); err != nil {
+	remoteReader := bufio.NewReader(stream)
+
+	if err := tunnel.SendAuth(stream, cfg.AuthToken); err != nil {
 		fmt.Println("[client] send auth error:", err)
 		return
 	}
@@ -93,7 +115,7 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig) {
 		return
 	}
 
-	if err := tunnel.SendConnect(remoteConn, targetAddr); err != nil {
+	if err := tunnel.SendConnect(stream, targetAddr); err != nil {
 		fmt.Println("[client] send connect error:", err)
 		_ = socks5.Reply(clientConn, 0x01)
 		return
@@ -117,7 +139,7 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig) {
 		return
 	}
 
-	relay.CopyBidirectional(clientConn, clientConn, remoteConn, remoteReader)
+	relay.CopyBidirectional(clientConn, clientConn, stream, remoteReader)
 
 	fmt.Println("[client] closed:", clientAddr)
 }
