@@ -2,15 +2,17 @@ package main
 
 import (
 	"bufio"
-	"crypto/tls"
+	"context"
 	"flag"
 	"fmt"
 	"net"
+	"time"
 
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
+	"mygotunnel/internal/wsconn"
 )
 
 func main() {
@@ -30,7 +32,7 @@ func main() {
 	defer ln.Close()
 
 	fmt.Println("[client] SOCKS5 listening on", cfg.LocalAddr)
-	fmt.Println("[client] remote node:", cfg.RemoteAddr)
+	fmt.Println("[client] remote WebSocket node:", cfg.RemoteAddr)
 
 	for {
 		conn, err := ln.Accept()
@@ -63,13 +65,11 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig) {
 
 	fmt.Println("[client] target:", targetAddr)
 
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-	}
-
-	remoteConn, err := tls.Dial("tcp", cfg.RemoteAddr, tlsConfig)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	remoteConn, err := wsconn.Dial(ctx, cfg.RemoteAddr, cfg.WSPath)
+	cancel()
 	if err != nil {
-		fmt.Println("[client] dial remote error:", err)
+		fmt.Println("[client] dial remote WebSocket error:", err)
 		_ = socks5.Reply(clientConn, 0x01)
 		return
 	}

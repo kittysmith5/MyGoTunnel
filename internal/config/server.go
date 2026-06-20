@@ -11,6 +11,7 @@ type ServerConfig struct {
 	AuthToken  string `json:"auth_token"`
 	CertFile   string `json:"cert_file"`
 	KeyFile    string `json:"key_file"`
+	WSPath     string `json:"ws_path"`
 }
 
 func LoadServerConfig(path string) (*ServerConfig, error) {
@@ -38,6 +39,10 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 
 	if cfg.KeyFile == "" {
 		cfg.KeyFile = "certs/key.pem"
+	}
+
+	if cfg.WSPath == "" {
+		cfg.WSPath = "/tunnel"
 	}
 
 	return &cfg, nil

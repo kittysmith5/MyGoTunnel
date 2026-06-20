@@ -10,6 +10,7 @@ type ClientConfig struct {
 	LocalAddr  string `json:"local_addr"`
 	RemoteAddr string `json:"remote_addr"`
 	AuthToken  string `json:"auth_token"`
+	WSPath     string `json:"ws_path"`
 }
 
 func LoadClientConfig(path string) (*ClientConfig, error) {
@@ -33,6 +34,10 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 
 	if cfg.AuthToken == "" {
 		return nil, fmt.Errorf("auth_token is empty")
+	}
+
+	if cfg.WSPath == "" {
+		cfg.WSPath = "/tunnel"
 	}
 
 	return &cfg, nil

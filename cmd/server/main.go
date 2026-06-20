@@ -3,16 +3,17 @@ package main
 import (
 	"bufio"
 	"crypto/subtle"
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/tunnel"
+	"mygotunnel/internal/wsconn"
 )
 
 func main() {
@@ -25,31 +26,26 @@ func main() {
 		return
 	}
 
-	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-	if err != nil {
-		panic(err)
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-	}
-
-	ln, err := tls.Listen("tcp", cfg.ListenAddr, tlsConfig)
-	if err != nil {
-		panic(err)
-	}
-	defer ln.Close()
-
-	fmt.Println("[server] listening on", cfg.ListenAddr)
-
-	for {
-		conn, err := ln.Accept()
+	mux := http.NewServeMux()
+	mux.HandleFunc(cfg.WSPath, func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsconn.Accept(w, r)
 		if err != nil {
-			fmt.Println("[server] accept error:", err)
-			continue
+			fmt.Println("[server] websocket accept error:", err)
+			return
 		}
 
 		go handleTunnel(conn, cfg)
+	})
+
+	server := &http.Server{
+		Addr:              cfg.ListenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	fmt.Println("[server] WebSocket listening on", cfg.ListenAddr, "path", cfg.WSPath)
+	if err := server.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile); err != nil {
+		panic(err)
 	}
 }
 
