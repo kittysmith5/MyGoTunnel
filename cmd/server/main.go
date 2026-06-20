@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -20,6 +21,29 @@ import (
 )
 
 const nextProto = "mygotunnel-quic"
+
+func buildQUICConfig(cfg config.QUICConfig) *quic.Config {
+	quicConfig := &quic.Config{
+		KeepAlivePeriod:    time.Duration(cfg.KeepAlivePeriodSeconds) * time.Second,
+		MaxIdleTimeout:     time.Duration(cfg.MaxIdleTimeoutSeconds) * time.Second,
+		MaxIncomingStreams: cfg.MaxIncomingStreams,
+	}
+
+	if cfg.InitialStreamReceiveWindow > 0 {
+		quicConfig.InitialStreamReceiveWindow = cfg.InitialStreamReceiveWindow
+	}
+	if cfg.MaxStreamReceiveWindow > 0 {
+		quicConfig.MaxStreamReceiveWindow = cfg.MaxStreamReceiveWindow
+	}
+	if cfg.InitialConnectionReceiveWindow > 0 {
+		quicConfig.InitialConnectionReceiveWindow = cfg.InitialConnectionReceiveWindow
+	}
+	if cfg.MaxConnectionReceiveWindow > 0 {
+		quicConfig.MaxConnectionReceiveWindow = cfg.MaxConnectionReceiveWindow
+	}
+
+	return quicConfig
+}
 
 func main() {
 	configPath := flag.String("config", "configs/server.json", "config file path")
@@ -41,11 +65,7 @@ func main() {
 		NextProtos:   []string{nextProto},
 	}
 
-	ln, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, &quic.Config{
-		KeepAlivePeriod:    20 * time.Second,
-		MaxIdleTimeout:     60 * time.Second,
-		MaxIncomingStreams: 1024,
-	})
+	ln, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, buildQUICConfig(cfg.QUICConfig))
 	if err != nil {
 		panic(err)
 	}
@@ -71,12 +91,19 @@ func handleConnection(conn *quic.Conn, cfg *config.ServerConfig) {
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			fmt.Println("[server] accept stream error:", err)
+			if !isNormalQUICClose(err) {
+				fmt.Println("[server] accept stream error:", err)
+			}
 			return
 		}
 
 		go handleTunnel(stream, remoteAddr, cfg)
 	}
+}
+
+func isNormalQUICClose(err error) bool {
+	var appErr *quic.ApplicationError
+	return errors.As(err, &appErr) && appErr.Remote && appErr.ErrorCode == 0
 }
 
 func handleTunnel(tunnelStream *quic.Stream, remoteAddr string, cfg *config.ServerConfig) {

@@ -11,6 +11,7 @@ type ServerConfig struct {
 	AuthToken  string `json:"auth_token"`
 	CertFile   string `json:"cert_file"`
 	KeyFile    string `json:"key_file"`
+	QUICConfig
 }
 
 func LoadServerConfig(path string) (*ServerConfig, error) {
@@ -38,6 +39,18 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 
 	if cfg.KeyFile == "" {
 		cfg.KeyFile = "certs/key.pem"
+	}
+
+	if cfg.KeepAlivePeriodSeconds <= 0 {
+		cfg.KeepAlivePeriodSeconds = 20
+	}
+
+	if cfg.MaxIdleTimeoutSeconds <= 0 {
+		cfg.MaxIdleTimeoutSeconds = 60
+	}
+
+	if cfg.MaxIncomingStreams == 0 {
+		cfg.MaxIncomingStreams = 1024
 	}
 
 	return &cfg, nil

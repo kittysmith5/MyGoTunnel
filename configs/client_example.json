@@ -1,0 +1,14 @@
+{
+  "local_addr": "127.0.0.1:1080",
+  "remote_addr": "your-vps.example.com:9001",
+  "auth_token": "replace-with-a-long-random-token",
+  "socks_handshake_timeout_seconds": 10,
+  "socks_request_timeout_seconds": 10,
+  "keep_alive_period_seconds": 20,
+  "max_idle_timeout_seconds": 60,
+  "initial_stream_receive_window": 0,
+  "max_stream_receive_window": 0,
+  "initial_connection_receive_window": 0,
+  "max_connection_receive_window": 0,
+  "max_incoming_streams": 0
+}

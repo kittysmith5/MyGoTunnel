@@ -7,9 +7,22 @@ import (
 )
 
 type ClientConfig struct {
-	LocalAddr  string `json:"local_addr"`
-	RemoteAddr string `json:"remote_addr"`
-	AuthToken  string `json:"auth_token"`
+	LocalAddr                    string `json:"local_addr"`
+	RemoteAddr                   string `json:"remote_addr"`
+	AuthToken                    string `json:"auth_token"`
+	SocksHandshakeTimeoutSeconds int    `json:"socks_handshake_timeout_seconds"`
+	SocksRequestTimeoutSeconds   int    `json:"socks_request_timeout_seconds"`
+	QUICConfig
+}
+
+type QUICConfig struct {
+	KeepAlivePeriodSeconds         int    `json:"keep_alive_period_seconds"`
+	MaxIdleTimeoutSeconds          int    `json:"max_idle_timeout_seconds"`
+	InitialStreamReceiveWindow     uint64 `json:"initial_stream_receive_window"`
+	MaxStreamReceiveWindow         uint64 `json:"max_stream_receive_window"`
+	InitialConnectionReceiveWindow uint64 `json:"initial_connection_receive_window"`
+	MaxConnectionReceiveWindow     uint64 `json:"max_connection_receive_window"`
+	MaxIncomingStreams             int64  `json:"max_incoming_streams"`
 }
 
 func LoadClientConfig(path string) (*ClientConfig, error) {
@@ -33,6 +46,22 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 
 	if cfg.AuthToken == "" {
 		return nil, fmt.Errorf("auth_token is empty")
+	}
+
+	if cfg.SocksHandshakeTimeoutSeconds <= 0 {
+		cfg.SocksHandshakeTimeoutSeconds = 10
+	}
+
+	if cfg.SocksRequestTimeoutSeconds <= 0 {
+		cfg.SocksRequestTimeoutSeconds = 10
+	}
+
+	if cfg.KeepAlivePeriodSeconds <= 0 {
+		cfg.KeepAlivePeriodSeconds = 20
+	}
+
+	if cfg.MaxIdleTimeoutSeconds <= 0 {
+		cfg.MaxIdleTimeoutSeconds = 60
 	}
 
 	return &cfg, nil

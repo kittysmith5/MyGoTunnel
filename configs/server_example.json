@@ -1,0 +1,13 @@
+{
+  "listen_addr": ":9001",
+  "auth_token": "replace-with-a-long-random-token",
+  "cert_file": "certs/cert.pem",
+  "key_file": "certs/key.pem",
+  "keep_alive_period_seconds": 20,
+  "max_idle_timeout_seconds": 60,
+  "initial_stream_receive_window": 0,
+  "max_stream_receive_window": 0,
+  "initial_connection_receive_window": 0,
+  "max_connection_receive_window": 0,
+  "max_incoming_streams": 1024
+}

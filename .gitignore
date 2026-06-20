@@ -1,3 +1,4 @@
-configs/*.json
+configs/server.json
+configs/client.json
 certs/*.pem
 .DS_Store
