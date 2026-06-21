@@ -4,11 +4,16 @@
   "auth_token": "replace-with-a-long-random-token",
   "socks_handshake_timeout_seconds": 10,
   "socks_request_timeout_seconds": 10,
-  "keep_alive_period_seconds": 20,
-  "max_idle_timeout_seconds": 60,
-  "initial_stream_receive_window": 0,
-  "max_stream_receive_window": 0,
-  "initial_connection_receive_window": 0,
-  "max_connection_receive_window": 0,
-  "max_incoming_streams": 0
+  "open_stream_timeout_seconds": 10,
+  "keep_alive_period_seconds": 15,
+  "max_idle_timeout_seconds": 90,
+  "handshake_idle_timeout_seconds": 10,
+  "initial_stream_receive_window": 1048576,
+  "max_stream_receive_window": 16777216,
+  "initial_connection_receive_window": 4194304,
+  "max_connection_receive_window": 67108864,
+  "max_incoming_streams": 2048,
+  "max_incoming_uni_streams": -1,
+  "initial_packet_size": 1252,
+  "disable_path_mtu_discovery": false
 }

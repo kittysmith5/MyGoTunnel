@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/quiccfg"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
@@ -31,37 +32,31 @@ type quicClient struct {
 }
 
 func newQUICClient(remoteAddr string, quicConfig *quic.Config) *quicClient {
+	quicConfig = quicConfig.Clone()
+	quicConfig.TokenStore = quic.NewLRUTokenStore(4, 4)
+
 	return &quicClient{
 		remoteAddr: remoteAddr,
 		tlsConfig: &tls.Config{
 			InsecureSkipVerify: true,
 			NextProtos:         []string{nextProto},
+			ServerName:         remoteServerName(remoteAddr),
 		},
 		quicConfig: quicConfig,
 	}
 }
 
-func buildQUICConfig(cfg config.QUICConfig) *quic.Config {
-	quicConfig := &quic.Config{
-		KeepAlivePeriod:    time.Duration(cfg.KeepAlivePeriodSeconds) * time.Second,
-		MaxIdleTimeout:     time.Duration(cfg.MaxIdleTimeoutSeconds) * time.Second,
-		MaxIncomingStreams: cfg.MaxIncomingStreams,
+func remoteServerName(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return ""
 	}
+	return host
+}
 
-	if cfg.InitialStreamReceiveWindow > 0 {
-		quicConfig.InitialStreamReceiveWindow = cfg.InitialStreamReceiveWindow
-	}
-	if cfg.MaxStreamReceiveWindow > 0 {
-		quicConfig.MaxStreamReceiveWindow = cfg.MaxStreamReceiveWindow
-	}
-	if cfg.InitialConnectionReceiveWindow > 0 {
-		quicConfig.InitialConnectionReceiveWindow = cfg.InitialConnectionReceiveWindow
-	}
-	if cfg.MaxConnectionReceiveWindow > 0 {
-		quicConfig.MaxConnectionReceiveWindow = cfg.MaxConnectionReceiveWindow
-	}
-
-	return quicConfig
+func (c *quicClient) connect(ctx context.Context) error {
+	_, err := c.getConn(ctx)
+	return err
 }
 
 func (c *quicClient) openStream(ctx context.Context) (*quic.Stream, error) {
@@ -105,7 +100,12 @@ func (c *quicClient) getConn(ctx context.Context) (*quic.Conn, error) {
 	defer c.mu.Unlock()
 
 	if c.conn != nil {
-		return c.conn, nil
+		select {
+		case <-c.conn.Context().Done():
+			c.conn = nil
+		default:
+			return c.conn, nil
+		}
 	}
 
 	conn, err := quic.DialAddr(ctx, c.remoteAddr, c.tlsConfig, c.quicConfig)
@@ -148,7 +148,8 @@ func main() {
 	fmt.Println("[client] SOCKS5 listening on", cfg.LocalAddr)
 	fmt.Println("[client] remote QUIC node:", cfg.RemoteAddr)
 
-	remote := newQUICClient(cfg.RemoteAddr, buildQUICConfig(cfg.QUICConfig))
+	remote := newQUICClient(cfg.RemoteAddr, quiccfg.Build(cfg.QUICConfig))
+	go warmQUICConnection(remote, cfg.OpenStreamTimeoutSeconds)
 
 	for {
 		conn, err := ln.Accept()
@@ -163,6 +164,7 @@ func main() {
 
 func handleClient(clientConn net.Conn, cfg *config.ClientConfig, remote *quicClient) {
 	defer clientConn.Close()
+	tuneTCP(clientConn)
 
 	clientAddr := clientConn.RemoteAddr().String()
 	fmt.Println("[client] connected:", clientAddr)
@@ -184,7 +186,8 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, remote *quicCli
 
 	fmt.Println("[client] target:", targetAddr)
 
-	streamCtx, cancelStream := context.WithTimeout(context.Background(), 10*time.Second)
+	streamTimeout := time.Duration(cfg.OpenStreamTimeoutSeconds) * time.Second
+	streamCtx, cancelStream := context.WithTimeout(context.Background(), streamTimeout)
 	stream, err := remote.openStream(streamCtx)
 	cancelStream()
 	if err != nil {
@@ -194,6 +197,7 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, remote *quicCli
 	}
 	defer stream.Close()
 
+	_ = stream.SetDeadline(time.Now().Add(streamTimeout))
 	remoteReader := bufio.NewReader(stream)
 
 	if err := tunnel.SendAuth(stream, cfg.AuthToken); err != nil {
@@ -236,7 +240,25 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, remote *quicCli
 		return
 	}
 
+	_ = stream.SetDeadline(time.Time{})
 	relay.CopyBidirectional(clientConn, clientConn, stream, remoteReader)
 
 	fmt.Println("[client] closed:", clientAddr)
+}
+
+func warmQUICConnection(remote *quicClient, timeoutSeconds int) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+
+	if err := remote.connect(ctx); err != nil {
+		fmt.Println("[client] warm QUIC connect error:", err)
+	}
+}
+
+func tuneTCP(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 }

@@ -41,17 +41,7 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		cfg.KeyFile = "certs/key.pem"
 	}
 
-	if cfg.KeepAlivePeriodSeconds <= 0 {
-		cfg.KeepAlivePeriodSeconds = 20
-	}
-
-	if cfg.MaxIdleTimeoutSeconds <= 0 {
-		cfg.MaxIdleTimeoutSeconds = 60
-	}
-
-	if cfg.MaxIncomingStreams == 0 {
-		cfg.MaxIncomingStreams = 1024
-	}
+	applyQUICDefaults(&cfg.QUICConfig)
 
 	return &cfg, nil
 }

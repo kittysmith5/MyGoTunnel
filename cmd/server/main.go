@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/quiccfg"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/tunnel"
 
@@ -21,29 +22,6 @@ import (
 )
 
 const nextProto = "mygotunnel-quic"
-
-func buildQUICConfig(cfg config.QUICConfig) *quic.Config {
-	quicConfig := &quic.Config{
-		KeepAlivePeriod:    time.Duration(cfg.KeepAlivePeriodSeconds) * time.Second,
-		MaxIdleTimeout:     time.Duration(cfg.MaxIdleTimeoutSeconds) * time.Second,
-		MaxIncomingStreams: cfg.MaxIncomingStreams,
-	}
-
-	if cfg.InitialStreamReceiveWindow > 0 {
-		quicConfig.InitialStreamReceiveWindow = cfg.InitialStreamReceiveWindow
-	}
-	if cfg.MaxStreamReceiveWindow > 0 {
-		quicConfig.MaxStreamReceiveWindow = cfg.MaxStreamReceiveWindow
-	}
-	if cfg.InitialConnectionReceiveWindow > 0 {
-		quicConfig.InitialConnectionReceiveWindow = cfg.InitialConnectionReceiveWindow
-	}
-	if cfg.MaxConnectionReceiveWindow > 0 {
-		quicConfig.MaxConnectionReceiveWindow = cfg.MaxConnectionReceiveWindow
-	}
-
-	return quicConfig
-}
 
 func main() {
 	configPath := flag.String("config", "configs/server.json", "config file path")
@@ -65,7 +43,7 @@ func main() {
 		NextProtos:   []string{nextProto},
 	}
 
-	ln, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, buildQUICConfig(cfg.QUICConfig))
+	ln, err := quic.ListenAddr(cfg.ListenAddr, tlsConfig, quiccfg.Build(cfg.QUICConfig))
 	if err != nil {
 		panic(err)
 	}
@@ -144,6 +122,7 @@ func handleTunnel(tunnelStream *quic.Stream, remoteAddr string, cfg *config.Serv
 		return
 	}
 	defer targetConn.Close()
+	tuneTCP(targetConn)
 
 	if err := tunnel.SendOK(tunnelStream); err != nil {
 		fmt.Println("[server] send OK error:", err)
@@ -153,6 +132,14 @@ func handleTunnel(tunnelStream *quic.Stream, remoteAddr string, cfg *config.Serv
 	relay.CopyBidirectional(tunnelStream, reader, targetConn, targetConn)
 
 	fmt.Println("[server] tunnel closed:", remoteAddr)
+}
+
+func tuneTCP(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
 }
 
 type readDeadlineSetter interface {

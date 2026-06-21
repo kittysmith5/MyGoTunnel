@@ -12,17 +12,22 @@ type ClientConfig struct {
 	AuthToken                    string `json:"auth_token"`
 	SocksHandshakeTimeoutSeconds int    `json:"socks_handshake_timeout_seconds"`
 	SocksRequestTimeoutSeconds   int    `json:"socks_request_timeout_seconds"`
+	OpenStreamTimeoutSeconds     int    `json:"open_stream_timeout_seconds"`
 	QUICConfig
 }
 
 type QUICConfig struct {
 	KeepAlivePeriodSeconds         int    `json:"keep_alive_period_seconds"`
 	MaxIdleTimeoutSeconds          int    `json:"max_idle_timeout_seconds"`
+	HandshakeIdleTimeoutSeconds    int    `json:"handshake_idle_timeout_seconds"`
 	InitialStreamReceiveWindow     uint64 `json:"initial_stream_receive_window"`
 	MaxStreamReceiveWindow         uint64 `json:"max_stream_receive_window"`
 	InitialConnectionReceiveWindow uint64 `json:"initial_connection_receive_window"`
 	MaxConnectionReceiveWindow     uint64 `json:"max_connection_receive_window"`
 	MaxIncomingStreams             int64  `json:"max_incoming_streams"`
+	MaxIncomingUniStreams          int64  `json:"max_incoming_uni_streams"`
+	InitialPacketSize              uint16 `json:"initial_packet_size"`
+	DisablePathMTUDiscovery        bool   `json:"disable_path_mtu_discovery"`
 }
 
 func LoadClientConfig(path string) (*ClientConfig, error) {
@@ -56,13 +61,11 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		cfg.SocksRequestTimeoutSeconds = 10
 	}
 
-	if cfg.KeepAlivePeriodSeconds <= 0 {
-		cfg.KeepAlivePeriodSeconds = 20
+	if cfg.OpenStreamTimeoutSeconds <= 0 {
+		cfg.OpenStreamTimeoutSeconds = 10
 	}
 
-	if cfg.MaxIdleTimeoutSeconds <= 0 {
-		cfg.MaxIdleTimeoutSeconds = 60
-	}
+	applyQUICDefaults(&cfg.QUICConfig)
 
 	return &cfg, nil
 }
