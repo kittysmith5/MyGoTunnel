@@ -8,6 +8,12 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
+type closeWriter interface {
+	CloseWrite() error
+}
+
+var _ closeWriter = (*utls.UConn)(nil)
+
 func Dial(ctx context.Context, remoteAddr, sni string) (net.Conn, error) {
 	dialer := &net.Dialer{}
 	tcpConn, err := dialer.DialContext(ctx, "tcp", remoteAddr)
