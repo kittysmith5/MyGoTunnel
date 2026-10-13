@@ -210,3 +210,67 @@ func TestPermitReacquiresAndTotalConnectionsRemainBounded(t *testing.T) {
 		t.Fatal("negative total limit accepted")
 	}
 }
+
+func TestResourceCountersTrackPermitAndConnectionLifetime(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	counters := &Counters{}
+	started := make(chan *Permit, 2)
+	rejected := make(chan struct{}, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeWithMetrics(listener, 1, 2, func(c net.Conn, p *Permit) { defer c.Close(); started <- p; io.Copy(io.Discard, c) }, func() { rejected <- struct{}{} }, counters)
+	}()
+	connect := func() net.Conn {
+		c, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	waitCounts := func(open, setup int64) {
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if counters.Open.Load() == open && counters.Setup.Load() == setup {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatalf("counts open=%d setup=%d", counters.Open.Load(), counters.Setup.Load())
+	}
+	a := connect()
+	defer a.Close()
+	first := <-started
+	waitCounts(1, 1)
+	first.Release()
+	first.Release()
+	waitCounts(1, 0)
+	b := connect()
+	defer b.Close()
+	<-started
+	waitCounts(2, 1)
+	c := connect()
+	defer c.Close()
+	wait(t, rejected)
+	if counters.Rejected.Load() != 1 {
+		t.Fatal("rejected counter missing")
+	}
+	if first.TryAcquire() {
+		t.Fatal("reacquired full setup slot")
+	}
+	b.Close()
+	waitCounts(1, 0)
+	if !first.TryAcquire() {
+		t.Fatal("reacquire failed")
+	}
+	waitCounts(1, 1)
+	a.Close()
+	waitCounts(0, 0)
+	listener.Close()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

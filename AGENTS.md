@@ -23,7 +23,7 @@ SOCKS5 应用
 - `cmd/client`：加载客户端配置、接受本地 SOCKS5 连接、建立远端 uTLS 连接并组织隧道流程。
 - `cmd/server`：加载服务端配置和证书、校验认证信息、连接目标地址并组织转发。
 - `internal/config`：客户端和服务端 JSON 配置结构、默认值及必填项校验。
-- `internal/logging`：基于标准库 `log/slog` 创建统一的分级、结构化日志记录器。
+- `internal/logging`：基于 `log/slog` 的紧凑英文文本、结构化 JSON、连接 ID、失败分类与周期资源汇总。
 - `internal/socks5`：SOCKS5 无认证握手、仅支持 TCP `CONNECT` 的请求解析和响应。
 - `internal/tunnel`：`AUTH`、`CONNECT`、`OK`、`ERR` 控制消息的读写。
 - `internal/utlsconn`：使用 Chrome ClientHello 指纹建立 uTLS 客户端连接。
@@ -84,7 +84,7 @@ JSON 中的未知字段目前会被忽略，不能仅凭某个本地配置中存
 # 编译检查两个命令入口，不在仓库留下可执行文件
 go build ./cmd/...
 
-# 运行全部测试；当前尚无 *_test.go，因此这同时是全包编译检查
+# 运行全部单元测试和本地协议/连接测试
 go test ./...
 
 # 静态检查
@@ -139,3 +139,14 @@ go build ./cmd/...
 - `git diff` 中只有任务相关内容，没有令牌、证书、私钥、配置文件或构建产物。
 - 协议或配置改动已经同步到所有调用方、测试和用户可见文档。
 - 若某项验证无法运行，在交付说明中明确列出未运行的命令及原因。
+
+## 日志契约
+
+- 默认 text 必须紧凑英文，不重复 time=/level=/msg=/component=；使用 UTC 完整日期时间 `YYYY-MM-DD HH:MM:SS.mmm`，启动输出 timezone=UTC，C/S 区分两端。JSON 继续使用标准字段和现有长字段名，Duration 为纳秒整数，字节数为原始整数；时间统一 UTC。事件名使用 listening/ready/closed/failed/stats 等短英文。
+- 目标域名/IP:端口和 peer 保留；不解密 HTTPS、不记录 URL 路径、token、私钥、连接码或原始控制报文。文本属性中的控制字符必须转义，写入一次完整记录，并在 With/WithGroup 派生处理器间共享写锁。
+- connection_id/id 只在进程内关联，包含进程前缀和原子递增编号。本轮不改变协议，不宣称两端 ID 一致。
+- 上传/下载统一以 SOCKS5 应用为参照：↑/upload_bytes 向目标，↓/download_bytes 回到应用；保留 relay 的根失败方向 up/down，不被故意中断的反向超时覆盖。
+- text 阶段短名为 socks/tcp/tls/take/ctl/auth/wait/dial/reply/idle/total，展示毫秒，最多 3 位小数。JSON 长字段定义见 README。服务端 total 排除 idle，但仍包含准备阶段 auth；连接生命周期 duration/dur 包含 idle。已预热池命中时 text 可省略零值 tcp/tls，JSON 保留。
+- failed 必须包含 stage 与 close_reason/reason；常见系统错误完整链进入 DEBUG，未知错误在 WARN 保留诊断信息。只有真正正常 EOF 才作为 INFO closed，不能把所有 reset/timeout 静默吞掉。
+- 资源状态每 30 秒一条 stats，active 统计 accepted 总数，setup 统计 permit 占用，idle 统计备用，rejected 是准入拒绝累计；计数使用原子操作，Permit Release/TryAcquire 同步更新，监听流程退出时停止并等待定时器。不要用日志计数改变任何连接、认证、超时、重试或半关闭行为。
+- 修改日志需覆盖毫秒与时区、短字段、英文事件、双向字节、ID 关联、根失败方向、分组属性、并发写入、错误详略、资源计数与定时器停止，并同步 README 和本文件。

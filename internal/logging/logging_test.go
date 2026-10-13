@@ -107,7 +107,7 @@ func TestNewDefaultsToInfoTextLogger(t *testing.T) {
 	if strings.Contains(got, "hidden") {
 		t.Errorf("debug log was not filtered: %q", got)
 	}
-	for _, want := range []string{"level=INFO", `msg="listener started"`, "component=server", "listen_addr=:9001"} {
+	for _, want := range []string{" INFO S listener started", "listen=:9001"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("log output %q does not contain %q", got, want)
 		}
@@ -128,7 +128,7 @@ func TestLogTunnelResult(t *testing.T) {
 				BToA: relay.DirectionResult{Bytes: 34},
 			},
 			wantLevel: "INFO",
-			wantMsg:   "tunnel closed",
+			wantMsg:   "closed",
 		},
 		{
 			name: "relay failure",
@@ -138,7 +138,7 @@ func TestLogTunnelResult(t *testing.T) {
 				Err:  errors.New("copy failed"),
 			},
 			wantLevel: "WARN",
-			wantMsg:   "tunnel relay failed",
+			wantMsg:   "failed",
 		},
 	}
 

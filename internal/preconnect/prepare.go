@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/tunnel"
 	"mygotunnel/internal/utlsconn"
@@ -55,7 +54,7 @@ func Prepare(ctx context.Context, cfg *config.ClientConfig) (entry *Entry, err e
 		return nil, err
 	}
 	if response != "OK" {
-		return nil, fmt.Errorf("preconnection authentication rejected")
+		return nil, tunnel.ErrAuthRejected
 	}
 	response, err = tunnel.ReadLine(reader)
 	if err != nil {

@@ -22,9 +22,10 @@ type DirectionResult struct {
 // caused the relay to stop. AToB is the upload direction at both current call
 // sites, while BToA is the download direction.
 type Result struct {
-	AToB DirectionResult
-	BToA DirectionResult
-	Err  error
+	AToB             DirectionResult
+	BToA             DirectionResult
+	Err              error
+	FailureDirection string
 }
 
 type closeWriter interface {
@@ -69,8 +70,10 @@ func CopyBidirectional(a net.Conn, aReader io.Reader, b net.Conn, bReader io.Rea
 	case first.result.Err != nil:
 		// The second direction was deliberately interrupted. Its detailed error
 		// remains in Result, but the first failure is the relay's root cause.
+		result.FailureDirection = directionName(first.direction)
 		result.Err = errors.Join(directionError(first), interruptErr)
 	case second.result.Err != nil:
+		result.FailureDirection = directionName(second.direction)
 		result.Err = directionError(second)
 	}
 
@@ -153,4 +156,11 @@ func wrapError(operation string, err error) error {
 	}
 
 	return fmt.Errorf("%s: %w", operation, err)
+}
+
+func directionName(d direction) string {
+	if d == directionAToB {
+		return "up"
+	}
+	return "down"
 }

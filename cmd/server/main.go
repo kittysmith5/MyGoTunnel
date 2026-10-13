@@ -68,7 +68,7 @@ func main() {
 		return
 	}
 	if err := run(*configPath, logger, *maxSetup, serverOptions{*maxConnections, *maxIdle}); err != nil {
-		logger.Error("server stopped", "error", err)
+		logger.Error("stopped", "error", err)
 		os.Exit(1)
 	}
 }
@@ -107,17 +107,24 @@ func run(configPath string, logger *slog.Logger, maxSetup int, options ...server
 	}
 	defer ln.Close()
 
-	logger.Info("TLS listener started",
+	logger.Info("listening",
 		"listen_addr", cfg.ListenAddr,
 		"alpn", "http/1.1",
+		"timezone", "UTC",
+		"max_connections", opts.maxConnections,
+		"max_setup", maxSetup,
+		"max_idle", opts.maxIdle,
 	)
 
 	idleSlots := make(chan struct{}, opts.maxIdle)
-	return admission.ServeWithPermit(ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleTunnelWithPool(conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire})
-	}, func() {
-		logger.Debug("connection limit reached", "max_setup", maxSetup, "max_connections", opts.maxConnections)
+	metrics := &admission.Counters{}
+	stopStats := logging.StartStats(logger, 30*time.Second, func() []any {
+		return []any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", len(idleSlots), "max_idle", opts.maxIdle, "rejected", metrics.Rejected.Load()}
 	})
+	defer stopStats()
+	return admission.ServeWithMetrics(ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
+		handleTunnelWithPool(conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire})
+	}, nil, metrics)
 }
 
 type serverPoolOptions struct {
@@ -133,18 +140,18 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 	defer tunnelConn.Close()
 
 	remoteAddr := tunnelConn.RemoteAddr().String()
-	connectionLogger := logger.With("client_addr", remoteAddr)
+	connectionLogger := logging.Connection(logger, remoteAddr)
 	startedAt := time.Now()
-	connectionLogger.Debug("connection accepted")
+	connectionLogger.Debug("accepted")
 	defer func() {
-		connectionLogger.Debug("connection closed", "duration", time.Since(startedAt))
+		connectionLogger.Debug("released", "duration", time.Since(startedAt))
 	}()
 
 	reader := bufio.NewReader(tunnelConn)
 
 	authStarted := time.Now()
 	if err := checkAuth(tunnelConn, reader, cfg.AuthToken); err != nil {
-		connectionLogger.Warn("authentication failed", "error", err)
+		logging.Failure(connectionLogger, "auth", err, "auth_duration", time.Since(authStarted), "setup_duration", time.Since(startedAt))
 		return
 	}
 
@@ -152,15 +159,16 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 	connectStarted := time.Now()
 	connectDeadline := time.Now().Add(tunnel.ControlTimeout)
 	if err := tunnelConn.SetDeadline(connectDeadline); err != nil {
-		connectionLogger.Warn("set CONNECT deadline failed", "error", err)
+		logging.Failure(connectionLogger, "connect", err)
 		return
 	}
 	line, err := tunnel.ReadLine(reader)
 	if err != nil {
-		connectionLogger.Warn("read CONNECT request failed", "error", err)
+		logging.Failure(connectionLogger, "connect", err, "wait_duration", time.Since(connectStarted), "auth_duration", authDuration, "setup_duration", time.Since(startedAt))
 		return
 	}
 
+	var idleDuration time.Duration
 	pooled := false
 	if line == "PREPARE" {
 		if poolOptions == nil || cap(poolOptions.idleSlots) == 0 {
@@ -183,15 +191,19 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 		defer releaseIdle()
 		releaseSetup()
 		if err := tunnelConn.SetDeadline(time.Now().Add(tunnel.PreparedIdleTimeout)); err != nil {
+			logging.Failure(connectionLogger, "prepare", err)
 			return
 		}
+		idleStarted := time.Now()
 		if err := tunnel.SendReady(tunnelConn); err != nil {
+			logging.Failure(connectionLogger, "prepare", err)
 			return
 		}
 		line, err = tunnel.ReadLine(reader)
+		idleDuration = time.Since(idleStarted)
 		releaseIdle()
 		if err != nil {
-			connectionLogger.Debug("prepared connection closed", "error", err)
+			connectionLogger.Debug("idle closed", "error", err)
 			return
 		}
 		if !poolOptions.resumeSetup() {
@@ -202,23 +214,25 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 		connectStarted = time.Now()
 		connectDeadline = connectStarted.Add(tunnel.ControlTimeout)
 		if err := tunnelConn.SetDeadline(connectDeadline); err != nil {
+			logging.Failure(connectionLogger, "connect", err)
 			return
 		}
 	}
 
 	if !strings.HasPrefix(line, "CONNECT ") {
-		connectionLogger.Warn("invalid tunnel command")
+		connectionLogger.Warn("failed", "stage", "connect", "close_reason", "protocol")
 		return
 	}
 
 	targetAddr := strings.TrimSpace(strings.TrimPrefix(line, "CONNECT "))
 	if targetAddr == "" {
-		connectionLogger.Warn("empty target address")
+		connectionLogger.Warn("failed", "stage", "connect", "close_reason", "empty")
 		return
 	}
 
+	waitDuration := time.Since(connectStarted)
 	requestLogger := connectionLogger.With("target_addr", targetAddr)
-	requestLogger.Debug("CONNECT request received")
+	requestLogger.Debug("connect")
 
 	ctx, cancel := context.WithDeadline(context.Background(), connectDeadline)
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
@@ -227,28 +241,32 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 	targetDuration := time.Since(targetStarted)
 	cancel()
 	if err != nil {
-		requestLogger.Warn("dial target failed", "target_dial_duration", targetDuration, "error", err)
+		logging.Failure(requestLogger, "dial", err, "target_dial_duration", targetDuration, "setup_duration", time.Since(startedAt)-idleDuration)
 		_ = tunnel.SendERR(tunnelConn)
 		return
 	}
 	defer targetConn.Close()
 
+	replyStarted := time.Now()
 	if err := tunnel.SendOK(tunnelConn); err != nil {
-		requestLogger.Warn("send CONNECT response failed", "error", err)
+		logging.Failure(requestLogger, "reply", err)
 		return
 	}
 
 	if err := tunnelConn.SetDeadline(time.Time{}); err != nil {
-		requestLogger.Warn("clear CONNECT deadline failed", "error", err)
+		logging.Failure(requestLogger, "control", err)
 		return
 	}
 	releaseSetup()
-	requestLogger.Info("tunnel established",
+	requestLogger.Info("ready",
 		"pool_connection", pooled,
 		"auth_duration", authDuration,
+		"idle_duration", idleDuration,
+		"wait_duration", waitDuration,
 		"target_dial_duration", targetDuration,
+		"reply_duration", time.Since(replyStarted),
 		"connect_duration", time.Since(connectStarted),
-		"setup_duration", time.Since(startedAt))
+		"setup_duration", time.Since(startedAt)-idleDuration)
 	result := relay.CopyBidirectional(tunnelConn, reader, targetConn, targetConn)
 	logging.LogTunnelResult(requestLogger, result, startedAt)
 }

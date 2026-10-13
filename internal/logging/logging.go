@@ -43,12 +43,17 @@ func New(writer io.Writer, options Options) (*slog.Logger, error) {
 		format = FormatText
 	}
 
-	handlerOptions := &slog.HandlerOptions{Level: level}
+	handlerOptions := &slog.HandlerOptions{Level: level, ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+		if len(groups) == 0 && a.Key == slog.TimeKey {
+			a.Value = slog.TimeValue(a.Value.Time().UTC())
+		}
+		return a
+	}}
 	var handler slog.Handler
 
 	switch format {
 	case FormatText:
-		handler = slog.NewTextHandler(writer, handlerOptions)
+		handler = newCompactHandler(writer, handlerOptions)
 	case FormatJSON:
 		handler = slog.NewJSONHandler(writer, handlerOptions)
 	default:

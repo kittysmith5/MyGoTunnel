@@ -18,6 +18,9 @@ const ControlTimeout = 20 * time.Second
 // Prepared connections are authenticated, bounded and expire without heartbeats.
 const PreparedIdleTimeout = 60 * time.Second
 
+var ErrAuthRejected = errors.New("auth rejected")
+var ErrConnectRejected = errors.New("connect rejected")
+
 var ErrControlLineTooLong = errors.New("control line exceeds 4096 bytes")
 
 func SendAuth(conn net.Conn, token string) error {

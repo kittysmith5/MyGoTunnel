@@ -24,6 +24,7 @@ var _ closeWriter = (*utls.UConn)(nil)
 type DialTimings struct {
 	TCPDuration time.Duration
 	TLSDuration time.Duration
+	Stage       string
 }
 
 func Dial(ctx context.Context, remoteAddr, sni, fingerprint string) (net.Conn, error) {
@@ -32,7 +33,7 @@ func Dial(ctx context.Context, remoteAddr, sni, fingerprint string) (net.Conn, e
 }
 
 func DialWithTimings(ctx context.Context, remoteAddr, sni, fingerprint string) (net.Conn, DialTimings, error) {
-	var timings DialTimings
+	timings := DialTimings{Stage: "config"}
 	var expected []byte
 	if fingerprint != "" {
 		var err error
@@ -42,6 +43,7 @@ func DialWithTimings(ctx context.Context, remoteAddr, sni, fingerprint string) (
 		}
 	}
 	dialer := &net.Dialer{}
+	timings.Stage = "tcp"
 	tcpStarted := time.Now()
 	tcpConn, err := dialer.DialContext(ctx, "tcp", remoteAddr)
 	timings.TCPDuration = time.Since(tcpStarted)
@@ -74,6 +76,7 @@ func DialWithTimings(ctx context.Context, remoteAddr, sni, fingerprint string) (
 	}
 	tlsConn := utls.UClient(tcpConn, tlsConfig, utls.HelloChrome_Auto)
 
+	timings.Stage = "tls"
 	tlsStarted := time.Now()
 	err = tlsConn.HandshakeContext(ctx)
 	timings.TLSDuration = time.Since(tlsStarted)
@@ -82,6 +85,7 @@ func DialWithTimings(ctx context.Context, remoteAddr, sni, fingerprint string) (
 		return nil, timings, err
 	}
 
+	timings.Stage = ""
 	return tlsConn, timings, nil
 }
 

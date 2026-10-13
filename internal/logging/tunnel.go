@@ -17,9 +17,9 @@ func LogTunnelResult(logger *slog.Logger, result relay.Result, startedAt time.Ti
 	}
 
 	if result.Err != nil {
-		logger.Warn("tunnel relay failed", append(attributes, "error", result.Err)...)
+		Failure(logger, result.FailureDirection, result.Err, attributes...)
 		return
 	}
 
-	logger.Info("tunnel closed", attributes...)
+	logger.Info("closed", append(attributes, "close_reason", "eof")...)
 }

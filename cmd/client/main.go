@@ -49,11 +49,11 @@ func main() {
 			logger.Error("import failed", "error", err)
 			os.Exit(1)
 		}
-		logger.Info("connection imported", "config_path", *configPath)
+		logger.Info("imported", "config_path", *configPath)
 		return
 	}
 	if err := run(*configPath, logger, *maxSetup, clientOptions{*poolSize, *maxConnections}); err != nil {
-		logger.Error("client stopped", "error", err)
+		logger.Error("stopped", "error", err)
 		os.Exit(1)
 	}
 }
@@ -82,10 +82,14 @@ func run(configPath string, logger *slog.Logger, maxSetup int, options ...client
 	}
 	defer ln.Close()
 
-	logger.Info("SOCKS5 listener started",
+	logger.Info("listening",
 		"listen_addr", cfg.LocalAddr,
 		"remote_addr", cfg.RemoteAddr,
 		"sni", cfg.SNI,
+		"timezone", "UTC",
+		"max_connections", opts.maxConnections,
+		"max_setup", maxSetup,
+		"max_idle", opts.poolSize,
 	)
 
 	var pool *preconnect.Pool
@@ -96,46 +100,51 @@ func run(configPath string, logger *slog.Logger, maxSetup int, options ...client
 		}
 		defer pool.Close()
 	}
-	return admission.Serve(ln, maxSetup, func(conn net.Conn, release func()) {
-		handleClient(conn, cfg, logger, release, pool)
-	}, func() {
-		logger.Debug("connection limit reached", "max_setup", maxSetup, "max_connections", opts.maxConnections)
-	}, opts.maxConnections)
+	metrics := &admission.Counters{}
+	stopStats := logging.StartStats(logger, 30*time.Second, func() []any {
+		idle := 0
+		if pool != nil {
+			idle = pool.IdleCount()
+		}
+		return []any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", opts.poolSize, "rejected", metrics.Rejected.Load()}
+	})
+	defer stopStats()
+	return admission.ServeWithMetrics(ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) { handleClient(conn, cfg, logger, permit.Release, pool) }, nil, metrics)
 }
 
 func handleClient(clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pools ...*preconnect.Pool) {
 	defer clientConn.Close()
 
 	clientAddr := clientConn.RemoteAddr().String()
-	connectionLogger := logger.With("client_addr", clientAddr)
+	connectionLogger := logging.Connection(logger, clientAddr)
 	startedAt := time.Now()
-	connectionLogger.Debug("connection accepted")
+	connectionLogger.Debug("accepted")
 	defer func() {
-		connectionLogger.Debug("connection closed", "duration", time.Since(startedAt))
+		connectionLogger.Debug("released", "duration", time.Since(startedAt))
 	}()
 
 	if err := clientConn.SetDeadline(time.Now().Add(socks5Timeout)); err != nil {
-		connectionLogger.Warn("set SOCKS5 deadline failed", "error", err)
+		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
 	if err := socks5.Handshake(clientConn); err != nil {
-		connectionLogger.Warn("SOCKS5 handshake failed", "error", err)
+		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
 
 	targetAddr, err := socks5.ReadRequest(clientConn)
 	if err != nil {
-		connectionLogger.Warn("SOCKS5 request failed", "error", err)
+		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		_ = socks5.Reply(clientConn, socks5.ReplyCode(err))
 		return
 	}
 
 	requestLogger := connectionLogger.With("target_addr", targetAddr)
-	requestLogger.Debug("SOCKS5 CONNECT received")
+	requestLogger.Debug("connect")
 
 	// Bound the eventual SOCKS5 reply while remote setup runs.
 	if err := clientConn.SetDeadline(time.Now().Add(remoteDialTimeout + tunnel.ControlTimeout + socks5Timeout)); err != nil {
-		requestLogger.Warn("set connection setup deadline failed", "error", err)
+		logging.Failure(requestLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
 	socksDuration := time.Since(startedAt)
@@ -147,7 +156,7 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Lo
 	session, err := openRemote(ctx, cfg, targetAddr, pool)
 	cancel()
 	if err != nil {
-		requestLogger.Warn("remote setup failed", "pool_fallback", session.PoolFallback, "tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "error", err)
+		logging.Failure(requestLogger, session.Stage, err, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "setup_duration", time.Since(startedAt))
 		code := byte(1)
 		if errors.Is(err, errTargetRejected) {
 			code = 5
@@ -159,20 +168,20 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Lo
 	defer remoteConn.Close()
 
 	if err := socks5.Reply(clientConn, 0x00); err != nil {
-		requestLogger.Warn("send SOCKS5 success reply failed", "error", err)
+		logging.Failure(requestLogger, "reply", err)
 		return
 	}
 
 	if err := remoteConn.SetDeadline(time.Time{}); err != nil {
-		requestLogger.Warn("clear tunnel control deadline failed", "error", err)
+		logging.Failure(requestLogger, "control", err)
 		return
 	}
 	if err := clientConn.SetDeadline(time.Time{}); err != nil {
-		requestLogger.Warn("clear SOCKS5 deadline failed", "error", err)
+		logging.Failure(requestLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
 	releaseSetup()
-	requestLogger.Info("tunnel established", "remote_addr", cfg.RemoteAddr,
+	requestLogger.Info("ready", "remote_addr", cfg.RemoteAddr,
 		"socks_duration", socksDuration,
 		"tcp_duration", session.Dial.TCPDuration,
 		"tls_duration", session.Dial.TLSDuration,

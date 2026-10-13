@@ -126,6 +126,9 @@ func TestCopyBidirectionalInterruptsOtherDirectionAfterError(t *testing.T) {
 	if !errors.Is(result.AToB.Err, wantErr) {
 		t.Errorf("A-to-B error = %v, want %v", result.AToB.Err, wantErr)
 	}
+	if result.FailureDirection != "up" {
+		t.Fatal("root upload error direction lost")
+	}
 	if result.BToA.Err == nil {
 		t.Error("B-to-A error = nil, want interruption error")
 	}
@@ -232,5 +235,16 @@ func waitForResult(t *testing.T, resultCh <-chan Result) Result {
 	case <-time.After(5 * time.Second):
 		t.Fatal("CopyBidirectional() did not return")
 		return Result{}
+	}
+}
+
+func TestRootDownloadFailureDirection(t *testing.T) {
+	aRelay, aPeer := newTCPPair(t)
+	bRelay, bPeer := newTCPPair(t)
+	setTestDeadlines(t, aRelay, aPeer, bRelay, bPeer)
+	want := errors.New("download source failed")
+	result := waitForResult(t, startRelay(aRelay, aRelay, bRelay, errorReader{err: want}))
+	if !errors.Is(result.Err, want) || result.FailureDirection != "down" {
+		t.Fatal("interrupted upload replaced root download direction")
 	}
 }

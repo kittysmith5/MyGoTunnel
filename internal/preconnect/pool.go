@@ -123,10 +123,10 @@ func (p *Pool) fill() {
 			_ = entry.Conn.Close()
 		}
 		if p.logger != nil {
-			p.logger.Debug("preconnection unavailable", "error", err)
+			p.logger.Debug("pool miss", "error", err)
 		}
 		if logUnsupported && p.logger != nil {
-			p.logger.Info("preconnections unavailable; using direct connections with periodic probes")
+			p.logger.Info("pool unsupported; retrying")
 		}
 		return
 	}

@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/preconnect"
@@ -13,8 +12,8 @@ import (
 	"time"
 )
 
-var errTargetRejected = errors.New("remote CONNECT rejected")
-var errAuthRejected = errors.New("remote authentication rejected")
+var errTargetRejected = tunnel.ErrConnectRejected
+var errAuthRejected = tunnel.ErrAuthRejected
 
 type remoteSession struct {
 	Conn                  net.Conn
@@ -23,6 +22,7 @@ type remoteSession struct {
 	ControlDuration       time.Duration
 	PoolAcquireDuration   time.Duration
 	PoolHit, PoolFallback bool
+	Stage                 string
 }
 
 func controlDeadline(ctx context.Context) time.Time {
@@ -33,12 +33,14 @@ func controlDeadline(ctx context.Context) time.Time {
 	return deadline
 }
 func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, pool *preconnect.Pool) (session *remoteSession, err error) {
-	session = &remoteSession{}
+	session = &remoteSession{Stage: "pool"}
 	if pool != nil {
 		start := time.Now()
 		entry := pool.Take(ctx)
 		session.PoolAcquireDuration = time.Since(start)
 		if entry != nil {
+			session.Stage = "connect"
+			session.PoolHit = true
 			stop := context.AfterFunc(ctx, func() { entry.Conn.Close() })
 			defer stop()
 			start = time.Now()
@@ -67,6 +69,7 @@ func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, po
 			}
 			// Retry only transport failure on an unused prepared connection, before any
 			// application payload has been sent. Never retry explicit target rejection.
+			session.PoolHit = false
 			session.PoolFallback = true
 		}
 	}
@@ -74,6 +77,7 @@ func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, po
 	conn, timings, err := utlsconn.DialWithTimings(dialCtx, cfg.RemoteAddr, cfg.SNI, cfg.CertificateFingerprint)
 	cancel()
 	session.Dial = timings
+	session.Stage = timings.Stage
 	if err != nil {
 		return session, fmt.Errorf("dial remote: %w", err)
 	}
@@ -84,9 +88,11 @@ func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, po
 	}()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
+	session.Stage = "control"
 	if err = conn.SetDeadline(controlDeadline(ctx)); err != nil {
 		return session, err
 	}
+	session.Stage = "auth"
 	start := time.Now()
 	defer func() { session.ControlDuration += time.Since(start) }()
 	if err = tunnel.SendSetup(conn, cfg.AuthToken, target); err != nil {
@@ -100,6 +106,7 @@ func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, po
 	if response != "OK" {
 		return session, errAuthRejected
 	}
+	session.Stage = "connect"
 	response, err = tunnel.ReadLine(reader)
 	if err != nil {
 		return session, err

@@ -6,15 +6,17 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Permit supports temporarily releasing setup capacity while an authenticated
 // connection waits in the idle pool, then reacquiring before target dial.
 type Permit struct {
-	mu    sync.Mutex
-	slots chan struct{}
-	held  bool
+	mu      sync.Mutex
+	slots   chan struct{}
+	held    bool
+	metrics *Counters
 }
 
 func (p *Permit) Release() {
@@ -23,6 +25,9 @@ func (p *Permit) Release() {
 	if p.held {
 		<-p.slots
 		p.held = false
+		if p.metrics != nil {
+			p.metrics.Setup.Add(-1)
+		}
 	}
 }
 
@@ -35,6 +40,9 @@ func (p *Permit) TryAcquire() bool {
 	select {
 	case p.slots <- struct{}{}:
 		p.held = true
+		if p.metrics != nil {
+			p.metrics.Setup.Add(1)
+		}
 		return true
 	default:
 		return false
@@ -51,7 +59,13 @@ func Serve(listener net.Listener, maxSetup int, handler func(net.Conn, func()), 
 	return ServeWithPermit(listener, maxSetup, total, func(c net.Conn, p *Permit) { handler(c, p.Release) }, onOverload)
 }
 
+type Counters struct{ Open, Setup, Rejected atomic.Int64 }
+
 func ServeWithPermit(listener net.Listener, maxSetup, maxConnections int, handler func(net.Conn, *Permit), onOverload func()) error {
+	return ServeWithMetrics(listener, maxSetup, maxConnections, handler, onOverload, nil)
+}
+
+func ServeWithMetrics(listener net.Listener, maxSetup, maxConnections int, handler func(net.Conn, *Permit), onOverload func(), metrics *Counters) error {
 	if maxSetup <= 0 {
 		return fmt.Errorf("max-setup must be positive")
 	}
@@ -65,6 +79,9 @@ func ServeWithPermit(listener net.Listener, maxSetup, maxConnections int, handle
 	}
 	reject := func(c net.Conn) {
 		_ = c.Close()
+		if metrics != nil {
+			metrics.Rejected.Add(1)
+		}
 		if onOverload != nil {
 			onOverload()
 		}
@@ -102,8 +119,15 @@ func ServeWithPermit(listener net.Listener, maxSetup, maxConnections int, handle
 		}
 		select {
 		case slots <- struct{}{}:
-			permit := &Permit{slots: slots, held: true}
+			permit := &Permit{slots: slots, held: true, metrics: metrics}
+			if metrics != nil {
+				metrics.Open.Add(1)
+				metrics.Setup.Add(1)
+			}
 			go func() {
+				if metrics != nil {
+					defer metrics.Open.Add(-1)
+				}
 				if connections != nil {
 					defer func() { <-connections }()
 				}
