@@ -25,6 +25,14 @@ func Handshake(conn net.Conn) error {
 		return err
 	}
 
-	_, err := conn.Write([]byte{0x05, 0x00})
-	return err
+	for _, method := range methods {
+		if method == 0x00 {
+			_, err := conn.Write([]byte{0x05, 0x00})
+			return err
+		}
+	}
+	if _, err := conn.Write([]byte{0x05, 0xff}); err != nil {
+		return err
+	}
+	return errors.New("no supported SOCKS5 authentication method")
 }

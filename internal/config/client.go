@@ -7,10 +7,11 @@ import (
 )
 
 type ClientConfig struct {
-	LocalAddr  string `json:"local_addr"`
-	RemoteAddr string `json:"remote_addr"`
-	AuthToken  string `json:"auth_token"`
-	SNI        string `json:"sni"`
+	LocalAddr              string `json:"local_addr"`
+	RemoteAddr             string `json:"remote_addr"`
+	AuthToken              string `json:"auth_token"`
+	SNI                    string `json:"sni"`
+	CertificateFingerprint string `json:"certificate_fingerprint,omitempty"`
 }
 
 func LoadClientConfig(path string) (*ClientConfig, error) {
@@ -36,5 +37,8 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		return nil, fmt.Errorf("auth_token is empty")
 	}
 
+	if err := validateClient(&cfg); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
 }

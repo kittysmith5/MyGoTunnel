@@ -35,9 +35,9 @@ SOCKS5 应用
 
 修改网络流程前，先完整跟踪客户端和服务端两侧。当前控制协议顺序为：
 
-1. 客户端发送 `AUTH <token>\n`。
-2. 服务端返回 `OK\n` 或 `ERR\n`。
-3. 客户端发送 `CONNECT <host:port>\n`。
+1. 客户端一次写入 `AUTH <token>\nCONNECT <host:port>\n`；兼容旧客户端分两次发送。
+2. 服务端认证后返回 `OK\n` 或 `ERR\n`；失败时不得拨号目标。
+3. 客户端按顺序读取认证和 CONNECT 两条响应，服务端认证成功后读取 CONNECT。
 4. 服务端完成目标连接后返回 `OK\n`，失败时返回 `ERR\n`。
 5. 成功后双方不再解析行协议，直接转发原始字节流。
 
@@ -49,7 +49,10 @@ SOCKS5 应用
 - 认证读取的 deadline 必须在结束后清除，避免影响后续连接阶段。
 - SOCKS5 当前仅支持版本 5、无认证方式和 TCP `CONNECT`，地址支持 IPv4、域名及 IPv6。不要在未同步协议、响应和测试的情况下宣称支持 UDP 或其他认证方式。
 - uTLS 客户端使用 `HelloChrome_Auto`，客户端与服务端均协商 `http/1.1` ALPN。相关值属于连接兼容性的一部分。
-- `InsecureSkipVerify` 是当前实现的一部分，也是明确的安全敏感点。除非任务要求，不要顺手改变；若改变，需同时说明证书信任、SNI 和部署配置的迁移方式。
+- 有导入指纹时，`InsecureSkipVerify` 仅用于替代公共 CA 验证，必须同时通过 `VerifyPeerCertificate` 校验固定证书指纹；没有指纹时使用系统 CA 和主机名验证。修改时同步说明证书信任、SNI 和部署迁移。
+- 预连接协议是 AUTH → OK → PREPARE → READY → CONNECT → OK；原有普通流程继续兼容。备用连接有独立数量/闲置限制，取用后不得回池；后台读取必须在交接前停止。
+- `-max-connections` 限制接受连接总数；备用等待时释放 setup permit，CONNECT 前必须重新申请。
+- `-max-setup` 限制正在建连的请求，成功进入转发前释放，失败返回也必须释放；不要让长连接占用建连额度。
 - 保留 `relay.CopyBidirectional` 的半关闭语义：正常 EOF 后等待反向数据排空；复制或半关闭失败时解除另一方向的阻塞，并在两个复制 goroutine 都退出后返回。修改转发退出策略时要考虑一侧 EOF、仍在返回的数据、阻塞 goroutine、字节统计和连接释放。
 
 ## 配置约定
@@ -60,6 +63,7 @@ SOCKS5 应用
 - `remote_addr`：必填，远端服务端的 `host:port`。
 - `auth_token`：必填。
 - `sni`：可选；为空时从 `remote_addr` 推导主机名。
+- `certificate_fingerprint`：可选，服务端叶证书 DER 的 SHA-256 十六进制指纹；存在时使用固定指纹验证，否则使用系统 CA 和主机名验证。
 
 服务端实际读取的字段只有：
 
