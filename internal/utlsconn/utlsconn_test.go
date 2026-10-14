@@ -3,10 +3,12 @@ package utlsconn
 import (
 	"context"
 	"crypto/tls"
+	utls "github.com/refraction-networking/utls"
 	"io"
 	"mygotunnel/internal/config"
 	"net"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -53,7 +55,12 @@ func TestCertificateVerification(t *testing.T) {
 				}
 				defer raw.Close()
 				raw.SetDeadline(time.Now().Add(3 * time.Second))
-				conn := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"http/1.1"}})
+				conn := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}, GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+					if !reflect.DeepEqual(hello.SupportedProtos, []string{"http/1.1"}) {
+						t.Errorf("wire ALPN: %v", hello.SupportedProtos)
+					}
+					return nil, nil
+				}})
 				err = conn.Handshake()
 				if err == nil && tc.success {
 					state := conn.ConnectionState()
@@ -91,5 +98,37 @@ func TestCertificateVerification(t *testing.T) {
 	}
 	if _, err := Dial(context.Background(), "127.0.0.1:1", "localhost", "bad"); err == nil {
 		t.Fatal("invalid pin accepted")
+	}
+}
+
+func TestTunnelHelloSpec(t *testing.T) {
+	first, err := tunnelHelloSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := tunnelHelloSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ext := range first.Extensions {
+		switch e := ext.(type) {
+		case *utls.ALPNExtension:
+			found = true
+			if !reflect.DeepEqual(e.AlpnProtocols, []string{"http/1.1"}) {
+				t.Fatal(e.AlpnProtocols)
+			}
+			e.AlpnProtocols[0] = "mutated"
+		case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:
+			t.Fatal("unexpected HTTP/2 settings")
+		}
+	}
+	if !found {
+		t.Fatal("missing ALPN")
+	}
+	for _, ext := range second.Extensions {
+		if e, ok := ext.(*utls.ALPNExtension); ok && e.AlpnProtocols[0] != "http/1.1" {
+			t.Fatal("shared extension state")
+		}
 	}
 }

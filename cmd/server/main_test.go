@@ -446,3 +446,25 @@ func TestPreparedTLSConnectionIdleAdmissionAndPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestServerTLSConfig(t *testing.T) {
+	cfg := serverTLSConfig(tls.Certificate{})
+	if cfg.MinVersion != tls.VersionTLS12 {
+		t.Fatal("unexpected minimum TLS version")
+	}
+	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != "http/1.1" {
+		t.Fatal(cfg.NextProtos)
+	}
+	if len(cfg.CipherSuites) != 6 {
+		t.Fatal("unexpected suite count")
+	}
+	for _, id := range cfg.CipherSuites {
+		switch id {
+		case tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:
+		default:
+			t.Fatalf("non-AEAD/ECDHE suite: %x", id)
+		}
+	}
+}

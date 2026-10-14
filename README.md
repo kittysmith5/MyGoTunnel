@@ -127,3 +127,9 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 客户端日志的 `pool_hit` 表示使用了有效备用连接，`pool_fallback` 表示备用传输失败后普通建连回退，`pool_acquire_duration` 记录取用耗时。命中时 TCP/TLS 阶段为零，表示它们已经在后台完成，不表示没有消耗 CPU 或网络。服务端 `pool_connection` 表示此连接通过 PREPARE 进入。 服务端 `setup_duration` 已排除备用等待时间，单独记录为 `idle_duration`；其中认证仍是在备用阶段完成的。`connect_duration` 仅表示当前 CONNECT 阶段，不应直接与客户端总时间比较。
 
 新客户端兼容旧服务端；旧客户端也兼容新服务端。首次启动、池未填满、突发请求超出池大小以及网络故障时，仍可能进行完整握手；预连接主要将工作提前，并不保证所有请求都有固定耗时。
+
+## TLS 握手配置
+
+客户端使用 uTLS `HelloChrome_133` 基线，每条连接独立生成模板；实际 ALPN 仅提供 `http/1.1`，移除模板中仅适用于 h2 的 ALPS 扩展。此前 `HelloChrome_Auto` 在当前依赖版本也对应 Chrome 133，但模板自带的 h2/ALPS 不会仅因 Config.NextProtos 而移除。此修改验证实际线上 ClientHello，避免服务端选择客户端未实现的 h2。调整后的模板不是完整 Chrome 指纹，也不宣称模拟当前最新 Chrome。
+
+服务端继续使用 Go 标准 TLS，明确最低 TLS 1.2，TLS 1.2 仅允许 ECDHE + AES-GCM/ChaCha20-Poly1305；TLS 1.3 密码套件及密钥交换保留 Go 默认配置。此为一致性与安全整改，不是 nginx/OpenSSL 服务端指纹模仿。自定义 AUTH/CONNECT 仍不是 HTTP，即使协商 http/1.1 也不表示支持网页。TCP、预连接、半关闭及证书指纹验证保持原有机制；不引入 WSS，不增加握手往返。旧客户端仍可连接新服务端，TLS 1.0/1.1 和仅支持旧 TLS 1.2 套件的外部客户端不再支持。

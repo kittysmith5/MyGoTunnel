@@ -96,10 +96,7 @@ func run(configPath string, logger *slog.Logger, maxSetup int, options ...server
 		return fmt.Errorf("load TLS certificate: %w", err)
 	}
 
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"http/1.1"},
-	}
+	tlsConfig := serverTLSConfig(cert)
 
 	ln, err := tls.Listen("tcp", cfg.ListenAddr, tlsConfig)
 	if err != nil {
@@ -309,4 +306,22 @@ func rejectAuth(conn net.Conn, reason error) error {
 	}
 
 	return reason
+}
+
+// serverTLSConfig hardens the existing TLS transport; it does not emulate OpenSSL.
+func serverTLSConfig(cert tls.Certificate) *tls.Config {
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+		// TLS 1.3 suites and key exchange retain Go defaults (including hybrid KEM).
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		},
+	}
 }

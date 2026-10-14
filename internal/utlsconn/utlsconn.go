@@ -60,6 +60,7 @@ func DialWithTimings(ctx context.Context, remoteAddr, sni, fingerprint string) (
 		ServerName:         serverName,
 		InsecureSkipVerify: len(expected) != 0,
 		NextProtos:         []string{"http/1.1"},
+		MinVersion:         utls.VersionTLS12,
 	}
 	if len(expected) != 0 {
 		// The imported certificate pin replaces public CA verification.
@@ -74,7 +75,15 @@ func DialWithTimings(ctx context.Context, remoteAddr, sni, fingerprint string) (
 			return nil
 		}
 	}
-	tlsConn := utls.UClient(tcpConn, tlsConfig, utls.HelloChrome_Auto)
+	tlsConn := utls.UClient(tcpConn, tlsConfig, utls.HelloCustom)
+	spec, err := tunnelHelloSpec()
+	if err == nil {
+		err = tlsConn.ApplyPreset(spec)
+	}
+	if err != nil {
+		_ = tcpConn.Close()
+		return nil, timings, fmt.Errorf("prepare ClientHello: %w", err)
+	}
 
 	timings.Stage = "tls"
 	tlsStarted := time.Now()
@@ -96,4 +105,25 @@ func serverNameFromAddr(addr string) string {
 	}
 
 	return strings.Trim(host, "[]")
+}
+
+// tunnelHelloSpec uses a reproducible Chrome baseline, adapted to our ALPN.
+// Each connection needs its own spec: ApplyPreset mutates extension state.
+func tunnelHelloSpec() (*utls.ClientHelloSpec, error) {
+	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_133)
+	if err != nil {
+		return nil, err
+	}
+	extensions := spec.Extensions[:0]
+	for _, extension := range spec.Extensions {
+		switch e := extension.(type) {
+		case *utls.ALPNExtension:
+			e.AlpnProtocols = []string{"http/1.1"}
+		case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:
+			continue // HTTP/2 application settings do not belong to this tunnel.
+		}
+		extensions = append(extensions, extension)
+	}
+	spec.Extensions = extensions
+	return &spec, nil
 }
