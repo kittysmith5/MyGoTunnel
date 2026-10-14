@@ -231,27 +231,33 @@ func TestPoolValidationAndEmptyTake(t *testing.T) {
 func TestAdaptivePoolBoundedGrowthAndStats(t *testing.T) {
 	f := &pipeFactory{}
 	defer f.close()
-	p, err := New(Options{Size: 1, MaxSize: 3}, f.create, nil)
+	var block atomic.Bool
+	p, err := New(Options{Size: 1, MaxSize: 3}, func(ctx context.Context) (*Entry, error) {
+		if block.Load() {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return f.create(ctx)
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer p.Close()
-	count := 0
-	for round := 0; round < 3; round++ {
-		n := p.Stats().Target
-		idle(t, p, n)
-		for i := 0; i < n; i++ {
-			e := p.Take(context.Background())
-			if e == nil {
-				t.Fatal("missing prepared connection")
-			}
-			e.Conn.Close()
-			count++
+	idle(t, p, 1)
+	block.Store(true)
+	e := p.Take(context.Background())
+	if e == nil {
+		t.Fatal("missing entry")
+	}
+	e.Conn.Close()
+	for i := 0; i < 10; i++ {
+		if p.Take(context.Background()) != nil {
+			t.Fatal("blocked factory produced entry")
 		}
 	}
 	p.RecordFallback()
 	s := p.Stats()
-	if s.Target != 3 || s.Hits != uint64(count) || s.Misses != 0 || s.Fallbacks != 1 || s.HitRate != 100 {
+	if s.Target != 3 || s.Hits != 1 || s.Misses != 10 || s.Fallbacks != 1 {
 		t.Fatalf("stats: %+v", s)
 	}
 	p.mu.Lock()
@@ -264,6 +270,7 @@ func TestAdaptivePoolBoundedGrowthAndStats(t *testing.T) {
 		t.Fatal("did not shrink")
 	}
 }
+
 func TestPoolMissAndMaxValidation(t *testing.T) {
 	p, err := New(Options{Size: 1, MaxSize: 2}, func(ctx context.Context) (*Entry, error) { <-ctx.Done(); return nil, ctx.Err() }, nil)
 	if err != nil {

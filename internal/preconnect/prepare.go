@@ -22,6 +22,7 @@ type Entry struct {
 	done        chan struct{}
 	guardErr    error
 	expires     time.Time
+	refreshAt   time.Time
 }
 
 func Prepare(ctx context.Context, cfg *config.ClientConfig) (entry *Entry, err error) {

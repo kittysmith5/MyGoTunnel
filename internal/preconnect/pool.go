@@ -22,24 +22,26 @@ type Options struct {
 
 // Pool owns only unused, authenticated connections. Used connections never return.
 type Pool struct {
-	mu                      sync.Mutex
-	target                  int
-	hits, misses, fallbacks uint64
-	lastDemand              time.Time
-	lastShrink              time.Time
-	idle                    []*Entry
-	filling                 int
-	closed                  bool
-	unsupportedLogged       bool
-	nextRetry               time.Time
-	retry                   time.Duration
-	opts                    Options
-	factory                 Factory
-	logger                  *slog.Logger
-	ctx                     context.Context
-	cancel                  context.CancelFunc
-	wake                    chan struct{}
-	wg                      sync.WaitGroup
+	mu                            sync.Mutex
+	target                        int
+	hits, misses, fallbacks       uint64
+	lastDemand                    time.Time
+	lastShrink                    time.Time
+	idle                          []*Entry
+	filling                       int
+	closed                        bool
+	unsupportedLogged             bool
+	nextRetry                     time.Time
+	retry                         time.Duration
+	batchFailed, batchUnsupported bool
+	renewed                       uint64
+	opts                          Options
+	factory                       Factory
+	logger                        *slog.Logger
+	ctx                           context.Context
+	cancel                        context.CancelFunc
+	wake                          chan struct{}
+	wg                            sync.WaitGroup
 }
 
 func New(opts Options, factory Factory, logger *slog.Logger) (*Pool, error) {
@@ -81,17 +83,49 @@ func (p *Pool) manage() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		var retired *Entry
+		var jobs []*Entry
 		p.mu.Lock()
 		now := time.Now()
 		p.shrinkLocked(now)
-		if !p.closed && p.ctx.Err() == nil && !now.Before(p.nextRetry) {
-			for len(p.idle)+p.filling < p.target {
-				p.filling++
+		// A retry advances once per completed batch, never once per parallel worker.
+		if !p.closed && p.ctx.Err() == nil && p.filling == 0 && !now.Before(p.nextRetry) {
+			p.batchFailed = false
+			p.batchUnsupported = false
+			for len(p.idle)+len(jobs) < p.target {
+				jobs = append(jobs, nil)
+			}
+			// At most one proactive replacement per batch. Keep the old entry until
+			// success when spare capacity exists. At the hard cap retire at most one,
+			// and never proactively remove the last ready connection.
+			if len(jobs) == 0 {
+				for i, e := range p.idle {
+					if now.Before(e.refreshAt) {
+						continue
+					}
+					if len(p.idle) < p.opts.MaxSize {
+						jobs = append(jobs, e)
+					} else if len(p.idle) > 1 {
+						p.idle = append(p.idle[:i], p.idle[i+1:]...)
+						retired = e
+						jobs = append(jobs, e)
+					}
+					break
+				}
+			}
+			p.filling = len(jobs)
+			for range jobs {
 				p.wg.Add(1)
-				go p.fill()
 			}
 		}
 		p.mu.Unlock()
+		if retired != nil {
+			_ = retired.Conn.Close()
+		}
+		// At the hard cap close the retired socket before opening its successor.
+		for _, old := range jobs {
+			go p.fill(old)
+		}
 		select {
 		case <-p.ctx.Done():
 			return
@@ -100,7 +134,37 @@ func (p *Pool) manage() {
 		}
 	}
 }
-func (p *Pool) fill() {
+func (p *Pool) completeBatchLocked(err error) {
+	if err != nil {
+		p.batchFailed = true
+		if errors.Is(err, ErrUnsupported) {
+			p.batchUnsupported = true
+		}
+	}
+	if p.filling != 0 {
+		return
+	}
+	if !p.batchFailed {
+		p.retry = 0
+		p.nextRetry = time.Time{}
+		p.unsupportedLogged = false
+		return
+	}
+	if p.batchUnsupported {
+		p.retry = p.opts.RetryMax
+	} else if p.retry == 0 {
+		p.retry = p.opts.RetryMin
+	} else if p.retry >= p.opts.RetryMax/2 {
+		p.retry = p.opts.RetryMax
+	} else {
+		p.retry *= 2
+	}
+	if p.retry > p.opts.RetryMax {
+		p.retry = p.opts.RetryMax
+	}
+	p.nextRetry = time.Now().Add(p.retry + time.Duration(rand.Float64()*float64(p.retry)/4))
+}
+func (p *Pool) fill(old *Entry) {
 	defer p.wg.Done()
 	ctx, cancel := context.WithTimeout(p.ctx, 35*time.Second)
 	entry, err := p.factory(ctx)
@@ -109,54 +173,75 @@ func (p *Pool) fill() {
 		if entry == nil || entry.Conn == nil || entry.Reader == nil {
 			err = fmt.Errorf("invalid prepared connection")
 		} else {
-			err = entry.Conn.SetReadDeadline(time.Now().Add(p.opts.IdleTTL))
+			// Retire between 80% and 100% of the configured TTL, always before the
+			// original upper bound. Start replacement another 20% TTL earlier.
+			ttl := time.Duration(float64(p.opts.IdleTTL) * (0.8 + 0.2*rand.Float64()))
+			entry.expires = time.Now().Add(ttl)
+			entry.refreshAt = entry.expires.Add(-p.opts.IdleTTL / 5)
+			err = entry.Conn.SetReadDeadline(entry.expires)
 		}
 	}
 	p.mu.Lock()
 	p.filling--
-	if err != nil {
-		logUnsupported := false
-		if errors.Is(err, ErrUnsupported) {
-			p.retry = p.opts.RetryMax
-			logUnsupported = !p.unsupportedLogged
-			p.unsupportedLogged = true
-		} else {
-			if p.retry == 0 {
-				p.retry = p.opts.RetryMin
-			} else {
-				p.retry *= 2
-			}
-			if p.retry > p.opts.RetryMax {
-				p.retry = p.opts.RetryMax
-			}
+	if p.closed || p.ctx.Err() != nil {
+		p.mu.Unlock()
+		if entry != nil && entry.Conn != nil {
+			_ = entry.Conn.Close()
 		}
-		p.nextRetry = time.Now().Add(p.retry + time.Duration(rand.Float64()*float64(p.retry)/4))
+		return
+	}
+	p.completeBatchLocked(err)
+	if err != nil {
+		unsupported := errors.Is(err, ErrUnsupported) && !p.unsupportedLogged
+		if unsupported {
+			p.unsupportedLogged = true
+		}
 		p.mu.Unlock()
 		if entry != nil && entry.Conn != nil {
 			_ = entry.Conn.Close()
 		}
 		if p.logger != nil {
-			p.logger.Debug("pool miss", "error", err)
+			p.logger.Debug("pool fill failed", "error", err)
+			if unsupported {
+				p.logger.Info("pool unsupported; retrying")
+			}
 		}
-		if logUnsupported && p.logger != nil {
-			p.logger.Info("pool unsupported; retrying")
-		}
+		p.signal()
 		return
 	}
-	if p.closed || p.ctx.Err() != nil {
+	var retired *Entry
+	if old != nil {
+		for i, e := range p.idle {
+			if e == old {
+				p.idle = append(p.idle[:i], p.idle[i+1:]...)
+				retired = old
+				break
+			}
+		}
+	}
+	// Demand may have consumed the old entry, or the target may have shrunk.
+	// Never close a handed-off connection or retain surplus replacements.
+	if len(p.idle) >= p.target {
 		p.mu.Unlock()
-		entry.Conn.Close()
+		_ = entry.Conn.Close()
+		if retired != nil {
+			_ = retired.Conn.Close()
+		}
+		p.signal()
 		return
 	}
-	p.unsupportedLogged = false
-	p.retry = 0
-	p.nextRetry = time.Time{}
-	entry.expires = time.Now().Add(p.opts.IdleTTL)
 	entry.done = make(chan struct{})
 	p.idle = append(p.idle, entry)
+	if old != nil {
+		p.renewed++
+	}
 	p.wg.Add(1)
 	go p.guard(entry)
 	p.mu.Unlock()
+	if retired != nil {
+		_ = retired.Conn.Close()
+	}
+	p.signal()
 }
 func (p *Pool) guard(entry *Entry) {
 	defer p.wg.Done()
@@ -266,6 +351,8 @@ func (p *Pool) IdleCount() int { p.mu.Lock(); defer p.mu.Unlock(); return len(p.
 // successful target connection. Fallbacks count subsequent transport failures.
 type Stats struct {
 	Hits, Misses, Fallbacks    uint64
+	Renewed                    uint64
+	Retry                      time.Duration
 	Idle, Filling, Target, Max int
 	HitRate                    float64
 }
@@ -273,7 +360,7 @@ type Stats struct {
 func (p *Pool) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	s := Stats{Hits: p.hits, Misses: p.misses, Fallbacks: p.fallbacks, Idle: len(p.idle), Filling: p.filling, Target: p.target, Max: p.opts.MaxSize}
+	s := Stats{Renewed: p.renewed, Retry: p.retry, Hits: p.hits, Misses: p.misses, Fallbacks: p.fallbacks, Idle: len(p.idle), Filling: p.filling, Target: p.target, Max: p.opts.MaxSize}
 	if n := s.Hits + s.Misses; n > 0 {
 		s.HitRate = 100 * float64(s.Hits) / float64(n)
 	}
