@@ -221,3 +221,28 @@ SOCKS 认证仅属于客户端本地配置，不导出到 mygotunnel 连接码�
 本轮验证：完整 race 测试、vet、构建通过；连接池与基准测试重复运行。双机使用独立端口和临时认证配置，回声、上传、下载均校验通过；默认周期内观察到 renewed=4，替换后请求正常。独立服务端重启后首次请求约 2.319 秒内完成（含 1 MiB 传输），客户端无需手动重启。此为短时恢复/正确性验证，不是长期稳定性或带宽提速承诺；正式服务未替换。
 
 错峰替换性能对照：上一版 8798e3f 与本轮代码在同一双机真实 TCP/TLS 链路按 A/B/B/A 运行；两边均使用 3 秒 TTL 加速到期场景，每次池就绪后空闲 3.020 秒再发 4 路请求，各 24 个样本、无失败。池命中率 33.3%→83.3%，建连 P50 201.958→68.438 ms、P95 616.640→279.137 ms。计时不含本地 SOCKS 协商，目标是服务端本地回声；不是默认 45 秒配置的全场景收益，也不代表大文件带宽提升。小样本且网络有波动，不作长期保证。受控 1 秒 TTL/100ms 准备实验中，完全空池时间约 198ms→0，但未满池累计时间约 201ms→313ms；提前替换也可能增加后台握手，需一起评估成本。
+
+## 同路径裸 TCP 对照与运行时诊断
+
+基准新增 `-direct`：直接连接 `-target`，跳过本地 SOCKS，使用同一负载、校验及半关闭协议，对照原始 TCP 和隧道。echo 仍对应 -echo 目标，upload/download 对应 -serve 目标；direct 不接受 SOCKS auth-file。
+
+`-interval 1s`（默认）在 stderr 每秒输出 progress JSON，记录实际上传/下载负载字节和该间隔 Mbps；0 禁用。stdout 保留最终汇总 JSON，新增 transport、uploaded_bytes/downloaded_bytes、CPU 秒、alloc_bytes、mallocs、GC 次数及末次 RSS。CPU 和 RSS 有 available 标记，非 Linux 不宣称已获得相应指标。汇总中的 CPU/分配属于 bench 进程，不等于代理进程；控制报文、测试密钥和摘要不计作负载字节，失败流可能已有部分实际传输。进度字节按应用 Write/Read 成功量计数，上传可能尚在内核发送队列，不能当作网卡实时线速；最终完成样本需远端摘要/EOF 确认。
+
+客户端、服务端和 bench 均可选 `-runtime-metrics /private/run.jsonl`，默认关闭；开启时以 0600 独占创建文件，已有文件拒绝启动，避免覆盖。输出初始及每秒进程快照：UTC 时间、Linux 用户+系统 CPU 累计秒、RSS、Go HeapAlloc、TotalAlloc、Mallocs、NumGC。两次累计值差除采样时间得到 CPU 占用或分配速率；CPU 100% 表示一核，RSS 不是 Go 堆大小。显式 stop 会等待写入任务结束，SIGTERM 直接退出时可能没有最终快照，应以已有样本分析。只记录资源数据，不含配置和凭据。采样本身也有少量分配及开销，不宜用微秒级样本推断收益。
+
+测试目标可使用 `-target-key-file /private/target.key`，文件必须是独立随机生成的 32 个原始字节，测试发起端也指定同一密钥文件。目标在接收测试头之前检查前缀，错误/截断拒绝；不得复用 SOCKS 密码或服务端 token。此为临时测试访问控制，不加密裸 TCP，不是通用对外认证服务。默认仍应监听回环；仅为同 IP/同端口 A/B 临时对照时才开放，受并发和期限限制，结束立即停止。
+
+```bash
+# 目标端（通常仅监听回环）
+./bench -serve 127.0.0.1:18082 -target-key-file /private/target.key -runtime-metrics /private/target-run.jsonl
+# 原始 TCP 样本：target 需为测试端实际可达地址
+./bench -direct -target test-host:18082 -mode upload -mib 8 -streams 1 -target-key-file /private/target.key
+# 隧道样本：target 从服务端视角解释，可按需加 SOCKS auth-file
+./bench -socks 127.0.0.1:1080 -target 127.0.0.1:18082 -mode upload -mib 8 -streams 1 -target-key-file /private/target.key
+```
+
+可靠对照应保持目标 IP/端口、负载和并发一致，交替 A/B/B/A，避免基准复制、额外测速抢占带宽。结合两端进程 CPU/堆指标和 TCP 重传、RTT、窗口快照；快照是采样，不能累加同一 socket 的累计重传计数来当成总丢包率。未测实际代理 CPU 或原始 TCP 时，不得将上传慢直接归因为 TLS 或缓冲区。
+
+2026-10-14 同路径对照：同一 x86_64→ARM64 公网 IP/18443，按裸 TCP/TLS/TLS/裸 TCP 交替运行。每轮单流上传 8 MiB、四流各下载 16 MiB，8 项均校验通过。上传裸 TCP 4.187/4.235 Mbps、隧道 4.263/4.132 Mbps，中位数差约 0.32%；绕过隧道后约 4.2 Mbps 的上传限制仍存在。下载两版都波动大，小样本不足判断 TLS 吞吐损耗。代理客户端 CPU 平均约单核 0.96～1.49%，服务端约 0.84～1.02%，均未触发 GC；采样观察到上传重传。当前证据不支持 TLS 计算或 Go 分配/GC 为主要上传瓶颈，但不能据此定位具体网络节点或限速原因。本轮未调整转发缓冲、密码套件、内核参数或正式服务。
+
+四路上传补测（同 IP/18443，TCP/TLS/TLS/TCP 顺序，各两次）：每流 8 MiB，单流总 8 MiB、四流总 32 MiB，8 项/20 条流均校验通过。裸 TCP 单流中位数 4.123 Mbps、四流合计 3.899 Mbps；TLS 隧道单流 4.049 Mbps、四流合计 3.888 Mbps。该路径增加并发未接近 40 Mbps，当前限制不主要是连接数不足；不能仅凭这些样本定位具体限速节点，亦不能把较低四流数值推广为并发必然变慢。正式服务及内核参数未变更。

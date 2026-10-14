@@ -12,6 +12,7 @@ import (
 
 	"mygotunnel/internal/admission"
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/diagnostics"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/preconnect"
 	"mygotunnel/internal/relay"
@@ -33,6 +34,7 @@ func main() {
 	maxSetup := flag.Int("max-setup", 128, "maximum concurrent connection setups; established tunnels do not count")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
 	logFormat := flag.String("log-format", logging.FormatText, "log format: text or json")
+	metricsPath := flag.String("runtime-metrics", "", "optional exclusive private runtime JSONL output file")
 	flag.Parse()
 
 	logger, err := logging.New(os.Stderr, logging.Options{
@@ -53,8 +55,15 @@ func main() {
 		logger.Info("imported", "config_path", *configPath)
 		return
 	}
+	stopMetrics, err := diagnostics.Start(*metricsPath)
+	if err != nil {
+		logger.Error("metrics failed", "error", err)
+		os.Exit(1)
+	}
+	defer stopMetrics()
 	if err := run(*configPath, logger, *maxSetup, clientOptions{*poolSize, *maxConnections, *poolMax}); err != nil {
 		logger.Error("stopped", "error", err)
+		stopMetrics()
 		os.Exit(1)
 	}
 }

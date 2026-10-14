@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"mygotunnel/internal/diagnostics"
 	"net"
 	"os"
 	"sync"
@@ -20,9 +21,12 @@ type credentials struct {
 	Password string `json:"password"`
 }
 type options struct {
-	Mode    string
-	Auth    *credentials
-	Timeout time.Duration
+	Mode      string
+	Auth      *credentials
+	Timeout   time.Duration
+	Direct    bool
+	TargetKey []byte
+	Progress  *progress
 }
 
 const maxPayload = int64(4096) << 20
@@ -31,6 +35,10 @@ func validAuth(a *credentials) bool {
 	return a == nil || (len(a.Username) > 0 && len(a.Username) <= 255 && len(a.Password) > 0 && len(a.Password) <= 255)
 }
 func main() {
+	metricsPath := flag.String("runtime-metrics", "", "optional exclusive private runtime JSONL file")
+	direct := flag.Bool("direct", false, "connect directly to target without SOCKS, for raw TCP comparison")
+	keyFile := flag.String("target-key-file", "", "optional file with exactly 32 raw bytes to authenticate test target")
+	interval := flag.Duration("interval", time.Second, "progress JSON interval on stderr; 0 disables")
 	echo := flag.String("echo", "", "serve legacy echo target")
 	serve := flag.String("serve", "", "serve bounded upload/download target (keep on loopback)")
 	socks := flag.String("socks", "127.0.0.1:1080", "SOCKS5 endpoint")
@@ -42,20 +50,36 @@ func main() {
 	streams := flag.Int("streams", 1, "parallel streams (1..128)")
 	flag.Parse()
 	fail := func(e error) { fmt.Fprintln(os.Stderr, e); os.Exit(2) }
-	if *timeout <= 0 || *mib < 1 || *mib > 4096 || *streams < 1 || *streams > 128 || (*mode != "echo" && *mode != "upload" && *mode != "download") || (*echo != "" && *serve != "") {
+	if *interval < 0 || *timeout <= 0 || *mib < 1 || *mib > 4096 || *streams < 1 || *streams > 128 || (*mode != "echo" && *mode != "upload" && *mode != "download") || (*echo != "" && *serve != "") {
 		fail(fmt.Errorf("invalid mode, limits or timeout"))
 	}
+	var key []byte
+	if *keyFile != "" {
+		var e error
+		key, e = os.ReadFile(*keyFile)
+		if e != nil || len(key) != 32 {
+			fail(fmt.Errorf("target key must be exactly 32 raw bytes"))
+		}
+	}
+	stopMetrics, metricErr := diagnostics.Start(*metricsPath)
+	if metricErr != nil {
+		fail(metricErr)
+	}
+	defer stopMetrics()
 	if *echo != "" || *serve != "" {
 		addr := *serve
 		if *echo != "" {
 			addr = *echo
 		}
-		if e := serveTarget(addr, *echo != "", *timeout); e != nil {
+		if e := serveTargetWithKey(addr, *echo != "", *timeout, key); e != nil {
 			fail(e)
 		}
 		return
 	}
-	o := options{Mode: *mode, Timeout: *timeout}
+	o := options{Mode: *mode, Timeout: *timeout, Direct: *direct, TargetKey: key}
+	if *direct && *authFile != "" {
+		fail(fmt.Errorf("auth-file is for SOCKS, not direct TCP"))
+	}
 	if *authFile != "" {
 		f, e := os.Open(*authFile)
 		if e != nil {
@@ -68,7 +92,11 @@ func main() {
 			fail(fmt.Errorf("invalid auth file: username and password must be 1..255 bytes"))
 		}
 	}
+	meter := &progress{}
+	o.Progress = meter
+	baseline := diagnostics.Snapshot()
 	start := time.Now()
+	stopProgress := meter.start(*interval, *mode, *direct)
 	var wg sync.WaitGroup
 	errs := make(chan error, *streams)
 	for i := 0; i < *streams; i++ {
@@ -84,13 +112,15 @@ func main() {
 			fmt.Fprintln(os.Stderr, e)
 		}
 	}
+	stopProgress()
 	sec := time.Since(start).Seconds()
+	measured := diagnostics.Snapshot()
 	rate := float64(*mib*int64(*streams-failures)) / sec
 	wire := rate
 	if *mode == "echo" {
 		wire *= 2
 	}
-	if e := json.NewEncoder(os.Stdout).Encode(map[string]any{"mode": *mode, "streams": *streams, "mib_per_stream": *mib, "seconds": sec, "payload_mib_per_second": rate, "bidirectional_mib_per_second": wire, "payload_mbps": rate * 8.388608, "failures": failures}); e != nil {
+	if e := json.NewEncoder(os.Stdout).Encode(map[string]any{"transport": map[bool]string{true: "tcp", false: "socks"}[*direct], "cpu_seconds": measured.CPUSeconds - baseline.CPUSeconds, "cpu_available": measured.CPUAvailable, "alloc_bytes": measured.TotalAlloc - baseline.TotalAlloc, "mallocs": measured.Mallocs - baseline.Mallocs, "gc_cycles": measured.NumGC - baseline.NumGC, "rss_bytes": measured.RSSBytes, "rss_available": measured.RSSAvailable, "uploaded_bytes": meter.tx.Load(), "downloaded_bytes": meter.rx.Load(), "mode": *mode, "streams": *streams, "mib_per_stream": *mib, "seconds": sec, "payload_mib_per_second": rate, "bidirectional_mib_per_second": wire, "payload_mbps": rate * 8.388608, "failures": failures}); e != nil {
 		fail(e)
 	}
 	if failures > 0 {
@@ -105,7 +135,11 @@ func transferWithOptions(socks, target string, size int64, o options) error {
 		return fmt.Errorf("invalid transfer options")
 	}
 	start := time.Now()
-	c, e := net.DialTimeout("tcp", socks, min(10*time.Second, o.Timeout))
+	dialAddress := socks
+	if o.Direct {
+		dialAddress = target
+	}
+	c, e := net.DialTimeout("tcp", dialAddress, min(10*time.Second, o.Timeout))
 	if e != nil {
 		return e
 	}
@@ -113,52 +147,62 @@ func transferWithOptions(socks, target string, size int64, o options) error {
 	if e = c.SetDeadline(start.Add(o.Timeout)); e != nil {
 		return e
 	}
-	if e = negotiate(c, o.Auth); e != nil {
-		return e
-	}
-	host, port, e := net.SplitHostPort(target)
-	if e != nil {
-		return e
-	}
-	if len(host) == 0 || len(host) > 255 {
-		return fmt.Errorf("invalid host")
-	}
-	p, e := net.LookupPort("tcp", port)
-	if e != nil {
-		return e
-	}
-	if p < 1 {
-		return fmt.Errorf("invalid port")
-	}
-	req := append([]byte{5, 1, 0, 3, byte(len(host))}, host...)
-	req = binary.BigEndian.AppendUint16(req, uint16(p))
-	if e = writeAll(c, req); e != nil {
-		return e
-	}
-	head := make([]byte, 4)
-	if _, e = io.ReadFull(c, head); e != nil {
-		return e
-	}
-	if head[0] != 5 || head[1] != 0 || head[2] != 0 {
-		return fmt.Errorf("SOCKS CONNECT rejected")
-	}
-	n := 0
-	switch head[3] {
-	case 1:
-		n = 6
-	case 4:
-		n = 18
-	case 3:
-		b := make([]byte, 1)
-		if _, e = io.ReadFull(c, b); e != nil {
+	if !o.Direct {
+		if e = negotiate(c, o.Auth); e != nil {
 			return e
 		}
-		n = int(b[0]) + 2
-	default:
-		return fmt.Errorf("invalid SOCKS address type")
+		host, port, e := net.SplitHostPort(target)
+		if e != nil {
+			return e
+		}
+		if len(host) == 0 || len(host) > 255 {
+			return fmt.Errorf("invalid host")
+		}
+		p, e := net.LookupPort("tcp", port)
+		if e != nil {
+			return e
+		}
+		if p < 1 {
+			return fmt.Errorf("invalid port")
+		}
+		req := append([]byte{5, 1, 0, 3, byte(len(host))}, host...)
+		req = binary.BigEndian.AppendUint16(req, uint16(p))
+		if e = writeAll(c, req); e != nil {
+			return e
+		}
+		head := make([]byte, 4)
+		if _, e = io.ReadFull(c, head); e != nil {
+			return e
+		}
+		if head[0] != 5 || head[1] != 0 || head[2] != 0 {
+			return fmt.Errorf("SOCKS CONNECT rejected")
+		}
+		n := 0
+		switch head[3] {
+		case 1:
+			n = 6
+		case 4:
+			n = 18
+		case 3:
+			b := make([]byte, 1)
+			if _, e = io.ReadFull(c, b); e != nil {
+				return e
+			}
+			n = int(b[0]) + 2
+		default:
+			return fmt.Errorf("invalid SOCKS address type")
+		}
+		if _, e = io.CopyN(io.Discard, c, int64(n)); e != nil {
+			return e
+		}
 	}
-	if _, e = io.CopyN(io.Discard, c, int64(n)); e != nil {
-		return e
+	if len(o.TargetKey) > 0 {
+		if len(o.TargetKey) != 32 {
+			return fmt.Errorf("invalid target key")
+		}
+		if e = writeAll(c, o.TargetKey); e != nil {
+			return e
+		}
 	}
 	if o.Mode != "echo" {
 		header := append([]byte("MGB1"), byte(1))
@@ -174,10 +218,10 @@ func transferWithOptions(socks, target string, size int64, o options) error {
 		if e = c.(*net.TCPConn).CloseWrite(); e != nil {
 			return e
 		}
-		return receivePayload(c, size)
+		return receivePayload(meterReader{c, o.Progress}, size)
 	}
 	if o.Mode == "upload" {
-		digest, e := sendPayload(c, size)
+		digest, e := sendPayload(meterWriter{c, o.Progress}, size)
 		if e != nil {
 			return e
 		}
@@ -195,7 +239,7 @@ func transferWithOptions(socks, target string, size int64, o options) error {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, e := sendPayload(c, size)
+		_, e := sendPayload(meterWriter{c, o.Progress}, size)
 		if e == nil {
 			e = c.(*net.TCPConn).CloseWrite()
 		}
@@ -204,7 +248,7 @@ func transferWithOptions(socks, target string, size int64, o options) error {
 		}
 		done <- e
 	}()
-	e = receivePayload(c, size)
+	e = receivePayload(meterReader{c, o.Progress}, size)
 	if e != nil {
 		c.Close()
 	}

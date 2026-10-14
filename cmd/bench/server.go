@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -12,6 +13,9 @@ import (
 
 // serveTarget is a test-only bounded endpoint, not a general proxy.
 func serveTarget(address string, echo bool, timeout time.Duration) error {
+	return serveTargetWithKey(address, echo, timeout, nil)
+}
+func serveTargetWithKey(address string, echo bool, timeout time.Duration, key []byte) error {
 	l, e := net.Listen("tcp", address)
 	if e != nil {
 		return e
@@ -30,6 +34,11 @@ func serveTarget(address string, echo bool, timeout time.Duration) error {
 				defer c.Close()
 				if e := c.SetDeadline(time.Now().Add(timeout)); e != nil {
 					return
+				}
+				if len(key) > 0 {
+					if checkTargetKey(c, key) != nil {
+						return
+					}
 				}
 				_ = handleTarget(c, echo)
 			}()
@@ -74,4 +83,18 @@ func handleTarget(c net.Conn, echo bool) error {
 	default:
 		return fmt.Errorf("invalid transfer mode")
 	}
+}
+
+func checkTargetKey(r io.Reader, key []byte) error {
+	if len(key) != 32 {
+		return fmt.Errorf("invalid target key configuration")
+	}
+	provided := make([]byte, 32)
+	if _, e := io.ReadFull(r, provided); e != nil {
+		return e
+	}
+	if subtle.ConstantTimeCompare(provided, key) != 1 {
+		return fmt.Errorf("target key rejected")
+	}
+	return nil
 }

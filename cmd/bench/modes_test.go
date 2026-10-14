@@ -50,7 +50,7 @@ func TestAuthenticatedModes(t *testing.T) {
 				writeAll(c, []byte{5, 0, 0, 1, 0, 0, 0, 0, 0, 0})
 				done <- handleTarget(c, mode == "echo")
 			}()
-			if e := transferWithOptions(l.Addr().String(), "echo.test:18081", 1<<20, options{mode, &credentials{"test-user", "test-password"}, 3 * time.Second}); e != nil {
+			if e := transferWithOptions(l.Addr().String(), "echo.test:18081", 1<<20, options{Mode: mode, Auth: &credentials{"test-user", "test-password"}, Timeout: 3 * time.Second}); e != nil {
 				t.Fatal(e)
 			}
 			if e := <-done; e != nil {
