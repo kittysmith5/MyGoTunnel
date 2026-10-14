@@ -22,26 +22,26 @@ type Options struct {
 
 // Pool owns only unused, authenticated connections. Used connections never return.
 type Pool struct {
-	mu                            sync.Mutex
-	target                        int
-	hits, misses, fallbacks       uint64
-	lastDemand                    time.Time
-	lastShrink                    time.Time
-	idle                          []*Entry
-	filling                       int
-	closed                        bool
-	unsupportedLogged             bool
-	nextRetry                     time.Time
-	retry                         time.Duration
-	batchFailed, batchUnsupported bool
-	renewed                       uint64
-	opts                          Options
-	factory                       Factory
-	logger                        *slog.Logger
-	ctx                           context.Context
-	cancel                        context.CancelFunc
-	wake                          chan struct{}
-	wg                            sync.WaitGroup
+	mu                      sync.Mutex
+	target                  int
+	hits, misses, fallbacks uint64
+	lastDemand              time.Time
+	lastShrink              time.Time
+	idle                    []*Entry
+	filling                 int
+	closed                  bool
+	unsupportedLogged       bool
+	nextRetry               time.Time
+	retry                   time.Duration
+	batchFailed             bool
+	renewed                 uint64
+	opts                    Options
+	factory                 Factory
+	logger                  *slog.Logger
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	wake                    chan struct{}
+	wg                      sync.WaitGroup
 }
 
 func New(opts Options, factory Factory, logger *slog.Logger) (*Pool, error) {
@@ -88,17 +88,15 @@ func (p *Pool) manage() {
 		p.mu.Lock()
 		now := time.Now()
 		p.shrinkLocked(now)
-		// A retry advances once per completed batch, never once per parallel worker.
-		if !p.closed && p.ctx.Err() == nil && p.filling == 0 && !now.Before(p.nextRetry) {
-			p.batchFailed = false
-			p.batchUnsupported = false
-			for len(p.idle)+len(jobs) < p.target {
+		// Healthy slots refill independently; failures impose one shared cooldown.
+		if !p.closed && p.ctx.Err() == nil && !now.Before(p.nextRetry) {
+			for len(p.idle)+p.filling+len(jobs) < p.target {
 				jobs = append(jobs, nil)
 			}
 			// At most one proactive replacement per batch. Keep the old entry until
 			// success when spare capacity exists. At the hard cap retire at most one,
 			// and never proactively remove the last ready connection.
-			if len(jobs) == 0 {
+			if len(jobs) == 0 && p.filling == 0 {
 				for i, e := range p.idle {
 					if now.Before(e.refreshAt) {
 						continue
@@ -113,7 +111,10 @@ func (p *Pool) manage() {
 					break
 				}
 			}
-			p.filling = len(jobs)
+			if len(jobs) > 0 {
+				p.batchFailed = false
+			}
+			p.filling += len(jobs)
 			for range jobs {
 				p.wg.Add(1)
 			}
@@ -134,23 +135,23 @@ func (p *Pool) manage() {
 		}
 	}
 }
+
+// Failures share a cooldown window, so parallel failures cannot multiply
+// backoff. A slow worker never prevents other vacant slots being replenished.
 func (p *Pool) completeBatchLocked(err error) {
-	if err != nil {
-		p.batchFailed = true
-		if errors.Is(err, ErrUnsupported) {
-			p.batchUnsupported = true
+	if err == nil {
+		if p.filling == 0 && !p.batchFailed {
+			p.retry = 0
+			p.nextRetry = time.Time{}
+			p.unsupportedLogged = false
 		}
-	}
-	if p.filling != 0 {
 		return
 	}
-	if !p.batchFailed {
-		p.retry = 0
-		p.nextRetry = time.Time{}
-		p.unsupportedLogged = false
+	p.batchFailed = true
+	if time.Now().Before(p.nextRetry) && !(errors.Is(err, ErrUnsupported) && p.retry < p.opts.RetryMax) {
 		return
 	}
-	if p.batchUnsupported {
+	if errors.Is(err, ErrUnsupported) {
 		p.retry = p.opts.RetryMax
 	} else if p.retry == 0 {
 		p.retry = p.opts.RetryMin

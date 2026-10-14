@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"mygotunnel/internal/admission"
@@ -35,6 +37,7 @@ func main() {
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
 	logFormat := flag.String("log-format", logging.FormatText, "log format: text or json")
 	metricsPath := flag.String("runtime-metrics", "", "optional exclusive private runtime JSONL output file")
+	shutdownTimeout := flag.Duration("shutdown-timeout", 15*time.Second, "maximum active connection drain time on shutdown")
 	flag.Parse()
 
 	logger, err := logging.New(os.Stderr, logging.Options{
@@ -76,7 +79,9 @@ func main() {
 		os.Exit(1)
 	}
 	defer stopMetrics()
-	if err := run(*configPath, logger, *maxSetup, serverOptions{*maxConnections, *maxIdle}); err != nil {
+	ctx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignal()
+	if err := runContext(ctx, *shutdownTimeout, *configPath, logger, *maxSetup, serverOptions{*maxConnections, *maxIdle}); err != nil {
 		logger.Error("stopped", "error", err)
 		stopMetrics()
 		os.Exit(1)
@@ -86,6 +91,13 @@ func main() {
 type serverOptions struct{ maxConnections, maxIdle int }
 
 func run(configPath string, logger *slog.Logger, maxSetup int, options ...serverOptions) error {
+	return runContext(context.Background(), 0, configPath, logger, maxSetup, options...)
+}
+
+func runContext(ctx context.Context, grace time.Duration, configPath string, logger *slog.Logger, maxSetup int, options ...serverOptions) error {
+	if grace < 0 {
+		return fmt.Errorf("shutdown-timeout must not be negative")
+	}
 	opts := serverOptions{1024, 64}
 	if len(options) > 0 {
 		opts = options[0]
@@ -129,8 +141,8 @@ func run(configPath string, logger *slog.Logger, maxSetup int, options ...server
 		return []any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", len(idleSlots), "max_idle", opts.maxIdle, "rejected", metrics.Rejected.Load()}
 	})
 	defer stopStats()
-	return admission.ServeWithMetrics(ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleTunnelWithPool(conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire})
+	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
+		handleTunnelContext(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire})
 	}, nil, metrics)
 }
 
@@ -144,6 +156,10 @@ func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Lo
 }
 
 func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, releaseSetup func(), poolOptions *serverPoolOptions) {
+	handleTunnelContext(context.Background(), tunnelConn, cfg, logger, releaseSetup, poolOptions)
+}
+
+func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, releaseSetup func(), poolOptions *serverPoolOptions) {
 	defer tunnelConn.Close()
 
 	remoteAddr := tunnelConn.RemoteAddr().String()
@@ -241,7 +257,7 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 	requestLogger := connectionLogger.With("target_addr", targetAddr)
 	requestLogger.Debug("connect")
 
-	ctx, cancel := context.WithDeadline(context.Background(), connectDeadline)
+	ctx, cancel := context.WithDeadline(parent, connectDeadline)
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	targetStarted := time.Now()
 	targetConn, dialTimings, err := dialmetrics.Dial(ctx, dialer, "tcp", targetAddr)

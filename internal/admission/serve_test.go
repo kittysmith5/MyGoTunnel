@@ -1,6 +1,7 @@
 package admission
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -272,5 +273,61 @@ func TestResourceCountersTrackPermitAndConnectionLifetime(t *testing.T) {
 	listener.Close()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(map[bool]string{false: "drain", true: "force"}[force], func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			started := make(chan struct{})
+			done := make(chan error, 1)
+			metrics := &Counters{}
+			go func() {
+				done <- ServeContext(ctx, 100*time.Millisecond, ln, 1, 1, func(c net.Conn, p *Permit) { defer c.Close(); p.Release(); close(started); io.Copy(c, c) }, nil, metrics)
+			}()
+			c, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			wait(t, started)
+			cancel()
+			if !force {
+				c.SetDeadline(time.Now().Add(time.Second))
+				if _, err := c.Write([]byte("ok")); err != nil {
+					t.Fatal(err)
+				}
+				b := make([]byte, 2)
+				if _, err := io.ReadFull(c, b); err != nil || string(b) != "ok" {
+					t.Fatalf("drain failed: %q %v", b, err)
+				}
+				c.Close()
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("shutdown stuck")
+			}
+			if metrics.Open.Load() != 0 || metrics.Setup.Load() != 0 {
+				t.Fatal("handlers not joined")
+			}
+			if force {
+				c.SetReadDeadline(time.Now().Add(time.Second))
+				var b [1]byte
+				if _, err := c.Read(b[:]); err == nil {
+					t.Fatal("connection not closed")
+				}
+			}
+		})
 	}
 }

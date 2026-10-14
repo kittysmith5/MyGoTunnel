@@ -248,3 +248,39 @@ func TestRootDownloadFailureDirection(t *testing.T) {
 		t.Fatal("interrupted upload replaced root download direction")
 	}
 }
+
+type failingReader struct{ err error }
+
+func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+type slowCloseConn struct {
+	net.Conn
+	called chan struct{}
+}
+
+func (c slowCloseConn) CloseWrite() error { close(c.called); time.Sleep(time.Second); return nil }
+func TestCopyErrorSkipsCloseNotify(t *testing.T) {
+	a, ap := net.Pipe()
+	defer a.Close()
+	defer ap.Close()
+	b, bp := net.Pipe()
+	defer b.Close()
+	defer bp.Close()
+	called := make(chan struct{})
+	root := errors.New("read failed")
+	done := make(chan Result, 1)
+	go func() { done <- CopyBidirectional(a, failingReader{root}, slowCloseConn{b, called}, b) }()
+	select {
+	case result := <-done:
+		if !errors.Is(result.Err, root) || result.FailureDirection != "up" {
+			t.Fatal(result)
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("error waited for close notify")
+	}
+	select {
+	case <-called:
+		t.Fatal("CloseWrite called on copy failure")
+	default:
+	}
+}

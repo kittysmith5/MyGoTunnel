@@ -384,10 +384,11 @@ func TestPreparedTLSConnectionIdleAdmissionAndPayload(t *testing.T) {
 	}()
 	idleSlots := make(chan struct{}, 1)
 	serveDone := make(chan error, 1)
+	counters := &admission.Counters{}
 	go func() {
-		serveDone <- admission.ServeWithPermit(listener, 1, 8, func(c net.Conn, p *admission.Permit) {
+		serveDone <- admission.ServeWithMetrics(listener, 1, 8, func(c net.Conn, p *admission.Permit) {
 			handleTunnelWithPool(c, server, slog.New(slog.NewTextHandler(io.Discard, nil)), p.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: p.TryAcquire})
-		}, nil)
+		}, nil, counters)
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -418,6 +419,14 @@ func TestPreparedTLSConnectionIdleAdmissionAndPayload(t *testing.T) {
 	// First idle connection released the only setup slot, but consumes idle cap.
 	if _, err := preconnect.Prepare(ctx, cfg); !errors.Is(err, preconnect.ErrBusy) {
 		t.Fatalf("idle capacity = %v", err)
+	}
+	// BUSY is written before that handler releases its setup permit.
+	// Wait for release rather than racing a legitimate overload rejection.
+	for counters.Setup.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if counters.Setup.Load() != 0 {
+		t.Fatal("BUSY handler retained setup permit")
 	}
 	if err := tunnel.SendConnect(first.Conn, target.Addr().String()); err != nil {
 		t.Fatal(err)

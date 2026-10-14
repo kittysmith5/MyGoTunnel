@@ -2,6 +2,7 @@
 package admission
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -66,6 +67,46 @@ func ServeWithPermit(listener net.Listener, maxSetup, maxConnections int, handle
 }
 
 func ServeWithMetrics(listener net.Listener, maxSetup, maxConnections int, handler func(net.Conn, *Permit), onOverload func(), metrics *Counters) error {
+	return ServeContext(context.Background(), 0, listener, maxSetup, maxConnections, handler, onOverload, metrics)
+}
+
+// ServeContext stops accepting on cancellation, drains handlers, then closes
+// remaining connections after grace. Handlers must exit when their socket closes.
+func ServeContext(ctx context.Context, grace time.Duration, listener net.Listener, maxSetup, maxConnections int, handler func(net.Conn, *Permit), onOverload func(), metrics *Counters) error {
+	if grace < 0 {
+		return fmt.Errorf("shutdown timeout must not be negative")
+	}
+	var handlers sync.WaitGroup
+	var mu sync.Mutex
+	active := make(map[net.Conn]struct{})
+	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
+	defer stop()
+	defer func() {
+		done := make(chan struct{})
+		go func() { handlers.Wait(); close(done) }()
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-done:
+			return
+		case <-timer.C:
+		}
+		mu.Lock()
+		remaining := make([]net.Conn, 0, len(active))
+		for c := range active {
+			remaining = append(remaining, c)
+		}
+		mu.Unlock()
+		for _, c := range remaining {
+			_ = c.SetDeadline(time.Now())
+			if wrapped, ok := c.(interface{ NetConn() net.Conn }); ok {
+				_ = wrapped.NetConn().Close()
+			} else {
+				_ = c.Close()
+			}
+		}
+		<-done
+	}()
 	if maxSetup <= 0 {
 		return fmt.Errorf("max-setup must be positive")
 	}
@@ -108,6 +149,10 @@ func ServeWithMetrics(listener net.Listener, maxSetup, maxConnections int, handl
 			}
 			return fmt.Errorf("accept connection: %w", err)
 		}
+		if ctx.Err() != nil {
+			_ = c.Close()
+			return nil
+		}
 		delay = 0
 		if connections != nil {
 			select {
@@ -124,7 +169,13 @@ func ServeWithMetrics(listener net.Listener, maxSetup, maxConnections int, handl
 				metrics.Open.Add(1)
 				metrics.Setup.Add(1)
 			}
+			handlers.Add(1)
+			mu.Lock()
+			active[c] = struct{}{}
+			mu.Unlock()
 			go func() {
+				defer handlers.Done()
+				defer func() { mu.Lock(); delete(active, c); mu.Unlock() }()
 				if metrics != nil {
 					defer metrics.Open.Add(-1)
 				}

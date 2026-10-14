@@ -82,7 +82,10 @@ func CopyBidirectional(a net.Conn, aReader io.Reader, b net.Conn, bReader io.Rea
 
 func copyDirection(resultCh chan<- copyResult, direction direction, dst net.Conn, src io.Reader) {
 	written, copyErr := io.Copy(dst, src)
-	shutdownErr := closeWrite(dst)
+	var shutdownErr error
+	if copyErr == nil {
+		shutdownErr = closeWrite(dst)
+	}
 
 	resultCh <- copyResult{
 		direction: direction,

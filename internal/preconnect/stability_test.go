@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func TestRetryAdvancesOncePerBatch(t *testing.T) {
+func TestRetryAdvancesOncePerCooldown(t *testing.T) {
 	p := &Pool{opts: Options{RetryMin: time.Second, RetryMax: 8 * time.Second}, filling: 8}
 	for i := 0; i < 8; i++ {
 		p.filling--
@@ -23,7 +23,7 @@ func TestRetryAdvancesOncePerBatch(t *testing.T) {
 		t.Fatalf("parallel failures multiplied backoff: %v", p.retry)
 	}
 	p.batchFailed = false
-	p.batchUnsupported = false
+	p.nextRetry = time.Time{}
 	p.filling = 2
 	p.filling--
 	p.completeBatchLocked(ErrBusy)
@@ -33,7 +33,7 @@ func TestRetryAdvancesOncePerBatch(t *testing.T) {
 		t.Fatal("partial success cleared failure", p.retry)
 	}
 	p.batchFailed = false
-	p.batchUnsupported = false
+	p.nextRetry = time.Time{}
 	p.filling = 1
 	p.filling--
 	p.completeBatchLocked(nil)
@@ -208,5 +208,63 @@ func TestMixedBatchDoesNotRetryImmediately(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	if calls.Load() != 8 || p.Stats().Retry != time.Second || p.Stats().Idle != 1 {
 		t.Fatalf("mixed batch retried or multiplied backoff: calls=%d stats=%+v", calls.Load(), p.Stats())
+	}
+}
+
+func TestSlowFillDoesNotBlockDemandRefill(t *testing.T) {
+	f := &pipeFactory{}
+	defer f.close()
+	var calls atomic.Int32
+	slow := make(chan struct{})
+	p, err := New(Options{Size: 2, MaxSize: 2}, func(ctx context.Context) (*Entry, error) {
+		if calls.Add(1) == 1 {
+			close(slow)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return f.create(ctx)
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	<-slow
+	idle(t, p, 1)
+	entry := p.Take(context.Background())
+	if entry == nil {
+		t.Fatal("ready connection not available")
+	}
+	defer entry.Conn.Close()
+	idle(t, p, 1)
+	if calls.Load() < 3 {
+		t.Fatal("slow handshake blocked refill")
+	}
+	if s := p.Stats(); s.Idle+s.Filling > 2 {
+		t.Fatal("capacity exceeded", s)
+	}
+}
+
+func TestFailureCooldownDoesNotWaitForSlowWorker(t *testing.T) {
+	f := &pipeFactory{}
+	defer f.close()
+	var calls atomic.Int32
+	p, err := New(Options{Size: 2, MaxSize: 2, RetryMin: 20 * time.Millisecond, RetryMax: 20 * time.Millisecond}, func(ctx context.Context) (*Entry, error) {
+		switch calls.Add(1) {
+		case 1:
+			<-ctx.Done()
+			return nil, ctx.Err()
+		case 2:
+			return nil, ErrBusy
+		default:
+			return f.create(ctx)
+		}
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	idle(t, p, 1)
+	if calls.Load() < 3 {
+		t.Fatal("cooldown still blocked by slow worker")
 	}
 }
