@@ -69,6 +69,7 @@ func (h *compactHandler) flatten(a slog.Attr) []slog.Attr {
 }
 
 var shortKeys = map[string]string{
+	"dns_duration": "dns", "target_tcp_duration": "target_tcp", "pool_hits": "hit", "pool_misses": "miss", "pool_fallbacks": "fallbacks", "pool_hit_rate": "hit_pct", "pool_target": "pool_target", "pool_filling": "filling",
 	"connection_id": "id", "client_addr": "peer", "remote_addr": "server", "listen_addr": "listen",
 	"config_path": "config", "socks_duration": "socks", "tcp_duration": "tcp", "tls_duration": "tls",
 	"control_duration": "ctl", "pool_acquire_duration": "take", "setup_duration": "total",

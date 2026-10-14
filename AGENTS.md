@@ -156,3 +156,28 @@ go build ./cmd/...
 客户端使用 uTLS `HelloChrome_133` 基线，每条连接独立生成模板；实际 ALPN 仅提供 `http/1.1`，移除模板中仅适用于 h2 的 ALPS 扩展。此前 `HelloChrome_Auto` 在当前依赖版本也对应 Chrome 133，但模板自带的 h2/ALPS 不会仅因 Config.NextProtos 而移除。此修改验证实际线上 ClientHello，避免服务端选择客户端未实现的 h2。调整后的模板不是完整 Chrome 指纹，也不宣称模拟当前最新 Chrome。
 
 服务端继续使用 Go 标准 TLS，明确最低 TLS 1.2，TLS 1.2 仅允许 ECDHE + AES-GCM/ChaCha20-Poly1305；TLS 1.3 密码套件及密钥交换保留 Go 默认配置。此为一致性与安全整改，不是 nginx/OpenSSL 服务端指纹模仿。自定义 AUTH/CONNECT 仍不是 HTTP，即使协商 http/1.1 也不表示支持网页。TCP、预连接、半关闭及证书指纹验证保持原有机制；不引入 WSS，不增加握手往返。旧客户端仍可连接新服务端，TLS 1.0/1.1 和仅支持旧 TLS 1.2 套件的外部客户端不再支持。
+
+## 自适应预连接与拨号测量
+
+客户端 `-pool-size 4 -pool-max 16`：size 是备用容量下限，max 是自适应上限（均不含已经转发的连接）。当请求取用时就绪数不超过 1，目标容量增加 1，最多达到 max；取用、失效立即触发补充。连续 30 秒无取用后，每 30 秒目标容量减 1，最低回到 size。已有多余空闲连接自然到期释放，不中断正在使用的连接。此为需求耗尽驱动的保守自适应，不是基于 QPS/补充时长的预测算法。后台补充与 ready 总量受目标限制；收缩后已经启动的补充可能短暂超过新目标，但不超过 max。`-pool-max 0` 或等于 size 使用固定容量；`-pool-size 0` 禁用池。非零 max 必须不小于 size，最大 32；例如 size=32 时须同时指定 max=32。服务端 `-max-idle` 为所有客户端共享，扩容仍可能被 BUSY 拒绝，沿用有界退避。
+
+每 30 秒 stats 新增：JSON `pool_hits/pool_misses/pool_fallbacks/pool_hit_rate/pool_target/pool_filling`，文本 `hit/miss/fallbacks/hit_pct/pool_target/filling`。hit/miss 统计启动以来的 Take 调用结果；命中指有效备用连接成功交接，不代表目标拨号成功；命中后传输错误转普通建连时同时增加 fallback。百分比为 100*hit/(hit+miss)，无请求为 0；禁用池时这些计数为 0，不将普通连接计为 miss。计数快照加锁，不改变流量和重试语义。
+
+服务端 ready 与拨号失败日志增加 `dns_duration`（text: dns）及 `target_tcp_duration`（text: target_tcp），原 `target_dial_duration`（dial）继续表示 DNS+TCP 总拨号墙钟耗时。通过标准库 httptrace 的网络事件观察 net.Dialer，不自行解析再顺序拨 IP，保留标准解析器、IPv4/IPv6 并行回退及原 deadline。IP 字面量 dns=0；TCP 从首次地址尝试到拨号返回，包含双栈回退等待，不能把并发尝试分别相加。DNS 时间包含系统解析器处理，不能当作纯公网 DNS RTT；两个子阶段之和与总耗时可有调度开销差异。不引入 DNS 缓存或修改双栈策略。
+
+## 大流量吞吐基准
+
+构建：`go build -o bench ./cmd/bench`。在服务端机器开启独立的本地回声目标：
+
+```bash
+./bench -echo 127.0.0.1:18081
+```
+
+在客户端机器经本地 SOCKS5 测试（目标地址从隧道服务端视角解释）：
+
+```bash
+./bench -socks 127.0.0.1:1080 -target 127.0.0.1:18081 -mib 32 -streams 1
+./bench -socks 127.0.0.1:1080 -target 127.0.0.1:18081 -mib 32 -streams 4
+```
+
+每流上传指定 MiB 并完整回传，发送与接收并发，使用 64 KiB 数据块，不缓存整份文件；校验字节数及 SHA-256，并验证上传半关闭后下载可排空。每流总期限 5 分钟。JSON 输出 seconds（包含 SOCKS/隧道建连）、payload_mib_per_second（单份有效载荷/总时间）、bidirectional_mib_per_second（上传+回传字节/总时间）、failures。非零失败退出码为 1，失败样本的速率不可用于比较。MiB/s 乘 8.388608 为 Mbps；这是双向回声基准，不是独立的单向下载带宽测量。建议相同机器、流量与时段预热后重复 3 次报告中位数；结合 CPU、内存、GC、丢包判断瓶颈，不能以一次基准承诺优化百分比。测试后停止 echo 进程，不在公网开放无认证回声服务。

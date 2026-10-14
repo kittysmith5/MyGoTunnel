@@ -106,6 +106,15 @@ func TestPreparedTransportFallbackAndExplicitRejection(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			session, err := openRemote(ctx, cfg, "target.test:443", pool)
+			stats := pool.Stats()
+			wantFallback := uint64(0)
+			if mode == "transport failure" {
+				wantFallback = 1
+			}
+			if stats.Hits != 1 || stats.Misses != 0 || stats.Fallbacks != wantFallback {
+				t.Fatalf("pool counters: %+v", stats)
+			}
+
 			if mode == "explicit rejection" {
 				if !errors.Is(err, errTargetRejected) || session.PoolFallback {
 					t.Fatal("explicit rejection was retried")

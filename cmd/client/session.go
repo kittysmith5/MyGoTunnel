@@ -71,6 +71,7 @@ func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, po
 			// application payload has been sent. Never retry explicit target rejection.
 			session.PoolHit = false
 			session.PoolFallback = true
+			pool.RecordFallback()
 		}
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, remoteDialTimeout)

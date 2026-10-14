@@ -16,6 +16,7 @@ import (
 
 	"mygotunnel/internal/admission"
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/dialmetrics"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/tunnel"
@@ -234,11 +235,11 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 	ctx, cancel := context.WithDeadline(context.Background(), connectDeadline)
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	targetStarted := time.Now()
-	targetConn, err := dialer.DialContext(ctx, "tcp", targetAddr)
+	targetConn, dialTimings, err := dialmetrics.Dial(ctx, dialer, "tcp", targetAddr)
 	targetDuration := time.Since(targetStarted)
 	cancel()
 	if err != nil {
-		logging.Failure(requestLogger, "dial", err, "target_dial_duration", targetDuration, "setup_duration", time.Since(startedAt)-idleDuration)
+		logging.Failure(requestLogger, "dial", err, "dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "setup_duration", time.Since(startedAt)-idleDuration)
 		_ = tunnel.SendERR(tunnelConn)
 		return
 	}
@@ -260,7 +261,7 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 		"auth_duration", authDuration,
 		"idle_duration", idleDuration,
 		"wait_duration", waitDuration,
-		"target_dial_duration", targetDuration,
+		"dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration,
 		"reply_duration", time.Since(replyStarted),
 		"connect_duration", time.Since(connectStarted),
 		"setup_duration", time.Since(startedAt)-idleDuration)

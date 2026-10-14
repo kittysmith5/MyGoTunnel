@@ -227,3 +227,57 @@ func TestPoolValidationAndEmptyTake(t *testing.T) {
 		t.Fatal("empty pool blocked request")
 	}
 }
+
+func TestAdaptivePoolBoundedGrowthAndStats(t *testing.T) {
+	f := &pipeFactory{}
+	defer f.close()
+	p, err := New(Options{Size: 1, MaxSize: 3}, f.create, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	count := 0
+	for round := 0; round < 3; round++ {
+		n := p.Stats().Target
+		idle(t, p, n)
+		for i := 0; i < n; i++ {
+			e := p.Take(context.Background())
+			if e == nil {
+				t.Fatal("missing prepared connection")
+			}
+			e.Conn.Close()
+			count++
+		}
+	}
+	p.RecordFallback()
+	s := p.Stats()
+	if s.Target != 3 || s.Hits != uint64(count) || s.Misses != 0 || s.Fallbacks != 1 || s.HitRate != 100 {
+		t.Fatalf("stats: %+v", s)
+	}
+	p.mu.Lock()
+	p.lastDemand = time.Now().Add(-time.Minute)
+	p.lastShrink = p.lastDemand
+	p.shrinkLocked(time.Now())
+	target := p.target
+	p.mu.Unlock()
+	if target != 2 {
+		t.Fatal("did not shrink")
+	}
+}
+func TestPoolMissAndMaxValidation(t *testing.T) {
+	p, err := New(Options{Size: 1, MaxSize: 2}, func(ctx context.Context) (*Entry, error) { <-ctx.Done(); return nil, ctx.Err() }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Take(context.Background()) != nil {
+		t.Fatal("unexpected hit")
+	}
+	p.Close()
+	s := p.Stats()
+	if s.Misses != 1 || s.HitRate != 0 {
+		t.Fatal(s)
+	}
+	if _, err := New(Options{Size: 3, MaxSize: 2}, (&pipeFactory{}).create, nil); err == nil {
+		t.Fatal("invalid max accepted")
+	}
+}

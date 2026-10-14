@@ -14,6 +14,7 @@ import (
 type Factory func(context.Context) (*Entry, error)
 type Options struct {
 	Size     int
+	MaxSize  int // zero keeps a fixed-size pool
 	IdleTTL  time.Duration
 	RetryMin time.Duration
 	RetryMax time.Duration
@@ -21,25 +22,35 @@ type Options struct {
 
 // Pool owns only unused, authenticated connections. Used connections never return.
 type Pool struct {
-	mu                sync.Mutex
-	idle              []*Entry
-	filling           int
-	closed            bool
-	unsupportedLogged bool
-	nextRetry         time.Time
-	retry             time.Duration
-	opts              Options
-	factory           Factory
-	logger            *slog.Logger
-	ctx               context.Context
-	cancel            context.CancelFunc
-	wake              chan struct{}
-	wg                sync.WaitGroup
+	mu                      sync.Mutex
+	target                  int
+	hits, misses, fallbacks uint64
+	lastDemand              time.Time
+	lastShrink              time.Time
+	idle                    []*Entry
+	filling                 int
+	closed                  bool
+	unsupportedLogged       bool
+	nextRetry               time.Time
+	retry                   time.Duration
+	opts                    Options
+	factory                 Factory
+	logger                  *slog.Logger
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	wake                    chan struct{}
+	wg                      sync.WaitGroup
 }
 
 func New(opts Options, factory Factory, logger *slog.Logger) (*Pool, error) {
 	if opts.Size < 1 || opts.Size > 32 || factory == nil {
 		return nil, fmt.Errorf("pool size must be between 1 and 32 and factory must be provided")
+	}
+	if opts.MaxSize == 0 {
+		opts.MaxSize = opts.Size
+	}
+	if opts.MaxSize < opts.Size || opts.MaxSize > 32 {
+		return nil, fmt.Errorf("pool max must be between size and 32")
 	}
 	if opts.IdleTTL == 0 {
 		opts.IdleTTL = 45 * time.Second
@@ -54,7 +65,7 @@ func New(opts Options, factory Factory, logger *slog.Logger) (*Pool, error) {
 		return nil, fmt.Errorf("invalid pool timing options")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &Pool{opts: opts, factory: factory, logger: logger, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1)}
+	p := &Pool{target: opts.Size, lastShrink: time.Now(), opts: opts, factory: factory, logger: logger, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1)}
 	p.wg.Add(1)
 	go p.manage()
 	return p, nil
@@ -71,8 +82,10 @@ func (p *Pool) manage() {
 	defer ticker.Stop()
 	for {
 		p.mu.Lock()
-		if !p.closed && p.ctx.Err() == nil && !time.Now().Before(p.nextRetry) {
-			for len(p.idle)+p.filling < p.opts.Size {
+		now := time.Now()
+		p.shrinkLocked(now)
+		if !p.closed && p.ctx.Err() == nil && !now.Before(p.nextRetry) {
+			for len(p.idle)+p.filling < p.target {
 				p.filling++
 				p.wg.Add(1)
 				go p.fill()
@@ -168,6 +181,26 @@ func (p *Pool) guard(entry *Entry) {
 // Take never waits for refill. Interrupt the passive EOF monitor and hand off
 // reader ownership before allowing caller to write CONNECT or read its response.
 func (p *Pool) Take(ctx context.Context) *Entry {
+	hit := false
+	defer func() {
+		p.mu.Lock()
+		if hit {
+			p.hits++
+		} else {
+			p.misses++
+		}
+		p.mu.Unlock()
+	}()
+	p.mu.Lock()
+	if ctx.Err() == nil && !p.closed {
+		p.lastDemand = time.Now()
+		// Grow only when demand exhausts ready capacity; never exceed MaxSize.
+		if len(p.idle) <= 1 && p.target < p.opts.MaxSize {
+			p.target++
+		}
+	}
+	p.mu.Unlock()
+	p.signal()
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -204,6 +237,7 @@ func (p *Pool) Take(ctx context.Context) *Entry {
 			entry.Conn.Close()
 			continue
 		}
+		hit = true
 		return entry
 	}
 }
@@ -227,3 +261,29 @@ func (p *Pool) Close() {
 
 // IdleCount is a snapshot of ready, unused connections, excluding ongoing fills.
 func (p *Pool) IdleCount() int { p.mu.Lock(); defer p.mu.Unlock(); return len(p.idle) }
+
+// Stats is a consistent snapshot. Hits mean successful pool acquisition, not
+// successful target connection. Fallbacks count subsequent transport failures.
+type Stats struct {
+	Hits, Misses, Fallbacks    uint64
+	Idle, Filling, Target, Max int
+	HitRate                    float64
+}
+
+func (p *Pool) Stats() Stats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s := Stats{Hits: p.hits, Misses: p.misses, Fallbacks: p.fallbacks, Idle: len(p.idle), Filling: p.filling, Target: p.target, Max: p.opts.MaxSize}
+	if n := s.Hits + s.Misses; n > 0 {
+		s.HitRate = 100 * float64(s.Hits) / float64(n)
+	}
+	return s
+}
+func (p *Pool) RecordFallback() { p.mu.Lock(); p.fallbacks++; p.mu.Unlock() }
+
+func (p *Pool) shrinkLocked(now time.Time) {
+	if p.target > p.opts.Size && now.Sub(p.lastDemand) >= 30*time.Second && now.Sub(p.lastShrink) >= 30*time.Second {
+		p.target--
+		p.lastShrink = now
+	}
+}

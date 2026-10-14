@@ -27,6 +27,7 @@ const (
 func main() {
 	configPath := flag.String("config", "configs/client.json", "config file path")
 	importCode := flag.Bool("import", false, "import connection code from stdin and exit")
+	poolMax := flag.Int("pool-max", 16, "maximum adaptive preconnections, size must not exceed this; 0 fixes pool at pool-size")
 	poolSize := flag.Int("pool-size", 4, "authenticated preconnections, 0 disables, maximum 32")
 	maxConnections := flag.Int("max-connections", 1024, "maximum accepted local connections")
 	maxSetup := flag.Int("max-setup", 128, "maximum concurrent connection setups; established tunnels do not count")
@@ -52,20 +53,20 @@ func main() {
 		logger.Info("imported", "config_path", *configPath)
 		return
 	}
-	if err := run(*configPath, logger, *maxSetup, clientOptions{*poolSize, *maxConnections}); err != nil {
+	if err := run(*configPath, logger, *maxSetup, clientOptions{*poolSize, *maxConnections, *poolMax}); err != nil {
 		logger.Error("stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-type clientOptions struct{ poolSize, maxConnections int }
+type clientOptions struct{ poolSize, maxConnections, poolMax int }
 
 func run(configPath string, logger *slog.Logger, maxSetup int, options ...clientOptions) error {
-	opts := clientOptions{4, 1024}
+	opts := clientOptions{4, 1024, 16}
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	if opts.poolSize < 0 || opts.poolSize > 32 || opts.maxConnections <= 0 {
+	if opts.poolSize < 0 || opts.poolSize > 32 || opts.maxConnections <= 0 || opts.poolMax < 0 || opts.poolMax > 32 || (opts.poolSize > 0 && opts.poolMax > 0 && opts.poolMax < opts.poolSize) {
 		return fmt.Errorf("invalid pool or connection limits")
 	}
 	if maxSetup <= 0 {
@@ -82,6 +83,13 @@ func run(configPath string, logger *slog.Logger, maxSetup int, options ...client
 	}
 	defer ln.Close()
 
+	poolLimit := opts.poolMax
+	if poolLimit == 0 {
+		poolLimit = opts.poolSize
+	}
+	if opts.poolSize == 0 {
+		poolLimit = 0
+	}
 	logger.Info("listening",
 		"listen_addr", cfg.LocalAddr,
 		"remote_addr", cfg.RemoteAddr,
@@ -89,12 +97,12 @@ func run(configPath string, logger *slog.Logger, maxSetup int, options ...client
 		"timezone", "UTC",
 		"max_connections", opts.maxConnections,
 		"max_setup", maxSetup,
-		"max_idle", opts.poolSize,
+		"max_idle", poolLimit,
 	)
 
 	var pool *preconnect.Pool
 	if opts.poolSize > 0 {
-		pool, err = preconnect.New(preconnect.Options{Size: opts.poolSize}, func(ctx context.Context) (*preconnect.Entry, error) { return preconnect.Prepare(ctx, cfg) }, logger)
+		pool, err = preconnect.New(preconnect.Options{Size: opts.poolSize, MaxSize: opts.poolMax}, func(ctx context.Context) (*preconnect.Entry, error) { return preconnect.Prepare(ctx, cfg) }, logger)
 		if err != nil {
 			return err
 		}
@@ -103,10 +111,12 @@ func run(configPath string, logger *slog.Logger, maxSetup int, options ...client
 	metrics := &admission.Counters{}
 	stopStats := logging.StartStats(logger, 30*time.Second, func() []any {
 		idle := 0
+		var ps preconnect.Stats
 		if pool != nil {
-			idle = pool.IdleCount()
+			ps = pool.Stats()
+			idle = ps.Idle
 		}
-		return []any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", opts.poolSize, "rejected", metrics.Rejected.Load()}
+		return []any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", ps.Max, "rejected", metrics.Rejected.Load(), "pool_hits", ps.Hits, "pool_misses", ps.Misses, "pool_fallbacks", ps.Fallbacks, "pool_hit_rate", ps.HitRate, "pool_target", ps.Target, "pool_filling", ps.Filling}
 	})
 	defer stopStats()
 	return admission.ServeWithMetrics(ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) { handleClient(conn, cfg, logger, permit.Release, pool) }, nil, metrics)
