@@ -6,12 +6,18 @@ import (
 	"os"
 )
 
+type SOCKSAuth struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
 type ClientConfig struct {
-	LocalAddr              string `json:"local_addr"`
-	RemoteAddr             string `json:"remote_addr"`
-	AuthToken              string `json:"auth_token"`
-	SNI                    string `json:"sni"`
-	CertificateFingerprint string `json:"certificate_fingerprint,omitempty"`
+	SOCKSAuth              *SOCKSAuth `json:"socks_auth,omitempty"`
+	LocalAddr              string     `json:"local_addr"`
+	RemoteAddr             string     `json:"remote_addr"`
+	AuthToken              string     `json:"auth_token"`
+	SNI                    string     `json:"sni"`
+	CertificateFingerprint string     `json:"certificate_fingerprint,omitempty"`
 }
 
 func LoadClientConfig(path string) (*ClientConfig, error) {
@@ -37,6 +43,11 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		return nil, fmt.Errorf("auth_token is empty")
 	}
 
+	if cfg.SOCKSAuth != nil {
+		if len(cfg.SOCKSAuth.Username) < 1 || len(cfg.SOCKSAuth.Username) > 255 || len(cfg.SOCKSAuth.Password) < 1 || len(cfg.SOCKSAuth.Password) > 255 {
+			return nil, fmt.Errorf("socks_auth username and password must each be 1..255 bytes")
+		}
+	}
 	if err := validateClient(&cfg); err != nil {
 		return nil, err
 	}

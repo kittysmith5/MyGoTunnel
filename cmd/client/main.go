@@ -94,6 +94,7 @@ func run(configPath string, logger *slog.Logger, maxSetup int, options ...client
 		"listen_addr", cfg.LocalAddr,
 		"remote_addr", cfg.RemoteAddr,
 		"sni", cfg.SNI,
+		"socks_auth", cfg.SOCKSAuth != nil,
 		"timezone", "UTC",
 		"max_connections", opts.maxConnections,
 		"max_setup", maxSetup,
@@ -137,7 +138,11 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Lo
 		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
-	if err := socks5.Handshake(clientConn); err != nil {
+	var socksAuth *socks5.Credentials
+	if cfg.SOCKSAuth != nil {
+		socksAuth = &socks5.Credentials{Username: cfg.SOCKSAuth.Username, Password: cfg.SOCKSAuth.Password}
+	}
+	if err := socks5.HandshakeWithAuth(clientConn, socksAuth); err != nil {
 		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}

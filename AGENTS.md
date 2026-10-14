@@ -24,7 +24,7 @@ SOCKS5 应用
 - `cmd/server`：加载服务端配置和证书、校验认证信息、连接目标地址并组织转发。
 - `internal/config`：客户端和服务端 JSON 配置结构、默认值及必填项校验。
 - `internal/logging`：基于 `log/slog` 的紧凑英文文本、结构化 JSON、连接 ID、失败分类与周期资源汇总。
-- `internal/socks5`：SOCKS5 无认证握手、仅支持 TCP `CONNECT` 的请求解析和响应。
+- `internal/socks5`：SOCKS5 可选用户名密码握手、仅支持 TCP `CONNECT` 的请求解析和响应。
 - `internal/tunnel`：`AUTH`、`CONNECT`、`OK`、`ERR` 控制消息的读写。
 - `internal/utlsconn`：使用 Chrome ClientHello 指纹建立 uTLS 客户端连接。
 - `internal/relay`：保留缓冲数据并执行带半关闭语义的双向复制。
@@ -47,7 +47,7 @@ SOCKS5 应用
 - 从控制协议切换到转发时，继续使用既有的 `bufio.Reader`。其中可能已经预读了应用数据，改回直接读取底层连接会丢数据。
 - 服务端认证比较使用常量时间比较；不要记录、回显或以普通字符串比较替代认证令牌。
 - 认证读取的 deadline 必须在结束后清除，避免影响后续连接阶段。
-- SOCKS5 当前仅支持版本 5、无认证方式和 TCP `CONNECT`，地址支持 IPv4、域名及 IPv6。不要在未同步协议、响应和测试的情况下宣称支持 UDP 或其他认证方式。
+- SOCKS5 当前支持版本 5、可选 RFC 1929 用户名密码认证和 TCP `CONNECT`，地址支持 IPv4、域名及 IPv6。不要在未同步协议、响应和测试的情况下宣称支持 UDP 或其他认证方式。
 - uTLS 客户端使用固定 `HelloChrome_133` 基线并适配 ALPN，客户端与服务端均协商 `http/1.1` ALPN。相关值属于连接兼容性的一部分。
 - 有导入指纹时，`InsecureSkipVerify` 仅用于替代公共 CA 验证，必须同时通过 `VerifyPeerCertificate` 校验固定证书指纹；没有指纹时使用系统 CA 和主机名验证。修改时同步说明证书信任、SNI 和部署迁移。
 - 预连接协议是 AUTH → OK → PREPARE → READY → CONNECT → OK；原有普通流程继续兼容。备用连接有独立数量/闲置限制，取用后不得回池；后台读取必须在交接前停止。
@@ -60,6 +60,7 @@ SOCKS5 应用
 客户端实际读取的字段只有：
 
 - `local_addr`：可选，默认 `127.0.0.1:1080`。
+- `socks_auth`：可选，包含本地 SOCKS5 的 `username` 和 `password`；启用后禁止免认证降级，凭据不进入连接码。
 - `remote_addr`：必填，远端服务端的 `host:port`。
 - `auth_token`：必填。
 - `sni`：可选；为空时从 `remote_addr` 推导主机名。
@@ -181,3 +182,15 @@ go build ./cmd/...
 ```
 
 每流上传指定 MiB 并完整回传，发送与接收并发，使用 64 KiB 数据块，不缓存整份文件；校验字节数及 SHA-256，并验证上传半关闭后下载可排空。每流总期限 5 分钟。JSON 输出 seconds（包含 SOCKS/隧道建连）、payload_mib_per_second（单份有效载荷/总时间）、bidirectional_mib_per_second（上传+回传字节/总时间）、failures。非零失败退出码为 1，失败样本的速率不可用于比较。MiB/s 乘 8.388608 为 Mbps；这是双向回声基准，不是独立的单向下载带宽测量。建议相同机器、流量与时段预热后重复 3 次报告中位数；结合 CPU、内存、GC、丢包判断瓶颈，不能以一次基准承诺优化百分比。测试后停止 echo 进程，不在公网开放无认证回声服务。
+
+## 客户端 SOCKS5 入口认证
+
+可选配置（占位值，不是部署凭据）：
+
+```json
+"socks_auth": {"username": "proxy-user", "password": "replace-with-a-separate-password"}
+```
+
+配置后仅选择 SOCKS5 方法 0x02，执行 RFC 1929 认证；即使应用同时提供免认证方法也不得降级。无此项或为 null 时保留免认证。用户名、密码均必须为 1～255 字节，缺失或超长拒绝启动。认证与 SOCKS 请求沿用现有共用 5 秒期限，失败在读取 CONNECT/取用预连接/拨号远端之前返回；日志不得出现用户名、密码或认证原始报文。启动仅记录 socks_auth=true/false。凭据比较使用固定长度 SHA-256 摘要及常量时间比较，不记录摘要。
+
+SOCKS 认证仅属于客户端本地配置，不导出到 mygotunnel 连接码，也不改变服务端 token/指纹/隧道协议。配置文件应为 0600。RFC 1929 不加密用户名密码，应结合现有局域网或虚拟内网及防火墙使用；无需修改监听地址或访问规则。测试必须覆盖分段读取、正确/错误凭据、无认证降级拒绝、畸形/截断报文和配置校验。
