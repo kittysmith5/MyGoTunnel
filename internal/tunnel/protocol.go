@@ -91,8 +91,8 @@ func ReadDatagram(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	n := int(binary.BigEndian.Uint16(size[:]))
-	if n == 0 {
-		return nil, fmt.Errorf("invalid UDP datagram size 0")
+	if n == 0 || n > MaxDatagramSize {
+		return nil, fmt.Errorf("invalid UDP datagram size %d", n)
 	}
 	packet := make([]byte, n)
 	if _, err := io.ReadFull(r, packet); err != nil {

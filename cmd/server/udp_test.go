@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +15,82 @@ import (
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
 )
+
+type udpReadErrorSignal struct {
+	failed chan struct{}
+	once   sync.Once
+}
+
+func (s *udpReadErrorSignal) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("read target UDP failed")) {
+		s.once.Do(func() { close(s.failed) })
+	}
+	return len(p), nil
+}
+
+func TestUDPTunnelRecoversAfterTargetReadError(t *testing.T) {
+	reserved, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := reserved.LocalAddr().(*net.UDPAddr)
+	_ = reserved.Close()
+	signal := &udpReadErrorSignal{failed: make(chan struct{})}
+	logger := slog.New(slog.NewTextHandler(signal, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	server, client := net.Pipe()
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+	done := make(chan struct{})
+	go func() {
+		handleTunnel(server, &config.ServerConfig{AuthToken: "test-token"}, logger)
+		close(done)
+	}()
+	defer func() {
+		_ = client.Close()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("target recovery session did not clean up its workers")
+		}
+	}()
+	reader := bufio.NewReader(client)
+	for _, command := range []string{"AUTH test-token\n", "UDP\n"} {
+		if _, err := io.WriteString(client, command); err != nil {
+			t.Fatal(err)
+		}
+		if response, err := tunnel.ReadLine(reader); err != nil || response != "OK" {
+			t.Fatalf("handshake: %q, %v", response, err)
+		}
+	}
+	packet := socks5.BuildUDPDatagram(socks5.UDPDatagram{Host: "127.0.0.1", Port: uint16(address.Port)}, []byte("recover"))
+	if err := tunnel.WriteDatagram(client, packet); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-signal.failed:
+	case <-time.After(time.Second):
+		t.Fatal("target read did not report the closed-port error")
+	}
+	echo, err := net.ListenUDP("udp4", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		data := make([]byte, 100)
+		n, peer, err := echo.ReadFromUDP(data)
+		if err == nil {
+			_, _ = echo.WriteToUDP(data[:n], peer)
+		}
+	}()
+	if err := tunnel.WriteDatagram(client, packet); err != nil {
+		t.Fatal(err)
+	}
+	response, err := tunnel.ReadDatagram(reader)
+	if err != nil || !bytes.Equal(response, packet) {
+		t.Fatalf("recovered target did not return UDP response: %v", err)
+	}
+}
 
 func TestUDPResponsesDropWhenQueueFull(t *testing.T) {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})

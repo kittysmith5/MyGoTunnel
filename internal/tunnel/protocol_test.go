@@ -3,6 +3,7 @@ package tunnel
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"testing"
@@ -51,6 +52,29 @@ func TestReadDatagramRejectsZeroLength(t *testing.T) {
 	_, err := ReadDatagram(bytes.NewReader([]byte{0, 0}))
 	if err == nil {
 		t.Fatal("ReadDatagram() unexpectedly accepted an empty frame")
+	}
+}
+
+func TestDatagramSizeLimits(t *testing.T) {
+	for _, size := range []int{0, MaxDatagramSize, MaxDatagramSize + 1, 65535} {
+		var wire bytes.Buffer
+		packet := make([]byte, size)
+		wantError := size == 0 || size > MaxDatagramSize
+		if err := WriteDatagram(&wire, packet); (err != nil) != wantError {
+			t.Fatalf("write size %d: error %v", size, err)
+		}
+		wire.Reset()
+		var header [2]byte
+		binary.BigEndian.PutUint16(header[:], uint16(size))
+		wire.Write(header[:])
+		wire.Write(packet)
+		got, err := ReadDatagram(&wire)
+		if (err != nil) != wantError || (!wantError && !bytes.Equal(got, packet)) {
+			t.Fatalf("read size %d: got %d bytes, error %v", size, len(got), err)
+		}
+		if wantError && wire.Len() != size {
+			t.Fatalf("invalid size %d consumed payload", size)
+		}
 	}
 }
 

@@ -154,6 +154,7 @@ type udpTarget struct {
 	conn         *net.UDPConn
 	destination  socks5.UDPDatagram
 	lastActivity atomic.Int64
+	failed       atomic.Bool
 }
 
 func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Logger, startedAt time.Time) {
@@ -163,7 +164,15 @@ func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Log
 	}
 	done := make(chan struct{})
 	var stopOnce sync.Once
-	stop := func() { stopOnce.Do(func() { close(done) }) }
+	stop := func() {
+		stopOnce.Do(func() {
+			close(done)
+			if err := tunnelConn.SetDeadline(time.Now()); err != nil {
+				_ = tunnelConn.Close()
+			}
+		})
+	}
+	var workers sync.WaitGroup
 	requests := make(chan []byte, udpFrameQueueSize)
 	responses := make(chan []byte, udpFrameQueueSize)
 	targets := make(map[string]*udpTarget)
@@ -177,6 +186,7 @@ func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Log
 		for _, target := range targets {
 			_ = target.conn.Close()
 		}
+		workers.Wait()
 		logger.Info("UDP tunnel closed",
 			"upload_datagrams", uploaded,
 			"download_datagrams", downloaded.Load(),
@@ -187,7 +197,9 @@ func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Log
 		)
 	}()
 
+	workers.Add(2)
 	go func() {
+		defer workers.Done()
 		for {
 			packet, err := tunnel.ReadDatagram(reader)
 			if err != nil {
@@ -202,6 +214,7 @@ func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Log
 		}
 	}()
 	go func() {
+		defer workers.Done()
 		writer := bufio.NewWriterSize(tunnelConn, 32*1024)
 		for {
 			select {
@@ -231,6 +244,11 @@ func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Log
 			}
 			address := net.JoinHostPort(destination.Host, strconv.Itoa(int(destination.Port)))
 			target := targets[address]
+			if target != nil && target.failed.Load() {
+				_ = target.conn.Close()
+				delete(targets, address)
+				target = nil
+			}
 			if target == nil {
 				if len(targets) >= udpTargetLimit {
 					logger.Debug("UDP session destination limit reached")
@@ -250,10 +268,16 @@ func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Log
 				if len(targets) > peakTargets {
 					peakTargets = len(targets)
 				}
-				go readUDPResponses(target, responses, done, &downloaded, &droppedResponses, logger)
+				workers.Add(1)
+				go func(target *udpTarget) {
+					defer workers.Done()
+					readUDPResponses(target, responses, done, &downloaded, &droppedResponses, logger)
+				}(target)
 			}
 			if _, err := target.conn.Write(payload); err != nil {
 				logger.Debug("write target UDP failed", "error", err)
+				_ = target.conn.Close()
+				delete(targets, address)
 				continue
 			}
 			target.lastActivity.Store(time.Now().UnixNano())
@@ -272,10 +296,16 @@ func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Log
 }
 
 func readUDPResponses(target *udpTarget, responses chan<- []byte, done <-chan struct{}, downloaded, dropped *atomic.Uint64, logger *slog.Logger) {
+	defer func() {
+		target.failed.Store(true)
+		_ = target.conn.Close()
+	}()
 	buffer := make([]byte, tunnel.MaxDatagramSize)
 	for {
 		n, err := target.conn.Read(buffer)
 		if err != nil {
+			target.failed.Store(true)
+			logger.Debug("read target UDP failed", "error", err)
 			return
 		}
 		target.lastActivity.Store(time.Now().UnixNano())

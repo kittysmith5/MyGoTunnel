@@ -166,6 +166,12 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Lo
 
 func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time) {
 	const udpFrameQueueSize = 256
+	tcpPeer, ok := clientConn.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		logger.Warn("SOCKS5 UDP control peer is not TCP")
+		_ = socks5.Reply(clientConn, 0x01)
+		return
+	}
 	bindIP := net.IPv4zero
 	if tcpLocal, ok := clientConn.LocalAddr().(*net.TCPAddr); ok && tcpLocal.IP.To4() == nil {
 		bindIP = net.IPv6unspecified
@@ -221,30 +227,41 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 
 	stop := make(chan struct{})
 	var stopOnce sync.Once
-	stopSession := func() { stopOnce.Do(func() { close(stop) }) }
-	defer stopSession()
-	go func() {
-		_, _ = io.Copy(io.Discard, clientConn)
-		stopSession()
-	}()
-	go func() {
-		<-stop
-		_ = udpConn.SetReadDeadline(time.Now())
-		_ = remoteConn.SetDeadline(time.Now())
-	}()
+	stopSession := func() {
+		stopOnce.Do(func() {
+			close(stop)
+			_ = udpConn.Close()
+			if err := remoteConn.SetDeadline(time.Now()); err != nil {
+				_ = remoteConn.Close()
+			}
+			if err := clientConn.SetReadDeadline(time.Now()); err != nil {
+				_ = clientConn.Close()
+			}
+		})
+	}
+	var workers sync.WaitGroup
 
 	var clientUDP *net.UDPAddr
 	var clientUDPmu sync.Mutex
 	responses := make(chan []byte, 128)
 	requests := make(chan []byte, udpFrameQueueSize)
-	remoteDone := make(chan struct{})
 	var uploaded atomic.Uint64
 	var downloaded atomic.Uint64
 	var dropped atomic.Uint64
+	var writeErrors atomic.Uint64
 	defer func() {
-		logger.Info("UDP tunnel closed", "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(), "dropped_datagrams", dropped.Load(), "duration", time.Since(startedAt))
+		stopSession()
+		workers.Wait()
+		logger.Info("UDP tunnel closed", "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(), "dropped_datagrams", dropped.Load(), "udp_write_errors", writeErrors.Load(), "duration", time.Since(startedAt))
+	}()
+	workers.Add(4)
+	go func() {
+		defer workers.Done()
+		_, _ = io.Copy(io.Discard, clientConn)
+		stopSession()
 	}()
 	go func() {
+		defer workers.Done()
 		writer := bufio.NewWriterSize(remoteConn, 32*1024)
 		for {
 			select {
@@ -252,7 +269,6 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 				if err := tunnel.WriteQueuedDatagrams(writer, packet, requests); err != nil {
 					logger.Debug("send UDP datagram through tunnel failed", "error", err)
 					stopSession()
-					_ = remoteConn.Close()
 					return
 				}
 			case <-stop:
@@ -261,7 +277,8 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 		}
 	}()
 	go func() {
-		defer close(remoteDone)
+		defer workers.Done()
+		defer stopSession()
 		for {
 			response, err := tunnel.ReadDatagram(reader)
 			if err != nil {
@@ -269,7 +286,6 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 			}
 			select {
 			case responses <- response:
-				downloaded.Add(1)
 			case <-stop:
 				return
 			default:
@@ -278,6 +294,7 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 		}
 	}()
 	go func() {
+		defer workers.Done()
 		for {
 			select {
 			case response := <-responses:
@@ -285,7 +302,12 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 				peer := clientUDP
 				clientUDPmu.Unlock()
 				if peer != nil {
-					_, _ = udpConn.WriteToUDP(response, peer)
+					if _, err := udpConn.WriteToUDP(response, peer); err != nil {
+						writeErrors.Add(1)
+						dropped.Add(1)
+					} else {
+						downloaded.Add(1)
+					}
 				}
 			case <-stop:
 				return
@@ -294,46 +316,37 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 	}()
 	packet := make([]byte, tunnel.MaxDatagramSize+1)
 	for {
-		_ = udpConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 		n, source, err := udpConn.ReadFromUDP(packet)
 		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
-				select {
-				case <-stop:
-					return
-				case <-remoteDone:
-					return
-				default:
-				}
-				continue
-			}
 			return
 		}
 		if n > tunnel.MaxDatagramSize {
 			dropped.Add(1)
 			continue
 		}
-		clientUDPmu.Lock()
-		if clientUDP == nil {
-			if request.Address != "" && request.Address != "0.0.0.0" && request.Address != "::" && source.IP.String() != request.Address {
-				logger.Warn("drop UDP packet from unexpected client address")
-				clientUDPmu.Unlock()
-				continue
-			}
-			clientUDP = source
-		}
-		if source.String() != clientUDP.String() {
-			clientUDPmu.Unlock()
+		if !source.IP.Equal(tcpPeer.IP) ||
+			(request.Port != 0 && source.Port != int(request.Port)) ||
+			(request.Address != "" && request.Address != "0.0.0.0" && request.Address != "::" && source.IP.String() != request.Address) {
+			dropped.Add(1)
 			continue
 		}
-		clientUDPmu.Unlock()
-		destination, payload, err := socks5.ParseUDPDatagram(packet[:n])
-		if err != nil {
+		if _, _, err := socks5.ParseUDPDatagram(packet[:n]); err != nil {
+			dropped.Add(1)
 			logger.Debug("drop malformed SOCKS5 UDP datagram", "error", err)
 			continue
 		}
+		clientUDPmu.Lock()
+		if clientUDP == nil {
+			clientUDP = source
+		}
+		matchesPeer := source.IP.Equal(clientUDP.IP) && source.Port == clientUDP.Port && source.Zone == clientUDP.Zone
+		clientUDPmu.Unlock()
+		if !matchesPeer {
+			dropped.Add(1)
+			continue
+		}
 		select {
-		case requests <- socks5.BuildUDPDatagram(destination, payload):
+		case requests <- append([]byte(nil), packet[:n]...):
 			uploaded.Add(1)
 		case <-stop:
 			return
