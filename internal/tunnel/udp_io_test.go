@@ -44,6 +44,51 @@ func TestPooledDatagramReaderAlignmentLimitsAndOwnership(t *testing.T) {
 	}
 }
 
+func TestPooledDatagramReaderEOFOnlyAtFrameBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		frame     []byte
+		exhausted bool
+		want      error
+	}{
+		{name: "empty", want: io.EOF},
+		{name: "half_prefix", frame: []byte{0}, want: io.ErrUnexpectedEOF},
+		{name: "missing_body", frame: []byte{0, 5}, want: io.ErrUnexpectedEOF},
+		{name: "partial_body", frame: []byte{0, 5, 'x'}, want: io.ErrUnexpectedEOF},
+		{name: "exhausted_empty", exhausted: true, want: io.EOF},
+		{name: "exhausted_half_prefix", frame: []byte{0}, exhausted: true, want: io.ErrUnexpectedEOF},
+		{name: "exhausted_missing_body", frame: []byte{0, 5}, exhausted: true, want: io.ErrUnexpectedEOF},
+		{name: "exhausted_partial_body", frame: []byte{0, 5, 'x'}, exhausted: true, want: io.ErrUnexpectedEOF},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resources := datagram.NewResources(1, 512)
+			defer resources.Close()
+			var held datagram.Packet
+			if tc.exhausted {
+				var err error
+				held, err = resources.Borrow(1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer held.Release()
+			}
+			reader := NewDatagramReader(bufio.NewReader(bytes.NewReader(tc.frame)), resources)
+			packet, err := reader.ReadPacket()
+			if !errors.Is(err, tc.want) || errors.Is(err, io.EOF) != (tc.want == io.EOF) {
+				t.Fatalf("ReadPacket() error = %v, want %v", err, tc.want)
+			}
+			if packet.Data != nil {
+				packet.Release()
+				t.Fatal("failed frame returned a packet owner")
+			}
+			held.Release()
+			if s := resources.Stats(); s.BufferBytes != s.CachedBytes {
+				t.Fatal("failed frame retained a buffer owner", s)
+			}
+		})
+	}
+}
+
 func TestPooledDatagramReaderWarmAllocationsAndMaximum(t *testing.T) {
 	r := datagram.NewResources(1, 1<<20)
 	defer r.Close()

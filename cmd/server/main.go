@@ -17,16 +17,21 @@ import (
 	"time"
 
 	"mygotunnel/internal/admission"
+	"mygotunnel/internal/buildinfo"
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/diagnostics"
 	"mygotunnel/internal/dialmetrics"
 	"mygotunnel/internal/logging"
+	"mygotunnel/internal/operations"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/tunnel"
 )
 
 func main() {
+	version := flag.Bool("version", false, "print build identity JSON and exit")
+	diagnose := flag.Bool("check-config", false, "validate configuration without starting service")
+	health := flag.Bool("health", false, "run bounded operational health check and exit")
 	configPath := flag.String("config", "configs/server.json", "config file path")
 	initialize := flag.Bool("init", false, "generate config, token and certificate, output connection code and exit")
 	exportCode := flag.Bool("export", false, "output connection code for existing config and exit")
@@ -40,6 +45,15 @@ func main() {
 	metricsPath := flag.String("runtime-metrics", "", "optional exclusive private runtime JSONL output file")
 	shutdownTimeout := flag.Duration("shutdown-timeout", 15*time.Second, "maximum active connection drain time on shutdown")
 	flag.Parse()
+	if *version {
+		if buildinfo.Write(os.Stdout) != nil {
+			os.Exit(1)
+		}
+		return
+	}
+	if *diagnose || *health {
+		os.Exit(operations.Check("server", *configPath, *health))
+	}
 
 	logger, err := logging.New(os.Stderr, logging.Options{
 		Component: "server",
@@ -130,6 +144,8 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	defer ln.Close()
 
 	logger.Info("listening",
+		"version", buildinfo.Current().Version,
+		"commit", buildinfo.Current().Commit,
 		"listen_addr", cfg.ListenAddr,
 		"alpn", "http/1.1",
 		"timezone", "UTC",
@@ -196,7 +212,8 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 
 	var idleDuration time.Duration
 	pooled := false
-	if line == "PREPARE" {
+	commandACK := line == "PREPARE ACK"
+	if line == "PREPARE" || commandACK {
 		if poolOptions == nil || cap(poolOptions.idleSlots) == 0 {
 			_ = tunnel.SendERR(tunnelConn)
 			return
@@ -221,8 +238,14 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 			return
 		}
 		idleStarted := time.Now()
-		if err := tunnel.SendReady(tunnelConn); err != nil {
-			logging.Failure(connectionLogger, "prepare", err)
+		var readyErr error
+		if commandACK {
+			readyErr = tunnel.SendReadyWithAck(tunnelConn)
+		} else {
+			readyErr = tunnel.SendReady(tunnelConn)
+		}
+		if readyErr != nil {
+			logging.Failure(connectionLogger, "prepare", readyErr)
 			return
 		}
 		line, err = tunnel.ReadLine(reader)
@@ -233,7 +256,9 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 			return
 		}
 		if !poolOptions.resumeSetup() {
-			_ = tunnel.SendTargetError(tunnelConn, syscall.ENOBUFS)
+			if err := tunnel.SendTargetResult(tunnelConn, syscall.ENOBUFS); err != nil {
+				logging.Failure(connectionLogger, "reply", err)
+			}
 			return
 		}
 		pooled = true
@@ -246,6 +271,12 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 	}
 
 	if line == "UDP" {
+		if commandACK {
+			if err := acknowledgePrepared(tunnelConn, connectDeadline); err != nil {
+				logging.Failure(connectionLogger, "ack", err)
+				return
+			}
+		}
 		handleUDPTunnel(tunnelConn, reader, connectionLogger.With(
 			"pool_connection", pooled, "auth_duration", authDuration, "idle_duration", idleDuration,
 			"wait_duration", time.Since(connectStarted)), startedAt, idleDuration, releaseSetup, cfg.UDPQueueConfig, resources...)
@@ -266,6 +297,12 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 	waitDuration := time.Since(connectStarted)
 	requestLogger := connectionLogger.With("target_addr", targetAddr)
 	requestLogger.Debug("connect")
+	if commandACK {
+		if err := acknowledgePrepared(tunnelConn, connectDeadline); err != nil {
+			logging.Failure(requestLogger, "ack", err)
+			return
+		}
+	}
 
 	ctx, cancel := context.WithDeadline(parent, connectDeadline)
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
@@ -275,13 +312,15 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 	cancel()
 	if err != nil {
 		logging.Failure(requestLogger, "dial", err, "dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "setup_duration", time.Since(startedAt)-idleDuration)
-		_ = tunnel.SendTargetError(tunnelConn, err)
+		if replyErr := tunnel.SendTargetResult(tunnelConn, err); replyErr != nil {
+			logging.Failure(requestLogger, "reply", replyErr)
+		}
 		return
 	}
 	defer targetConn.Close()
 
 	replyStarted := time.Now()
-	if err := tunnel.SendOK(tunnelConn); err != nil {
+	if err := tunnel.SendTargetResult(tunnelConn, nil); err != nil {
 		logging.Failure(requestLogger, "reply", err)
 		return
 	}
@@ -302,6 +341,20 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 		"setup_duration", time.Since(startedAt)-idleDuration)
 	result := relay.CopyBidirectional(tunnelConn, reader, targetConn, targetConn)
 	logging.LogTunnelResult(requestLogger, result, startedAt)
+}
+
+func acknowledgePrepared(conn net.Conn, controlDeadline time.Time) error {
+	deadline := time.Now().Add(tunnel.PreparedAckTimeout)
+	if controlDeadline.Before(deadline) {
+		deadline = controlDeadline
+	}
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	if err := tunnel.SendAcknowledged(conn); err != nil {
+		return err
+	}
+	return conn.SetWriteDeadline(controlDeadline)
 }
 
 func checkAuth(conn net.Conn, reader *bufio.Reader, expectedToken string) (authErr error) {

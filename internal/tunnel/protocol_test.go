@@ -99,6 +99,18 @@ func TestReadLineReturnsTimeout(t *testing.T) {
 	}
 }
 
+func TestReadLineDistinguishesBoundaryAndTruncatedEOF(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  error
+	}{{"", io.EOF}, {"ACK", io.ErrUnexpectedEOF}, {"ERR DNS", io.ErrUnexpectedEOF}} {
+		_, err := ReadLine(bufio.NewReader(strings.NewReader(tc.input)))
+		if !errors.Is(err, tc.want) {
+			t.Fatalf("ReadLine(%q) = %v, want %v", tc.input, err, tc.want)
+		}
+	}
+}
+
 type setupWriter struct {
 	net.Conn
 	bytes.Buffer

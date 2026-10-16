@@ -21,6 +21,20 @@ func requestError(rep byte, message string) error {
 	return &RequestError{Rep: rep, message: message}
 }
 
+// validateDomain is shared by TCP requests and UDP destinations. Neither may
+// introduce address separators or control characters into downstream protocols.
+func validateDomain(host string) error {
+	if host == "" || strings.ContainsAny(host, ":/\\[]") {
+		return requestError(0x08, "invalid SOCKS5 domain")
+	}
+	for _, character := range host {
+		if unicode.IsControl(character) || unicode.IsSpace(character) {
+			return requestError(0x08, "invalid SOCKS5 domain")
+		}
+	}
+	return nil
+}
+
 // ReplyCode maps malformed requests and transport failures to SOCKS5 responses.
 func ReplyCode(err error) byte {
 	var requestErr *RequestError
@@ -91,13 +105,8 @@ func ReadRequestDetails(conn net.Conn) (Request, error) {
 		}
 
 		host = string(hostBuf)
-		if host == "" || strings.ContainsAny(host, ":/\\[]") {
-			return Request{}, requestError(0x08, "invalid SOCKS5 domain")
-		}
-		for _, character := range host {
-			if character < 0x20 || character == 0x7f || unicode.IsSpace(character) {
-				return Request{}, requestError(0x08, "invalid SOCKS5 domain")
-			}
+		if err := validateDomain(host); err != nil {
+			return Request{}, err
 		}
 
 	case 0x04:

@@ -35,12 +35,20 @@ func (r *DatagramReader) ReadPacket() (datagram.Packet, error) {
 	p, err := r.resources.Borrow(n)
 	if err != nil {
 		if _, discardErr := r.reader.Discard(n); discardErr != nil {
+			if errors.Is(discardErr, io.EOF) {
+				discardErr = io.ErrUnexpectedEOF
+			}
 			return datagram.Packet{}, discardErr
 		}
 		return datagram.Packet{}, err
 	}
 	if _, err = io.ReadFull(r.reader, p.Data); err != nil {
 		p.Release()
+		// EOF is clean only before a frame's prefix. Once the length has
+		// arrived, even a completely absent body is a truncated frame.
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF
+		}
 		return datagram.Packet{}, err
 	}
 	return p, nil

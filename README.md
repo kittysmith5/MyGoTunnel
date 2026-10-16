@@ -45,9 +45,11 @@ go run ./cmd/server -export -config configs/server.json -public-addr example.com
 
 SOCKS5 同时支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 经现有 TLS/TCP 隧道按长度封装，在服务端还原为 UDP；保留 TCP 控制连接。UDP 使用与 TCP 相同的证书指纹/CA 校验、认证、控制阶段超时、预连接池、连接准入和优雅退出，不额外退回跳过证书验证。普通建连可合并发送 AUTH 与 UDP，备用命中只发送 UDP。进入转发前释放 setup 名额；UDP association 仍占总连接名额。
 
-UDP 来源 IP 必须与 SOCKS TCP 对端相同。请求中非零源端口会被约束；否则第一个合法报文绑定端口。畸形报文、其他来源、分片报文与含 SOCKS 头超过 65000 字节的报文被丢弃。客户端 legacy socks_username/socks_password 仍可读取，嵌套 socks_auth 优先；认证禁止免认证降级。
+UDP 来源 IP 必须与 SOCKS TCP 对端相同。ASSOCIATE 声明源域名时，在成功回复前解析一次（最长5秒，计入总setup预算），结果须包含TCP对端IP；不匹配返回REP=2，解析失败返回REP=4。后续仍只接受TCP对端IP，不按每包解析源域名。请求中非零源端口会被约束；否则第一个合法报文绑定端口。空目标域名、控制字符/地址分隔符、目标端口0、畸形报文、其他来源、分片报文与含 SOCKS 头超过 65000 字节的报文均在绑定来源端口前丢弃；ASSOCIATE源端口0及零长度UDP负载保留。客户端 legacy socks_username/socks_password 仍可读取，嵌套 socks_auth 优先；认证禁止免认证降级。
 
 出错目标 socket 下次发包重建，空闲 2 分钟后回收（15 秒扫描），每会话最多 256 个目标 worker，退出中的 worker 也占名额。各目标独立解析和发送，慢目标不会阻塞其他目标的分发；域名初始化并发最多 16，数字 IP 不占 DNS 名额。同一目标初始化期间复用待发送队列，保持该目标的发送顺序。目标拨号（包括等待 DNS 名额）与写入各受 5 秒期限约束，断开隧道取消解析、关闭目标 socket 并等待所有 worker。进程取消后，已建立会话继续到 grace 结束或正常断开；不会在进程取消瞬间无条件中断所有 UDP。
+
+目标表达到256项时，会先回收已失败或已闲置的项再判断新目标准入，无需等下次15秒扫描；关闭中的worker仍占独立名额，直到全部I/O结束。帧边界EOF才记为正常关闭；长度头已完整到达后，body缺失或被截断（包括预算不足时丢弃body）均记为truncated错误。
 
 客户端出站/入站队列为 256/128 包，服务端收发各 256 包；每队列默认还限制 1 MiB 数据，入队和出队都会丢弃等待满 250 ms 的旧报文，再按容量决定是否接收新包。服务端每目标待发送队列最多 32 包、64 KiB UDP 负载，所有目标待发送队列另共享 1 MiB 负载预算，不能随目标数量无限扩张。目标初始化等待计入队列年龄，转入目标队列不会重置年龄。每批最多刷新 32 个已排队帧，不等待凑批。缓冲写入直接复用 bufio 帧头空间，不再为每个包复制整帧；客户端本地入队、服务端响应入队在容量不足时不复制负载。
 
@@ -85,6 +87,8 @@ UDP 结束记录首个根因的 `stage` / `close_reason`，包括 udp_control、
 
 新错误在客户端日志区分 timeout、dns、unreachable、refused、limit、canceled、error，并映射到 SOCKS 回复：NETWORK=3，TIMEOUT/DNS/HOST=4，REFUSED=5，其余=1。6是TTL expired，不用于一般拨号超时。旧ERR保持原客户端CONNECT拒绝语义；未知错误码按协议错误处理。任何明确错误响应都不触发备用连接的传输回退，只有原有传输失败路径允许回退。
 
+目标OK/ERR回复（包括预连接重取setup失败、UDP建立成功）有独立1秒写入预算，即使先前控制读取/目标拨号期限耗尽，也会尝试有界发送，并记录回复写入失败。客户端在AUTH成功后或协商ACK后重新起算目标响应等待，20秒控制预算另留1秒回复余量，仍受整体setup期限限制。
+
 ## 日志
 
 日志使用 Go `log/slog`，写到 stderr，默认 `-log-level info -log-format text`。消息保持英文；文本采用紧凑格式，去掉重复的 `time=`、`level=`、`msg=`、`component=`。日期完整，UTC 时间精确到毫秒，启动时输出 `timezone=UTC`；`C` / `S` 分别表示客户端 / 服务端。
@@ -115,6 +119,7 @@ UDP 结束记录首个根因的 `stage` / `close_reason`，包括 udp_control、
 | tcp | tcp_duration | 连接服务端，包含域名解析 |
 | tls | tls_duration | 客户端 TLS 握手 |
 | take | pool_acquire_duration | 取用备用连接 |
+| ack | pool_ack_duration | 已协商预连接的命令发送到即时ACK耗时；失败时包含该阶段等待，未协商为0 |
 | ctl | control_duration | 认证/CONNECT 交互，包含等待服务端拨号；回退时包含两次控制尝试 |
 | auth | auth_duration | 服务端认证，包含 TLS 握手；备用连接中此阶段在后台完成 |
 | wait | wait_duration | 服务端 CONNECT 命令读取和准备阶段，不包含备用闲置 |
@@ -147,12 +152,12 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 ## 连接期限与控制报文
 
 - 客户端 SOCKS5 协商和 CONNECT 请求读取共用 5 秒读写期限。
-- 客户端连接远端 TCP/uTLS 保持 15 秒总超时；随后 AUTH 和 CONNECT 交互共用 20 秒读写期限。
-- 本地 SOCKS5 建连响应另受 40 秒期限约束，覆盖远端拨号、控制交互和响应写入。
-- 服务端 TLS 握手、AUTH 读取和认证响应写入共用 5 秒读写期限；认证后 CONNECT 读取、目标拨号和响应写入共用 20 秒期限。目标拨号仍为 10 秒超时。
+- 客户端连接远端 TCP/uTLS 保持 15 秒总超时；控制响应每阶段最长21秒（20秒控制+1秒回复余量），AUTH成功/ACK收到后重设，并夹住parent期限。
+- 前台总setup期限为38秒（15秒远端建连+20秒控制+1秒回复+2秒池ACK），本地SOCKS5回复另留5秒，最多43秒；UDP源域名解析计入同一setup预算，不能保证每个子阶段都同时用满。
+- 服务端 TLS 握手、AUTH 读取和认证响应写入共用 5 秒读写期限；认证后 CONNECT 读取和目标拨号共用20秒期限，目标拨号自身仍最长10秒，最终目标回复单独最多1秒。
 - 建连成功后，客户端和服务端清除控制阶段的读写期限，不限制应用数据转发时长。
 - AUTH、CONNECT 和响应的每行控制报文最多 4096 字节，包含换行；超限立即失败。发送值和接收报文拒绝内嵌控制字符，兼容行尾 CRLF。
-- SOCKS5 仅接受客户端提供的无认证方法，否则返回 05 FF 并关闭连接。不支持的命令返回 REP=07，不支持的地址类型或非法域名返回 REP=08；RSV 必须为零，目标端口不能为零。
+- SOCKS5 按本地配置选择免认证或RFC1929认证；配置凭据后禁止免认证降级。不支持的命令返回 REP=07，不支持的地址类型或非法域名返回 REP=08；RSV 必须为零，目标端口不能为零。
 
 上述超时为代码默认值，当前没有新增 JSON 配置项。AUTH/CONNECT 的顺序与成功响应保持兼容。
 
@@ -166,7 +171,11 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 
 ## 预连接池
 
-客户端默认 `-pool-size 4 -pool-max 16`，按需在 4～16 条备用容量间调整；pool-size 范围 0～32；设为 0 使用原来的 TCP/TLS + AUTH/CONNECT 流水建连。后台完成 TLS 和 AUTH 后发送 PREPARE，服务端回复 READY，连接只用于一次后续 CONNECT；不会复用已转发过数据的连接，也没有多路复用。备用连接用完就补充，池为空时立即走普通建连，不等待补充。
+客户端默认 `-pool-size 4 -pool-max 16`，按需在 4～16 条备用容量间调整；pool-size 范围 0～32；设为 0 使用原来的 TCP/TLS + AUTH/CONNECT 流水建连。后台完成 TLS 和 AUTH 后协商PREPARE，连接只用于一次后续CONNECT或UDP；不会复用已转发过数据的连接，也没有多路复用。备用连接用完就补充，池为空时立即走普通建连，不等待补充。
+
+新客户端先发送 `AUTH → PREPARE ACK`；支持的新服务端回复 `OK → READY ACK`，交接后收到CONNECT/UDP即先回复ACK，再继续目标拨号或UDP建立，最后回复原OK/ERR。命令发送与即时ACK共用独立2秒期限；ACK后恢复目标响应等待，正常慢目标不会因2秒期限被提前回退。服务端发送ACK后直接继续处理，不等待客户端确认，不强制增加一次控制往返。
+
+只有本次连接明确协商READY ACK才启用2秒期限。旧客户端仍用PREPARE/READY且不会收到ACK；旧服务端在AUTH成功后对新探测返回EOF/ERR时，新客户端最多换一条连接重试旧PREPARE。仅有效旧READY会缓存旧能力，缓存按池隔离5分钟后可重新探测；并行首次填充可能各探测一次。AUTH失败、BUSY、超时、取消或畸形协商响应不触发旧协议重试。未协商旧连接保留原控制等待行为，不能承诺其静默失效也在2秒内恢复。
 
 备用连接最长闲置 45 秒，后台被动读取以发现 EOF/失效，取用前停止后台读取并交接同一个缓冲读取器。失败按 0.5～30 秒指数退避并增加随机抖动；不支持 PREPARE 的旧服务端可正常走普通流程，后台以较长退避周期重新探测。仅在未发送任何应用负载的备用连接发生传输错误时，允许一次普通建连回退；明确的目标拨号失败不自动重试。请求总建连期限保持有界。
 
@@ -305,3 +314,43 @@ SOCKS 认证仅属于客户端本地配置，不导出到 mygotunnel 连接码�
 转发正常 EOF 仍发送半关闭并等待反向数据排空；复制失败时跳过该方向 CloseWrite，立即向协调方报告根错误并中断双向读写，再等待两个复制任务退出。保持原错误方向、字节计数及既有 bufio.Reader。正常运行期间没有新增通用空闲超时或半关闭排空超时。
 
 验证覆盖慢握手期间继续补充、慢 worker 与失败窗口并存时恢复、共享退避、错误路径跳过关闭通知、取消后继续传输与自然排空、期限到达后强制关闭并回收 handler/计数。历史双机性能数据属于此前版本，本轮不得据此宣称吞吐提升。
+
+### 发布与运维（Linux/systemd）
+
+两端支持 `-version` 输出版本、完整提交、构建时间和平台 JSON，不读取配置。
+`-config /etc/mygotunnel/client.json -check-config` 离线校验配置；服务端还校验证书/私钥与有效期。
+诊断只输出固定错误码，不输出配置解析原文或凭据；配置权限过宽会给出警告。
+`-health` 客户端检查经证书验证和认证的远端预连接通道；服务端检查本地监听可达。
+健康检查不等同于任意目标 TCP/UDP 可达，服务端监听探测会产生一次预期握手关闭日志。
+
+在已提交的版本上运行 `scripts/release.sh v0.1.0 /private/release`，从 Git archive 构建
+Linux ARM64/AMD64 两端及带 SHA-256 的 manifest。版本标签必须指向 manifest 的 commit。
+安装脚本为 `/usr/local/sbin/mygotunnelctl` 后：
+
+```bash
+sudo mygotunnelctl status --role client
+sudo mygotunnelctl diagnose --role client
+sudo mygotunnelctl health --role client
+sudo mygotunnelctl upgrade --role client --bundle /private/release
+sudo mygotunnelctl rollback --role client
+```
+
+服务端用 `--role server`。工具使用现有 `/etc/mygotunnel/{client,server}.json` 和同名
+systemd 服务，保留配置、凭据与启动参数。升级校验哈希、版本、提交、配置，原子替换二进制，
+重启后检查健康、实际运行文件哈希；失败自动恢复上一二进制并重启。
+回滚同样检查健康，成功后可再次 rollback 撤销本次回滚。
+备份保存在 root 私有的 `/var/lib/mygotunnel/releases`，保留供人工审计清理，不自动删除。
+仅安装可信本地 bundle；manifest 哈希验证传输完整性，不提供发行者签名验证。
+
+`scripts/observe.py --role client --output /var/lib/mygotunnel/observation/UNIQUE --hours 72`
+每 30 秒被动读取 journal、systemd 和 /proc，输出私有 samples.jsonl / summary.json；
+建议通过独立 systemd 服务运行。最多 72 小时，不生成业务探测流量，不保存目标地址或凭据。
+记录 RSS、FD、TCP 连接数、重启次数、stats 中活跃连接/UDP 资源、建连失败率与建连 P95/P99。
+分位数来自成功 ready 的 setup_duration，含 SOCKS 前端等待，按 1ms 向上取整，超过 60s
+记录为 60001；不是应用 RTT。失败率以首次 ready/failed 的连接 ID 去重，转发中错误单列；
+预连接后台错误无连接 ID 不计入。去重表限制 10 万项，超长连接被逐出后可能重复分类。
+单次最多读取 2 万条 journal，达到上限会标记数据可能不完整。保留基线/峰值/末值辅助判断增长，
+需要完整观察窗口与负载背景才能认定泄漏；低流量时分位数不代表高负载体验。
+
+回滚到尚无运维标志的历史版本时，版本显示为 legacy/unknown，健康门禁降为服务状态、
+本地监听与运行文件哈希检查；原配置始终保留。新版本间回滚使用完整健康门禁。

@@ -47,7 +47,7 @@ func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Log
 func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Logger, startedAt time.Time, idleDuration time.Duration, releaseSetup func(), queueConfig config.UDPQueueConfig, dial udpDialFunc, limits ...*datagram.Resources) {
 	resources := datagram.SelectResources(limits)
 	replyStarted := time.Now()
-	if err := tunnel.SendOK(tunnelConn); err != nil {
+	if err := tunnel.SendTargetResult(tunnelConn, nil); err != nil {
 		logger.Warn("send UDP response failed", "error", err)
 		return
 	}
@@ -90,6 +90,19 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 		targetFull += stats.FullDrops
 		targetExpired += stats.ExpiredDrops
 		targetPeakBytes = max(targetPeakBytes, uint64(stats.PeakBytes))
+	}
+	sweepTargets := func(now time.Time) {
+		for address, target := range targets {
+			last := time.Unix(0, target.lastActivity.Load())
+			idleExpired := now.Sub(last) >= udpTargetIdleTimeout
+			if target.failed.Load() || idleExpired {
+				retire(target)
+				delete(targets, address)
+				if idleExpired {
+					expiredTargets++
+				}
+			}
+		}
 	}
 	defer func() {
 		stop("udp_session", nil)
@@ -180,6 +193,12 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 				target = nil
 			}
 			if target == nil {
+				// Failed targets can release their socket between periodic sweeps.
+				// Reclaim their map entries before rejecting an unrelated target;
+				// targetSlots still bounds workers whose I/O has not stopped yet.
+				if len(targets) >= udpTargetLimit {
+					sweepTargets(time.Now())
+				}
 				if len(targets) >= udpTargetLimit {
 					frame.Release()
 					droppedRequests.Add(1)
@@ -228,17 +247,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 				droppedRequests.Add(1)
 			}
 		case now := <-ticker.C:
-			for address, target := range targets {
-				last := time.Unix(0, target.lastActivity.Load())
-				idleExpired := now.Sub(last) >= udpTargetIdleTimeout
-				if target.failed.Load() || idleExpired {
-					retire(target)
-					delete(targets, address)
-					if idleExpired {
-						expiredTargets++
-					}
-				}
-			}
+			sweepTargets(now)
 		}
 	}
 }

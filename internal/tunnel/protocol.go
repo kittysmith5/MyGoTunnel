@@ -15,6 +15,16 @@ const MaxControlLineBytes = 4096
 // ControlTimeout bounds AUTH/CONNECT reads and writes, not application traffic.
 const ControlTimeout = 20 * time.Second
 
+// ControlReplyTimeout is a separate, bounded budget for the final OK/ERR.
+const ControlReplyTimeout = time.Second
+
+// PreparedAckTimeout bounds command delivery and the immediate receipt ACK,
+// independently of the time needed to resolve and connect to the target.
+const PreparedAckTimeout = 2 * time.Second
+
+const PreparedAckReady = "READY ACK"
+const CommandAcknowledged = "ACK"
+
 // Prepared connections are authenticated, bounded and expire without heartbeats.
 const PreparedIdleTimeout = 60 * time.Second
 
@@ -48,6 +58,9 @@ func ReadLine(reader *bufio.Reader) (string, error) {
 			return "", ErrControlLineTooLong
 		}
 		if !errors.Is(err, bufio.ErrBufferFull) {
+			if errors.Is(err, io.EOF) && len(line) > 0 {
+				return "", io.ErrUnexpectedEOF
+			}
 			return "", err
 		}
 	}
@@ -115,10 +128,24 @@ func SendERR(conn net.Conn) error {
 
 // SendPrepare negotiates preconnection support after ordinary AUTH.
 func SendPrepare(conn net.Conn, token string) error {
+	return sendPrepare(conn, token, false)
+}
+
+func SendPrepareWithAck(conn net.Conn, token string) error {
+	return sendPrepare(conn, token, true)
+}
+
+func sendPrepare(conn net.Conn, token string, ack bool) error {
 	if err := validateCommand("AUTH", token); err != nil {
 		return err
+	}
+	if ack {
+		return writeControl(conn, "AUTH "+token+"\nPREPARE ACK\n")
 	}
 	return writeControl(conn, "AUTH "+token+"\nPREPARE\n")
 }
 func SendReady(conn net.Conn) error { return writeControl(conn, "READY\n") }
 func SendBusy(conn net.Conn) error  { return writeControl(conn, "BUSY\n") }
+
+func SendReadyWithAck(conn net.Conn) error { return writeControl(conn, PreparedAckReady+"\n") }
+func SendAcknowledged(conn net.Conn) error { return writeControl(conn, CommandAcknowledged+"\n") }

@@ -32,6 +32,11 @@ type udpAssociationTest struct {
 // external server. The remote stub echoes framed SOCKS UDP packets unchanged.
 func newUDPAssociationTest(t *testing.T, request socks5.Request, limits ...*datagram.Resources) udpAssociationTest {
 	t.Helper()
+	return newUDPAssociationTestReply(t, request, 0, net.DefaultResolver.LookupIPAddr, limits...)
+}
+
+func newUDPAssociationTestReply(t *testing.T, request socks5.Request, wantRep byte, lookup udpSourceLookup, limits ...*datagram.Resources) udpAssociationTest {
+	t.Helper()
 	certSource := httptest.NewTLSServer(nil)
 	cert := certSource.TLS.Certificates[0]
 	certSource.Close()
@@ -100,9 +105,9 @@ func newUDPAssociationTest(t *testing.T, request socks5.Request, limits ...*data
 		defer close(done)
 		defer clientConn.Close()
 		pin := sha256.Sum256(cert.Certificate[0])
-		handleUDPAssociate(context.Background(), clientConn, request, &config.ClientConfig{
+		handleUDPAssociateWithResolver(context.Background(), clientConn, request, &config.ClientConfig{
 			RemoteAddr: listener.Addr().String(), AuthToken: "test-token", CertificateFingerprint: hex.EncodeToString(pin[:]),
-		}, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now(), func() {}, nil, limits...)
+		}, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now(), func() {}, nil, lookup, limits...)
 	}()
 	t.Cleanup(func() {
 		_ = control.Close()
@@ -117,8 +122,21 @@ func newUDPAssociationTest(t *testing.T, request socks5.Request, limits ...*data
 	if _, err := io.ReadFull(control, reply[:]); err != nil {
 		t.Fatal(err)
 	}
-	if reply[0] != 5 || reply[1] != 0 || reply[3] != 1 {
+	if reply[0] != 5 || reply[1] != wantRep || reply[3] != 1 {
 		t.Fatalf("UDP association reply: %v", reply)
+	}
+	if wantRep != 0 {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("rejected association did not stop")
+		}
+		select {
+		case <-remoteConn:
+			t.Fatal("rejected UDP source opened remote connection")
+		default:
+		}
+		return udpAssociationTest{control: control, done: done}
 	}
 	return udpAssociationTest{
 		control: control, remote: <-remoteConn, done: done,
@@ -178,7 +196,15 @@ func TestUDPAssociationRejectsForeignSourceAndInvalidFirstPacket(t *testing.T) {
 	for _, bad := range []struct {
 		conn   *net.UDPConn
 		packet []byte
-	}{{foreign, packet}, {malformed, []byte{0, 0, 1, 1}}, {malformed, oversized}} {
+	}{
+		{foreign, packet},
+		{malformed, []byte{0, 0, 1, 1}},
+		{malformed, oversized},
+		{malformed, socks5.BuildUDPDatagram(socks5.UDPDatagram{Host: "", Port: 53}, nil)},
+		{malformed, socks5.BuildUDPDatagram(socks5.UDPDatagram{Host: "bad\nhost", Port: 53}, nil)},
+		{malformed, socks5.BuildUDPDatagram(socks5.UDPDatagram{Host: "bad:host", Port: 53}, nil)},
+		{malformed, socks5.BuildUDPDatagram(socks5.UDPDatagram{Host: "example.test", Port: 0}, nil)},
+	} {
 		if _, err := bad.conn.WriteToUDP(bad.packet, session.relay); err != nil {
 			t.Fatal(err)
 		}

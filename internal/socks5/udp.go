@@ -35,6 +35,9 @@ func ParseUDPDatagram(packet []byte) (UDPDatagram, []byte, error) {
 			return UDPDatagram{}, nil, io.ErrUnexpectedEOF
 		}
 		host = string(packet[pos : pos+n])
+		if err := validateDomain(host); err != nil {
+			return UDPDatagram{}, nil, err
+		}
 		pos += n
 	case 0x04:
 		if len(packet) < pos+16+2 {
@@ -46,6 +49,9 @@ func ParseUDPDatagram(packet []byte) (UDPDatagram, []byte, error) {
 		return UDPDatagram{}, nil, errors.New("unsupported SOCKS5 UDP address type")
 	}
 	port := binary.BigEndian.Uint16(packet[pos : pos+2])
+	if port == 0 {
+		return UDPDatagram{}, nil, requestError(0x01, "invalid SOCKS5 target port")
+	}
 	pos += 2
 	return UDPDatagram{Host: host, Port: port}, packet[pos:], nil
 }

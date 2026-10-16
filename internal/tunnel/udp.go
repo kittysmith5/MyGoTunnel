@@ -115,6 +115,9 @@ func ReadDatagram(r io.Reader) ([]byte, error) {
 	}
 	packet := make([]byte, n)
 	if _, err := io.ReadFull(r, packet); err != nil {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
 		return nil, err
 	}
 	return packet, nil

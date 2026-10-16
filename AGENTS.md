@@ -50,7 +50,7 @@ SOCKS5 应用
 - SOCKS5 支持版本 5、可选 RFC 1929 用户名密码认证、TCP `CONNECT` 和 UDP `ASSOCIATE`，地址支持 IPv4、域名及 IPv6。UDP 来源必须匹配 TCP 对端 IP，先校验报文再绑定端口。
 - uTLS 客户端使用固定 `HelloChrome_133` 基线并适配 ALPN，客户端与服务端均协商 `http/1.1` ALPN。相关值属于连接兼容性的一部分。
 - 有导入指纹时，`InsecureSkipVerify` 仅用于替代公共 CA 验证，必须同时通过 `VerifyPeerCertificate` 校验固定证书指纹；没有指纹时使用系统 CA 和主机名验证。修改时同步说明证书信任、SNI 和部署迁移。
-- 预连接协议是 AUTH → OK → PREPARE → READY → CONNECT（或 UDP）→ OK；原有普通流程继续兼容。备用连接有独立数量/闲置限制，取用后不得回池；后台读取必须在交接前停止。
+- 旧预连接协议为AUTH → OK → PREPARE → READY → CONNECT（或UDP）→ OK；新连接可协商PREPARE ACK / READY ACK，命令后先ACK再原OK/ERR。只有本连接成功协商才启用ACK，旧流程不发送额外ACK。原有普通流程继续兼容。备用连接有独立数量/闲置限制，取用后不得回池；后台读取必须在交接前停止。
 - `-max-connections` 限制接受连接总数；备用等待时释放 setup permit，CONNECT 前必须重新申请。
 - `-max-setup` 限制正在建连的请求，成功进入转发前释放，失败返回也必须释放；不要让长连接占用建连额度。
 - 保留 `relay.CopyBidirectional` 的半关闭语义：正常 EOF 后等待反向数据排空；复制或半关闭失败时解除另一方向的阻塞，并在两个复制 goroutine 都退出后返回。修改转发退出策略时要考虑一侧 EOF、仍在返回的数据、阻塞 goroutine、字节统计和连接释放。
@@ -153,6 +153,7 @@ go build ./cmd/...
 - failed 必须包含 stage 与 close_reason/reason；常见系统错误完整链进入 DEBUG，未知错误在 WARN 保留诊断信息。只有真正正常 EOF 才作为 INFO closed，不能把所有 reset/timeout 静默吞掉。
 - 资源状态每 30 秒一条 stats，active 统计 accepted 总数，setup 统计 permit 占用，idle 统计备用，rejected 是准入拒绝累计；计数使用原子操作，Permit Release/TryAcquire 同步更新，监听流程退出时停止并等待定时器。不要用日志计数改变任何连接、认证、超时、重试或半关闭行为。
 - 修改日志需覆盖毫秒与时区、短字段、英文事件、双向字节、ID 关联、根失败方向、分组属性、并发写入、错误详略、资源计数与定时器停止，并同步 README 和本文件。
+- pool_ack_duration（text ack）为协商后命令发送至即时ACK的Duration，JSON纳秒/text毫秒；不含ACK后的目标等待，未协商为0，失败时保留已等待值。它属于control_duration子阶段，不能再与control相加。
 
 ## TLS 握手配置
 
@@ -272,3 +273,20 @@ UDP池化Packet为单所有者：Push成功转交所有权，失败仍由调用�
 进程终止原因计数udp_end_eof/timeout/reset/truncated/canceled/closed/error互斥，之和为udp_sessions_closed，只统计已经进入UDP转发的会话；不得把setup拒绝或次生错误重复计入。
 
 目标错误仅发送ERR白名单TIMEOUT/DNS/NETWORK/HOST/REFUSED/LIMIT/CANCELED/INTERNAL，不能传原始错误文本。新客户端兼容旧ERR，旧客户端非OK处理兼容新ERR；AUTH与PREPARE BUSY保持原响应。目标错误日志优先保留具体分类，SOCKS NETWORK=3，TIMEOUT/DNS/HOST=4，REFUSED=5，其余=1，不能把普通超时映射TTL expired=6。显式错误（含未知码的协议错误）不能触发备用传输回退。修改需覆盖普通/池命中、TCP/UDP的错误解析和SOCKS回复、新旧响应兼容。
+
+满256项目标表时先回收其他failed/idle项再拒绝新目标；targetSlots仍覆盖退出中的worker，不能因删除map就提前释放slot。长度头完整后的body读取/丢弃EOF均为ErrUnexpectedEOF，只有帧边界EOF正常；同时覆盖池化与旧ReadDatagram及实际日志统计。
+
+ASSOCIATE源域名在成功前有界解析一次（5秒，计入setup总预算），结果须包含TCPpeerIP；每包仍只匹配TCPpeer IP与约定源端口。源不匹配REP2，解析失败REP4；拒绝先于socket/远端拨号。TCP/UDP共享域名语义校验；UDP目标空域名、控制/空白字符、分隔符、port0在绑定源端口前拒绝，ASSOCIATE源port0及零UDP负载保持。
+
+NewPreparer按pool探测ACK，仅AUTH OK后的纯EOF/ERR可在新连接重试一次legacy，成功旧READY才缓存5分钟；AUTH/BUSY/timeout/cancel/畸形/截断响应不降级。ACK命令发送+读取共2秒，ACK后独立等待目标20秒+1秒回复，夹parent期限；ACK前OK或未知/过长/控制字符响应均协议失败不可回退。父deadline已到即使ctx.Err尚未发布也不可重试。前台总setup38秒，本地SOCKS回复另留5秒；UDP解析共享此总预算。旧未协商连接不施加ACK期限。
+
+目标OK/ERR（含重取setup拒绝、UDP成功）用SendTargetResult独立1秒写期限，不能继承已耗尽控制/旧idle写期限，发送失败要记录；成功进入转发前清除全部期限。客户端AUTH OK/ACK后重新起算目标等待，给回复留余量。ACK发送后服务端不等待客户端确认，认证、指纹、预读Reader、半关闭与转发不变量保留。
+
+## 发布与运维入口
+
+两端 `-version` 在读取配置前输出 buildinfo JSON；`-check-config` 只离线检查，
+`-health` 为显式有界探测。诊断不得输出原始解析错误（可能含凭据）。
+发布用 scripts/release.sh 从已提交 Git archive 构建，通过 ldflags 写入 version/commit/built。
+运维升级仅使用可信本地 bundle，校验 manifest、版本与运行文件，保留原配置和 unit；失败自动回滚。
+scripts/observe.py 被动采集最多72小时，指标为成功建连耗时分位数而非应用RTT；
+采集上限/异常须显式标记，不得把监测启动当作72小时稳定验证已完成。

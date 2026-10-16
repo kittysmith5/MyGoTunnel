@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"mygotunnel/internal/admission"
+	"mygotunnel/internal/buildinfo"
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/diagnostics"
 	"mygotunnel/internal/logging"
+	"mygotunnel/internal/operations"
 	"mygotunnel/internal/preconnect"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/socks5"
@@ -24,11 +26,15 @@ import (
 )
 
 const (
-	socks5Timeout     = 5 * time.Second
-	remoteDialTimeout = 15 * time.Second
+	socks5Timeout      = 5 * time.Second
+	remoteDialTimeout  = 15 * time.Second
+	remoteSetupTimeout = remoteDialTimeout + tunnel.ControlTimeout + tunnel.ControlReplyTimeout + tunnel.PreparedAckTimeout
 )
 
 func main() {
+	version := flag.Bool("version", false, "print build identity JSON and exit")
+	diagnose := flag.Bool("check-config", false, "validate configuration without starting service")
+	health := flag.Bool("health", false, "run bounded operational health check and exit")
 	configPath := flag.String("config", "configs/client.json", "config file path")
 	importCode := flag.Bool("import", false, "import connection code from stdin and exit")
 	poolMax := flag.Int("pool-max", 16, "maximum adaptive preconnections, size must not exceed this; 0 fixes pool at pool-size")
@@ -40,6 +46,15 @@ func main() {
 	metricsPath := flag.String("runtime-metrics", "", "optional exclusive private runtime JSONL output file")
 	shutdownTimeout := flag.Duration("shutdown-timeout", 15*time.Second, "maximum active connection drain time on shutdown")
 	flag.Parse()
+	if *version {
+		if buildinfo.Write(os.Stdout) != nil {
+			os.Exit(1)
+		}
+		return
+	}
+	if *diagnose || *health {
+		os.Exit(operations.Check("client", *configPath, *health))
+	}
 
 	logger, err := logging.New(os.Stderr, logging.Options{
 		Component: "client",
@@ -115,6 +130,8 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		poolLimit = 0
 	}
 	logger.Info("listening",
+		"version", buildinfo.Current().Version,
+		"commit", buildinfo.Current().Commit,
 		"listen_addr", cfg.LocalAddr,
 		"remote_addr", cfg.RemoteAddr,
 		"sni", cfg.SNI,
@@ -127,7 +144,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 
 	var pool *preconnect.Pool
 	if opts.poolSize > 0 {
-		pool, err = preconnect.New(preconnect.Options{Size: opts.poolSize, MaxSize: opts.poolMax}, func(ctx context.Context) (*preconnect.Entry, error) { return preconnect.Prepare(ctx, cfg) }, logger)
+		pool, err = preconnect.New(preconnect.Options{Size: opts.poolSize, MaxSize: opts.poolMax}, preconnect.NewPreparer(cfg), logger)
 		if err != nil {
 			return err
 		}
@@ -202,7 +219,7 @@ func handleClientWithResources(parent context.Context, clientConn net.Conn, cfg 
 	}
 
 	if request.Command == socks5.CommandUDPAssociate {
-		if err := clientConn.SetDeadline(time.Now().Add(remoteDialTimeout + tunnel.ControlTimeout + socks5Timeout)); err != nil {
+		if err := clientConn.SetDeadline(time.Now().Add(remoteSetupTimeout + socks5Timeout)); err != nil {
 			logging.Failure(connectionLogger, "socks", err)
 			return
 		}
@@ -215,16 +232,16 @@ func handleClientWithResources(parent context.Context, clientConn net.Conn, cfg 
 	requestLogger.Debug("connect")
 
 	// Bound the eventual SOCKS5 reply while remote setup runs.
-	if err := clientConn.SetDeadline(time.Now().Add(remoteDialTimeout + tunnel.ControlTimeout + socks5Timeout)); err != nil {
+	if err := clientConn.SetDeadline(time.Now().Add(remoteSetupTimeout + socks5Timeout)); err != nil {
 		logging.Failure(requestLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
 	socksDuration := time.Since(startedAt)
-	ctx, cancel := context.WithTimeout(parent, remoteDialTimeout+tunnel.ControlTimeout)
+	ctx, cancel := context.WithTimeout(parent, remoteSetupTimeout)
 	session, err := openRemote(ctx, cfg, targetAddr, pool)
 	cancel()
 	if err != nil {
-		logging.Failure(requestLogger, session.Stage, err, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "setup_duration", time.Since(startedAt))
+		logging.Failure(requestLogger, session.Stage, err, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "pool_ack_duration", session.AckDuration, "tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "setup_duration", time.Since(startedAt))
 		code := socks5.ReplyCode(err)
 		var typed *tunnel.TargetError
 		if !errors.As(err, &typed) && errors.Is(err, errTargetRejected) {
@@ -258,6 +275,7 @@ func handleClientWithResources(parent context.Context, clientConn net.Conn, cfg 
 		"pool_hit", session.PoolHit,
 		"pool_fallback", session.PoolFallback,
 		"pool_acquire_duration", session.PoolAcquireDuration,
+		"pool_ack_duration", session.AckDuration,
 		"setup_duration", time.Since(startedAt))
 	result := relay.CopyBidirectional(clientConn, clientConn, remoteConn, remoteReader)
 	logging.LogTunnelResult(requestLogger, result, startedAt)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mygotunnel/internal/config"
@@ -18,13 +19,53 @@ import (
 	"time"
 )
 
+type udpSourceLookup func(context.Context, string) ([]net.IPAddr, error)
+
+// A source domain is a declaration of the UDP sender, not a destination to
+// resolve for every packet. Authorize it once, then keep the TCP peer IP rule.
+func validateUDPAssociateSource(ctx context.Context, source string, peer net.IP, lookup udpSourceLookup) (byte, error) {
+	if source == "" {
+		return 0, nil
+	}
+	if ip := net.ParseIP(source); ip != nil {
+		if ip.IsUnspecified() || ip.Equal(peer) {
+			return 0, nil
+		}
+		return 0x02, errors.New("SOCKS5 UDP source does not match TCP peer")
+	}
+	addresses, err := lookup(ctx, source)
+	if err != nil {
+		return 0x04, fmt.Errorf("resolve SOCKS5 UDP source: %w", err)
+	}
+	for _, address := range addresses {
+		if address.IP.Equal(peer) {
+			return 0, nil
+		}
+	}
+	return 0x02, errors.New("SOCKS5 UDP source domain does not include TCP peer")
+}
+
 func handleUDPAssociate(parent context.Context, clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time, releaseSetup func(), pool *preconnect.Pool, limits ...*datagram.Resources) {
+	handleUDPAssociateWithResolver(parent, clientConn, request, cfg, logger, startedAt, releaseSetup, pool, net.DefaultResolver.LookupIPAddr, limits...)
+}
+
+func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time, releaseSetup func(), pool *preconnect.Pool, lookup udpSourceLookup, limits ...*datagram.Resources) {
 	const udpFrameQueueSize = 256
 	resources := datagram.SelectResources(limits)
 	tcpPeer, ok := clientConn.RemoteAddr().(*net.TCPAddr)
 	if !ok {
 		logger.Warn("SOCKS5 UDP control peer is not TCP")
 		_ = socks5.Reply(clientConn, 0x01)
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, remoteSetupTimeout)
+	defer cancel()
+	resolveCtx, resolveCancel := context.WithTimeout(ctx, socks5Timeout)
+	rep, err := validateUDPAssociateSource(resolveCtx, request.Address, tcpPeer.IP, lookup)
+	resolveCancel()
+	if err != nil {
+		logging.Failure(logger, "udp_source", err)
+		_ = socks5.Reply(clientConn, rep)
 		return
 	}
 	if !resources.AcquireSocket() {
@@ -53,7 +94,6 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 	defer scratch.Release()
 
 	socksDuration := time.Since(startedAt)
-	ctx, cancel := context.WithTimeout(parent, remoteDialTimeout+tunnel.ControlTimeout)
 	session, err := openRemoteUDP(ctx, cfg, pool)
 	cancel()
 	if err != nil {
@@ -87,6 +127,7 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 	logger.Info("ready", "transport", "udp", "remote_addr", cfg.RemoteAddr,
 		"socks_duration", socksDuration, "pool_hit", session.PoolHit,
 		"pool_fallback", session.PoolFallback, "pool_acquire_duration", session.PoolAcquireDuration,
+		"pool_ack_duration", session.AckDuration,
 		"tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration,
 		"control_duration", session.ControlDuration, "setup_duration", time.Since(startedAt))
 
@@ -221,8 +262,7 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 			continue
 		}
 		if !source.IP.Equal(tcpPeer.IP) ||
-			(request.Port != 0 && source.Port != int(request.Port)) ||
-			(request.Address != "" && request.Address != "0.0.0.0" && request.Address != "::" && source.IP.String() != request.Address) {
+			(request.Port != 0 && source.Port != int(request.Port)) {
 			dropped.Add(1)
 			continue
 		}

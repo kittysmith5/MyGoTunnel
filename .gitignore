@@ -1,3 +1,5 @@
 configs/*.json
 certs/*.pem
 configs/*.pem
+
+scripts/__pycache__/
