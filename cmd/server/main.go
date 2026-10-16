@@ -200,7 +200,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 
 	authStarted := time.Now()
 	peerKey := authlimit.PeerKey(tunnelConn.RemoteAddr())
-	if err := checkAuthTokens(tunnelConn, reader, cfg.ActiveAuthTokens(time.Now()), authLimiter, peerKey); err != nil {
+	if err := checkAuthTokenProvider(tunnelConn, reader, func() []string { return cfg.ActiveAuthTokens(time.Now()) }, authLimiter, peerKey); err != nil {
 		if errors.Is(err, authlimit.ErrLimited) {
 			connectionLogger.Debug("authentication rate limited")
 			return
@@ -373,7 +373,11 @@ func checkAuth(conn net.Conn, reader *bufio.Reader, expectedToken string) error 
 	return checkAuthTokens(conn, reader, []string{expectedToken}, nil, "")
 }
 
-func checkAuthTokens(conn net.Conn, reader *bufio.Reader, expectedTokens []string, limiter *authlimit.Limiter, peerKey string) (authErr error) {
+func checkAuthTokens(conn net.Conn, reader *bufio.Reader, expectedTokens []string, limiter *authlimit.Limiter, peerKey string) error {
+	return checkAuthTokenProvider(conn, reader, func() []string { return expectedTokens }, limiter, peerKey)
+}
+
+func checkAuthTokenProvider(conn net.Conn, reader *bufio.Reader, tokenProvider func() []string, limiter *authlimit.Limiter, peerKey string) (authErr error) {
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return fmt.Errorf("set authentication deadline: %w", err)
 	}
@@ -394,6 +398,7 @@ func checkAuthTokens(conn net.Conn, reader *bufio.Reader, expectedTokens []strin
 	if limiter != nil && !limiter.Allow(peerKey) {
 		return rejectAuth(conn, authlimit.ErrLimited)
 	}
+	expectedTokens := tokenProvider()
 
 	clientToken := strings.TrimSpace(strings.TrimPrefix(line, "AUTH "))
 

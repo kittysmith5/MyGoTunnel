@@ -507,3 +507,24 @@ func TestPreviousAuthTokenAndFailureLimit(t *testing.T) {
 		t.Fatalf("rate limit not applied: %v", err)
 	}
 }
+
+func TestPreviousAuthTokenExpiresAtAuthenticationTime(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	cfg := &config.ServerConfig{AuthToken: "new", PreviousAuthTokens: []config.PreviousToken{{Token: "old", ExpiresAt: time.Now().Add(time.Hour)}}}
+	now := time.Now()
+	done := make(chan error, 1)
+	go func() {
+		done <- checkAuthTokenProvider(server, bufio.NewReader(server), func() []string { return cfg.ActiveAuthTokens(now) }, nil, "")
+	}()
+	now = now.Add(2 * time.Hour)
+	_, _ = io.WriteString(client, "AUTH old\n")
+	reply, err := tunnel.ReadLine(bufio.NewReader(client))
+	if err != nil || reply != "ERR" {
+		t.Fatalf("reply=%q error=%v", reply, err)
+	}
+	if err := <-done; err == nil || err.Error() != "authentication token mismatch" {
+		t.Fatalf("expired token accepted: %v", err)
+	}
+}
