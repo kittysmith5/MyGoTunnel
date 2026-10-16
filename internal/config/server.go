@@ -4,14 +4,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 )
+
+type PreviousToken struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
 
 type ServerConfig struct {
 	UDPQueueConfig
-	ListenAddr string `json:"listen_addr"`
-	AuthToken  string `json:"auth_token"`
-	CertFile   string `json:"cert_file"`
-	KeyFile    string `json:"key_file"`
+	ListenAddr         string          `json:"listen_addr"`
+	AuthToken          string          `json:"auth_token"`
+	PreviousAuthTokens []PreviousToken `json:"previous_auth_tokens,omitempty"`
+	CertFile           string          `json:"cert_file"`
+	KeyFile            string          `json:"key_file"`
 }
 
 func LoadServerConfig(path string) (*ServerConfig, error) {
@@ -29,8 +37,16 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		cfg.ListenAddr = ":9001"
 	}
 
-	if cfg.AuthToken == "" {
-		return nil, fmt.Errorf("auth_token is empty")
+	if !validToken(cfg.AuthToken) {
+		return nil, fmt.Errorf("auth_token is invalid")
+	}
+	if len(cfg.PreviousAuthTokens) > 1 {
+		return nil, fmt.Errorf("at most one previous auth token is supported")
+	}
+	for _, p := range cfg.PreviousAuthTokens {
+		if !validToken(p.Token) || p.Token == cfg.AuthToken || p.ExpiresAt.IsZero() {
+			return nil, fmt.Errorf("invalid previous_auth_tokens entry")
+		}
 	}
 
 	if cfg.CertFile == "" {
@@ -45,4 +61,25 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	}
 
 	return &cfg, nil
+}
+
+func validToken(token string) bool {
+	if token == "" || len(token) > 4089 || strings.TrimSpace(token) != token {
+		return false
+	}
+	for _, r := range token {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+func (c *ServerConfig) ActiveAuthTokens(now time.Time) []string {
+	out := []string{c.AuthToken}
+	for _, p := range c.PreviousAuthTokens {
+		if now.Before(p.ExpiresAt) {
+			out = append(out, p.Token)
+		}
+	}
+	return out
 }

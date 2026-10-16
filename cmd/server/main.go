@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"mygotunnel/internal/admission"
+	"mygotunnel/internal/authlimit"
 	"mygotunnel/internal/buildinfo"
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/datagram"
@@ -128,6 +130,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		return fmt.Errorf("load config: %w", err)
 	}
 	resources := datagram.NewResources(cfg.ProcessLimits())
+	authLimiter := authlimit.New(4096, 5, time.Minute, time.Minute)
 	defer resources.Close()
 
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
@@ -157,11 +160,11 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	idleSlots := make(chan struct{}, opts.maxIdle)
 	metrics := &admission.Counters{}
 	stopStats := logging.StartStats(logger, 30*time.Second, func() []any {
-		return append([]any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", len(idleSlots), "max_idle", opts.maxIdle, "rejected", metrics.Rejected.Load()}, logging.UDPResourceAttrs(resources)...)
+		return append([]any{"auth_rate_limited", authLimiter.Limited(), "active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", len(idleSlots), "max_idle", opts.maxIdle, "rejected", metrics.Rejected.Load()}, logging.UDPResourceAttrs(resources)...)
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleTunnelContext(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire}, resources)
+		handleTunnelContextWithLimiter(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire}, authLimiter, resources)
 	}, nil, metrics)
 }
 
@@ -179,6 +182,10 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 }
 
 func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, releaseSetup func(), poolOptions *serverPoolOptions, resources ...*datagram.Resources) {
+	handleTunnelContextWithLimiter(parent, tunnelConn, cfg, logger, releaseSetup, poolOptions, nil, resources...)
+}
+
+func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, releaseSetup func(), poolOptions *serverPoolOptions, authLimiter *authlimit.Limiter, resources ...*datagram.Resources) {
 	defer tunnelConn.Close()
 
 	remoteAddr := tunnelConn.RemoteAddr().String()
@@ -192,7 +199,12 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 	reader := bufio.NewReader(tunnelConn)
 
 	authStarted := time.Now()
-	if err := checkAuth(tunnelConn, reader, cfg.AuthToken); err != nil {
+	peerKey := authlimit.PeerKey(tunnelConn.RemoteAddr())
+	if err := checkAuthTokens(tunnelConn, reader, cfg.ActiveAuthTokens(time.Now()), authLimiter, peerKey); err != nil {
+		if errors.Is(err, authlimit.ErrLimited) {
+			connectionLogger.Debug("authentication rate limited")
+			return
+		}
 		logging.Failure(connectionLogger, "auth", err, "auth_duration", time.Since(authStarted), "setup_duration", time.Since(startedAt))
 		return
 	}
@@ -357,7 +369,11 @@ func acknowledgePrepared(conn net.Conn, controlDeadline time.Time) error {
 	return conn.SetWriteDeadline(controlDeadline)
 }
 
-func checkAuth(conn net.Conn, reader *bufio.Reader, expectedToken string) (authErr error) {
+func checkAuth(conn net.Conn, reader *bufio.Reader, expectedToken string) error {
+	return checkAuthTokens(conn, reader, []string{expectedToken}, nil, "")
+}
+
+func checkAuthTokens(conn net.Conn, reader *bufio.Reader, expectedTokens []string, limiter *authlimit.Limiter, peerKey string) (authErr error) {
 	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		return fmt.Errorf("set authentication deadline: %w", err)
 	}
@@ -375,11 +391,26 @@ func checkAuth(conn net.Conn, reader *bufio.Reader, expectedToken string) (authE
 	if !strings.HasPrefix(line, "AUTH ") {
 		return rejectAuth(conn, errors.New("invalid authentication command"))
 	}
+	if limiter != nil && !limiter.Allow(peerKey) {
+		return rejectAuth(conn, authlimit.ErrLimited)
+	}
 
 	clientToken := strings.TrimSpace(strings.TrimPrefix(line, "AUTH "))
 
-	if subtle.ConstantTimeCompare([]byte(clientToken), []byte(expectedToken)) != 1 {
+	matched := 0
+	actual := sha256.Sum256([]byte(clientToken))
+	for _, token := range expectedTokens {
+		expected := sha256.Sum256([]byte(token))
+		matched |= subtle.ConstantTimeCompare(actual[:], expected[:])
+	}
+	if matched != 1 {
+		if limiter != nil {
+			limiter.Failure(peerKey)
+		}
 		return rejectAuth(conn, errors.New("authentication token mismatch"))
+	}
+	if limiter != nil {
+		limiter.Success(peerKey)
 	}
 
 	if err := tunnel.SendOK(conn); err != nil {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"mygotunnel/internal/admission"
+	"mygotunnel/internal/authlimit"
 	"mygotunnel/internal/buildinfo"
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/datagram"
@@ -114,6 +115,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		return fmt.Errorf("load config: %w", err)
 	}
 	resources := datagram.NewResources(cfg.ProcessLimits())
+	authLimiter := authlimit.New(4096, 5, time.Minute, time.Minute)
 	defer resources.Close()
 
 	ln, err := net.Listen("tcp", cfg.LocalAddr)
@@ -160,11 +162,11 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 			ps = pool.Stats()
 			idle = ps.Idle
 		}
-		return append([]any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", ps.Max, "rejected", metrics.Rejected.Load(), "pool_hits", ps.Hits, "pool_misses", ps.Misses, "pool_fallbacks", ps.Fallbacks, "pool_hit_rate", ps.HitRate, "pool_target", ps.Target, "pool_filling", ps.Filling, "pool_renewed", ps.Renewed, "pool_retry", ps.Retry}, logging.UDPResourceAttrs(resources)...)
+		return append([]any{"auth_rate_limited", authLimiter.Limited(), "active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", ps.Max, "rejected", metrics.Rejected.Load(), "pool_hits", ps.Hits, "pool_misses", ps.Misses, "pool_fallbacks", ps.Fallbacks, "pool_hit_rate", ps.HitRate, "pool_target", ps.Target, "pool_filling", ps.Filling, "pool_renewed", ps.Renewed, "pool_retry", ps.Retry}, logging.UDPResourceAttrs(resources)...)
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleClientWithResources(ctx, conn, cfg, logger, permit.Release, pool, resources)
+		handleClientWithResourcesAndAuthLimiter(ctx, conn, cfg, logger, permit.Release, pool, resources, authLimiter)
 	}, nil, metrics)
 }
 
@@ -181,6 +183,10 @@ func handleClientContext(parent context.Context, clientConn net.Conn, cfg *confi
 }
 
 func handleClientWithResources(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pool *preconnect.Pool, resources *datagram.Resources) {
+	handleClientWithResourcesAndAuthLimiter(parent, clientConn, cfg, logger, releaseSetup, pool, resources, nil)
+}
+
+func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pool *preconnect.Pool, resources *datagram.Resources, authLimiter *authlimit.Limiter) {
 	defer clientConn.Close()
 
 	clientAddr := clientConn.RemoteAddr().String()
@@ -195,11 +201,13 @@ func handleClientWithResources(parent context.Context, clientConn net.Conn, cfg 
 		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
-	var socksAuth *socks5.Credentials
-	if username, password, enabled := cfg.SOCKSCredentials(); enabled {
-		socksAuth = &socks5.Credentials{Username: username, Password: password}
+	var socksCredentials []*socks5.Credentials
+	if credentials, enabled := cfg.SOCKSCredentialSet(time.Now()); enabled {
+		for _, c := range credentials {
+			socksCredentials = append(socksCredentials, &socks5.Credentials{Username: c.Username, Password: c.Password})
+		}
 	}
-	handshakeTimings, err := socks5.HandshakeWithAuthTimings(clientConn, socksAuth)
+	handshakeTimings, err := socks5.HandshakeWithCredentialSet(clientConn, socksCredentials, authLimiter)
 	connectionLogger = connectionLogger.With(
 		"socks_first_byte_duration", handshakeTimings.FirstByte,
 		"socks_method_duration", handshakeTimings.Method,

@@ -1,7 +1,9 @@
 package socks5
 
 import (
+	"errors"
 	"io"
+	"mygotunnel/internal/authlimit"
 	"net"
 	"testing"
 	"time"
@@ -80,5 +82,45 @@ func TestAuthTruncated(t *testing.T) {
 	b.Close()
 	if <-done == nil {
 		t.Fatal("truncated accepted")
+	}
+}
+
+func TestCredentialRotationAndRateLimit(t *testing.T) {
+	limiter := authlimit.New(8, 2, time.Minute, time.Minute)
+	creds := []*Credentials{{Username: "new", Password: "newpass"}, {Username: "old", Password: "oldpass"}}
+	do := func(user, pass string) error {
+		server, client := net.Pipe()
+		defer server.Close()
+		defer client.Close()
+		done := make(chan error, 1)
+		go func() { _, err := HandshakeWithCredentialSet(server, creds, limiter); done <- err }()
+		_, _ = client.Write([]byte{5, 1, 2})
+		method := make([]byte, 2)
+		if _, err := io.ReadFull(client, method); err != nil {
+			return err
+		}
+		u, p := []byte(user), []byte(pass)
+		payload := []byte{1, byte(len(u))}
+		payload = append(payload, u...)
+		payload = append(payload, byte(len(p)))
+		payload = append(payload, p...)
+		_, _ = client.Write(payload)
+		result := make([]byte, 2)
+		if _, err := io.ReadFull(client, result); err != nil {
+			return err
+		}
+		return <-done
+	}
+	if err := do("old", "oldpass"); err != nil {
+		t.Fatalf("previous credential rejected: %v", err)
+	}
+	if err := do("bad", "badpass"); !errors.Is(err, ErrAuthRejected) {
+		t.Fatalf("first bad auth: %v", err)
+	}
+	if err := do("bad", "badpass"); !errors.Is(err, ErrAuthRejected) {
+		t.Fatalf("threshold auth: %v", err)
+	}
+	if err := do("new", "newpass"); !errors.Is(err, ErrAuthLimited) {
+		t.Fatalf("rate limit not applied: %v", err)
 	}
 }

@@ -290,3 +290,8 @@ NewPreparer按pool探测ACK，仅AUTH OK后的纯EOF/ERR可在新连接重试一
 运维升级仅使用可信本地 bundle，校验 manifest、版本与运行文件，保留原配置和 unit；失败自动回滚。
 scripts/observe.py 被动采集最多72小时，指标为成功建连耗时分位数而非应用RTT；
 采集上限/异常须显式标记，不得把监测启动当作72小时稳定验证已完成。
+
+
+## 认证限速与发布签名
+
+认证错误按peer IP有界计数；只计真实凭据不匹配，不把超时/截断算密码错误。锁表上限必须明确采用fail-closed策略，日志不可包含凭据。凭据过渡最多保留一个到期时间明确的旧项，constant-time比较，过期后新建会话不得授权；不要改动旧AUTH wire format。发布bundle由Ed25519签名，升级先验证root本地信任公钥、签名、平台和哈希，再停服务；不信任bundle自带公钥。

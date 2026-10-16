@@ -18,6 +18,7 @@ import (
 
 	"io"
 	"mygotunnel/internal/admission"
+	"mygotunnel/internal/authlimit"
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/preconnect"
 	"mygotunnel/internal/tunnel"
@@ -475,5 +476,34 @@ func TestServerTLSConfig(t *testing.T) {
 		default:
 			t.Fatalf("non-AEAD/ECDHE suite: %x", id)
 		}
+	}
+}
+
+func TestPreviousAuthTokenAndFailureLimit(t *testing.T) {
+	limiter := authlimit.New(16, 2, time.Minute, time.Minute)
+	tokens := []string{"new-token", "old-token"}
+	authenticate := func(token string) error {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		done := make(chan error, 1)
+		go func() { done <- checkAuthTokens(server, bufio.NewReader(server), tokens, limiter, "peer") }()
+		_, _ = io.WriteString(client, "AUTH "+token+"\n")
+		_, err := tunnel.ReadLine(bufio.NewReader(client))
+		if err != nil {
+			return err
+		}
+		return <-done
+	}
+	if err := authenticate("old-token"); err != nil {
+		t.Fatalf("previous token rejected: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := authenticate("bad"); err == nil || err.Error() != "authentication token mismatch" {
+			t.Fatalf("bad token: %v", err)
+		}
+	}
+	if err := authenticate("new-token"); !errors.Is(err, authlimit.ErrLimited) {
+		t.Fatalf("rate limit not applied: %v", err)
 	}
 }

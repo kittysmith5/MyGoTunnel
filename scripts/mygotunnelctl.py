@@ -2,8 +2,9 @@
 """Local root-only atomic upgrades. Bundles must come from a trusted source.
 Hashes detect transfer corruption; they do not authenticate the publisher.
 """
-import argparse,fcntl,hashlib,json,os,pathlib,platform,shutil,socket,subprocess,tempfile,time
+import argparse,base64,fcntl,hashlib,json,os,pathlib,platform,shutil,socket,subprocess,tempfile,time
 
+TRUSTED_KEYS=pathlib.Path("/etc/mygotunnel/release-keys")
 ROOT=pathlib.Path('/var/lib/mygotunnel/releases')
 def run(*args):
  return subprocess.check_output(args,text=True,stderr=subprocess.DEVNULL,timeout=45).strip()
@@ -17,6 +18,23 @@ def atomic(src,dst):
   os.chmod(tmp,0o755); os.replace(tmp,dst)
  finally:
   if os.path.exists(tmp): os.unlink(tmp)
+def verify_manifest(manifest,key_path=None):
+ if not isinstance(manifest,dict) or not all(k in manifest for k in ('version','commit','built','key_id','files','signature')): raise RuntimeError('invalid signed manifest')
+ signed={k:manifest[k] for k in ('version','commit','built','key_id','files')}
+ with tempfile.TemporaryDirectory() as d:
+  d=pathlib.Path(d); pub=d/'pub.der'; payload=d/'payload'; sig=d/'signature'
+  candidates=[pathlib.Path(key_path)] if key_path else sorted(TRUSTED_KEYS.glob('*.pub.pem'))
+  trusted=None
+  for candidate in candidates:
+   result=subprocess.run(['openssl','pkey','-pubin','-in',str(candidate),'-outform','DER','-out',str(pub)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   if result.returncode==0 and hashlib.sha256(pub.read_bytes()[-32:]).hexdigest()[:16]==manifest['key_id']:
+    trusted=candidate;break
+  if trusted is None: raise RuntimeError('untrusted signing key')
+  payload.write_bytes(json.dumps(signed,sort_keys=True,separators=(',',':')).encode())
+  signature=base64.b64decode(manifest['signature'],validate=True); sig.write_bytes(signature)
+  subprocess.run(['openssl','pkeyutl','-verify','-pubin','-inkey',str(trusted),'-rawin','-in',str(payload),'-sigfile',str(sig)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+ return signed
+
 def identity(binary):
  try: return json.loads(run(str(binary),'-version'))
  except subprocess.CalledProcessError: return dict(version='legacy',commit='unknown')
@@ -52,12 +70,14 @@ def main():
   if a.action=='upgrade':
    if not a.bundle: p.error('--bundle is required for upgrade')
    bundle=a.bundle.resolve(); manifest=json.loads((bundle/'manifest.json').read_text())
+   signed=verify_manifest(manifest)
    arch={'aarch64':'arm64','x86_64':'amd64'}.get(platform.machine())
    if arch is None: p.error('unsupported architecture')
    name=a.role+'-linux-'+arch; candidate=bundle/name
-   if digest(candidate)!=manifest['files'][name]: raise RuntimeError('bundle checksum mismatch')
+   if digest(bundle/'release-ed25519.pub.pem')!=signed['files']['release-ed25519.pub.pem']: raise RuntimeError('bundle public key checksum mismatch')
+   if digest(candidate)!=signed['files'][name]: raise RuntimeError('bundle checksum mismatch')
    candidate_info=json.loads(run(str(candidate),'-version'))
-   if candidate_info['commit']!=manifest['commit'] or candidate_info['version']!=manifest['version']: raise RuntimeError('build identity mismatch')
+   if candidate_info['commit']!=signed['commit'] or candidate_info['version']!=signed['version']: raise RuntimeError('build identity mismatch')
   else:
    old=json.loads(state.read_text()); candidate=pathlib.Path(old['previous'])
    if digest(candidate)!=old['sha256']: raise RuntimeError('rollback checksum mismatch')

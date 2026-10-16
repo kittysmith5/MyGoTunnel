@@ -354,3 +354,22 @@ systemd 服务，保留配置、凭据与启动参数。升级校验哈希、版
 
 回滚到尚无运维标志的历史版本时，版本显示为 legacy/unknown，健康门禁降为服务状态、
 本地监听与运行文件哈希检查；原配置始终保留。新版本间回滚使用完整健康门禁。
+
+### 认证失败保护、凭据过渡与签名升级
+
+客户端和服务端对 RFC 1929 密码或隧道 token 的**实际不匹配**计数；超时、断包和畸形握手分开记录，
+不消耗错误密码额度。每个来源 IP 默认 60 秒内允许 5 次错误，第 5 次后封 60 秒；成功认证清除该来源记录。
+记录最多 4096 项，到上限时先清理过期项，仍满则暂时拒绝未记录的新来源，避免攻击者用大量源地址耗尽内存。
+这会影响同一公网出口共享 IP 的用户，因此生产应观察 `auth_rate_limited` 和认证失败日志；当前限制按 IP，不能区分同一 NAT 后的用户。
+TLS 握手在 AUTH 前完成，来源限速无法避免所有握手 CPU 消耗，仍由连接/并发上限控制资源。
+
+隧道 token 轮换时，先在服务端把新值设为 `auth_token`，把旧值放入限时过渡列表，再更新客户端并重启客户端；确认客户端不再用旧值后删除列表项。最多允许一个旧 token：
+
+```json
+{"auth_token":"NEW_TOKEN","previous_auth_tokens":[{"token":"OLD_TOKEN","expires_at":"2026-11-01T00:00:00Z"}]}
+```
+
+时间必须是 RFC3339；过期项自动停止授权。新客户端 SOCKS 凭据在 `socks_auth`，可把一个带 `expires_at` 的旧账号放进 `previous_socks_auth`，方便应用逐步切换。旧格式 `socks_username` / `socks_password` 仍可用。
+两端当前通过受控 systemd 重启加载配置；服务端配置先接受新旧 token，重启客户端切换后再撤旧 token。SOCKS 旧凭据只在过渡期有效。配置权限设为 0600，凭据不写日志。
+
+版本包清单由 Ed25519 私钥签名，升级器从 `/etc/mygotunnel/release-keys/<key-id>.pub.pem` 的 root 管理信任目录选择公钥，并在停服务前验证签名、平台二进制哈希、构建版本和提交。发布私钥用 `scripts/generate-release-key.sh` 生成，离线保存；`scripts/release.sh VERSION OUTPUT PRIVATE_KEY.pem` 要求私钥 mode 0600，生成已签名 bundle。公钥需经可信渠道预装到两台机器的 root 信任目录；不能从待验证 bundle 自动建立信任。加入新公钥后先用新钥发布并验证，再移除旧公钥。签名只验证发布者和文件完整性，不替代 root 权限保护、配置权限或回滚备份保护。

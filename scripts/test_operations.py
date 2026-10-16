@@ -38,3 +38,23 @@ class ObservationIntegrationTest(unittest.TestCase):
    self.assertEqual(summary['ready'],1); self.assertEqual(summary['setup_failed'],1)
    self.assertEqual(summary['relay_failed'],1); self.assertEqual(summary['p99_setup_ms'],149)
    self.assertEqual(summary['resources']['active'],11); self.assertTrue(summary['complete'])
+
+class SignatureTest(unittest.TestCase):
+ def test_signature_authenticates_manifest_and_rejects_tampering(self):
+  import base64,hashlib,json,pathlib,subprocess,tempfile
+  m=load('mygotunnelctl')
+  with tempfile.TemporaryDirectory() as d:
+   d=pathlib.Path(d);key=d/'key.pem';pub=d/'pub.pem';der=d/'pub.der';payload=d/'payload';sig=d/'signature'
+   subprocess.run(['openssl','genpkey','-algorithm','ED25519','-out',str(key)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   subprocess.run(['openssl','pkey','-in',str(key),'-pubout','-out',str(pub)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   subprocess.run(['openssl','pkey','-pubin','-in',str(pub),'-outform','DER','-out',str(der)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   signed=dict(version='v-test',commit='abc',built='now',key_id=hashlib.sha256(der.read_bytes()[-32:]).hexdigest()[:16],files={'client':'a'*64})
+   payload.write_bytes(json.dumps(signed,sort_keys=True,separators=(',',':')).encode())
+   subprocess.run(['openssl','pkeyutl','-sign','-inkey',str(key),'-rawin','-in',str(payload),'-out',str(sig)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   manifest=dict(signed,signature=base64.b64encode(sig.read_bytes()).decode())
+   self.assertEqual(m.verify_manifest(manifest,pub)['commit'],'abc')
+   manifest['files']['client']='b'*64
+   with self.assertRaises(Exception):m.verify_manifest(manifest,pub)
+   manifest=dict(signed,signature=base64.b64encode(sig.read_bytes()).decode());wrong=d/'wrong.pem'
+   subprocess.run(['openssl','genpkey','-algorithm','ED25519','-out',str(wrong)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   with self.assertRaises(Exception):m.verify_manifest(manifest,wrong)
