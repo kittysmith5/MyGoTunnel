@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"time"
 )
 
 type Credentials struct{ Username, Password string }
@@ -13,25 +14,48 @@ type Credentials struct{ Username, Password string }
 func Handshake(conn net.Conn) error { return HandshakeWithAuth(conn, nil) }
 
 func HandshakeWithAuth(conn net.Conn, auth *Credentials) error {
+	_, err := HandshakeWithAuthTimings(conn, auth)
+	return err
+}
+
+// HandshakeTimings includes peer/network waiting as well as local processing.
+// FirstByte ends at the first greeting byte; Method covers the rest of method
+// negotiation and its reply; Auth covers RFC 1929, or is zero when disabled.
+type HandshakeTimings struct {
+	FirstByte, Method, Auth time.Duration
+}
+
+func HandshakeWithAuthTimings(conn net.Conn, auth *Credentials) (timings HandshakeTimings, err error) {
 	if auth != nil && (len(auth.Username) < 1 || len(auth.Username) > 255 || len(auth.Password) < 1 || len(auth.Password) > 255) {
-		return errors.New("invalid SOCKS5 authentication configuration")
+		return timings, errors.New("invalid SOCKS5 authentication configuration")
 	}
 	header := make([]byte, 2)
-
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return err
+	started := time.Now()
+	_, err = io.ReadFull(conn, header[:1])
+	timings.FirstByte = time.Since(started)
+	if err != nil {
+		return timings, err
+	}
+	methodStarted := time.Now()
+	defer func() {
+		if timings.Method == 0 {
+			timings.Method = time.Since(methodStarted)
+		}
+	}()
+	if _, err := io.ReadFull(conn, header[1:]); err != nil {
+		return timings, err
 	}
 
 	ver := header[0]
 	nMethods := int(header[1])
 
 	if ver != 0x05 {
-		return errors.New("not SOCKS5")
+		return timings, errors.New("not SOCKS5")
 	}
 
 	methods := make([]byte, nMethods)
 	if _, err := io.ReadFull(conn, methods); err != nil {
-		return err
+		return timings, err
 	}
 
 	wanted := byte(0)
@@ -42,18 +66,22 @@ func HandshakeWithAuth(conn net.Conn, auth *Credentials) error {
 		if method == wanted {
 			_, err := conn.Write([]byte{0x05, wanted})
 			if err != nil {
-				return err
+				return timings, err
 			}
+			timings.Method = time.Since(methodStarted)
 			if auth != nil {
-				return authenticate(conn, auth)
+				authStarted := time.Now()
+				err := authenticate(conn, auth)
+				timings.Auth = time.Since(authStarted)
+				return timings, err
 			}
-			return nil
+			return timings, nil
 		}
 	}
 	if _, err := conn.Write([]byte{0x05, 0xff}); err != nil {
-		return err
+		return timings, err
 	}
-	return errors.New("no supported SOCKS5 authentication method")
+	return timings, errors.New("no supported SOCKS5 authentication method")
 }
 
 // RFC 1929 authentication is bounded by the caller's SOCKS setup deadline.

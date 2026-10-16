@@ -47,9 +47,22 @@ SOCKS5 同时支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 经现有 TLS/TCP 隧道
 
 UDP 来源 IP 必须与 SOCKS TCP 对端相同。请求中非零源端口会被约束；否则第一个合法报文绑定端口。畸形报文、其他来源、分片报文与含 SOCKS 头超过 65000 字节的报文被丢弃。客户端 legacy socks_username/socks_password 仍可读取，嵌套 socks_auth 优先；认证禁止免认证降级。
 
-出错目标 socket 下次发包重建，空闲 2 分钟后回收（15 秒扫描），每会话最多 256 个目标。客户端出站/入站队列为 256/128，服务端双向各 256，满时丢包。每批最多刷新 32 个已排队帧，不额外等待。目标拨号与写入各受 5 秒期限约束，断开隧道取消目标解析/拨号并等待所有 worker。进程取消后，已建立会话继续到 grace 结束或正常断开；不会在进程取消瞬间无条件中断所有 UDP。
+出错目标 socket 下次发包重建，空闲 2 分钟后回收（15 秒扫描），每会话最多 256 个目标 worker，退出中的 worker 也占名额。各目标独立解析和发送，慢目标不会阻塞其他目标的分发；域名初始化并发最多 16，数字 IP 不占 DNS 名额。同一目标初始化期间复用待发送队列，保持该目标的发送顺序。目标拨号（包括等待 DNS 名额）与写入各受 5 秒期限约束，断开隧道取消解析、关闭目标 socket 并等待所有 worker。进程取消后，已建立会话继续到 grace 结束或正常断开；不会在进程取消瞬间无条件中断所有 UDP。
 
-会话日志保留 connection_id、transport=udp、资源与建连信息。client upload_datagrams 表示入隧道队列，download_datagrams 表示成功写入本地 UDP，udp_write_errors 记录写入失败，dropped_datagrams 包括来源、报文、队列和写入失败。server download_datagrams 为进入响应队列数量。UDP write 成功不保证应用收到；TCP 丢包重传仍会延迟后续数据报，不宣称原生 UDP 延迟特性。
+客户端出站/入站队列为 256/128 包，服务端收发各 256 包；每队列默认还限制 1 MiB 数据，入队和出队都会丢弃等待满 250 ms 的旧报文，再按容量决定是否接收新包。服务端每目标待发送队列最多 32 包、64 KiB UDP 负载，所有目标待发送队列另共享 1 MiB 负载预算，不能随目标数量无限扩张。目标初始化等待计入队列年龄，转入目标队列不会重置年龄。每批最多刷新 32 个已排队帧，不等待凑批。缓冲写入直接复用 bufio 帧头空间，不再为每个包复制整帧；客户端本地入队、服务端响应入队在容量不足时不复制负载。
+
+客户端、服务端 JSON 均可独立设置以下本地策略，不进入连接码；缺省或 0 使用默认值。旧配置无需修改：
+
+```json
+{
+  "udp_queue_max_bytes": 1048576,
+  "udp_queue_max_age_ms": 250
+}
+```
+
+`udp_queue_max_bytes` 范围 65000～67108864，同时控制各方向队列与服务端共享目标预算；目标单队列仍受 64 KiB 限制。`udp_queue_max_age_ms` 范围 1～60000，可根据业务容忍度调高。年龄只在应用入队/出队时检查，不是网络 RTT 或送达期限，不能清除 TLS/TCP/内核已接收的积压；慢 DNS 期间超过年龄的待发送包同样会丢弃。队列和 worker 元数据、帧头、读缓冲及在途包不计入负载预算，不能把 1 MiB 当作整个关联的内存上限。
+
+会话日志保留 connection_id、transport=udp、资源与建连信息。client upload_datagrams 表示入隧道队列，download_datagrams 表示成功写入本地 UDP，udp_write_errors 记录写入失败，dropped_datagrams 包括来源、报文、队列和写入失败。server download_datagrams 为进入响应队列数量，upload_datagrams 为成功向目标写入数量。新增 queue_full_drops、queue_expired_drops 分别记录容量拒绝与年龄丢弃；request_queue_peak_bytes、response_queue_peak_bytes 记录收发队列数据峰值，server target_queue_peak_bytes 为单目标待发送队列负载峰值。client dropped_datagrams 包含年龄丢弃；server dropped_requests/dropped_responses 记录相应路径上的直接拒绝；queue_* 是队列维度统计，可与这些计数重叠，不能直接相加。统计在会话结束后输出。UDP write 成功不保证应用收到；TCP 丢包重传仍会延迟后续数据报，不宣称原生 UDP 延迟特性。
 
 ## 日志
 
@@ -73,7 +86,11 @@ UDP 来源 IP 必须与 SOCKS TCP 对端相同。请求中非零源端口会被�
 
 | 文本短名 | JSON 字段 | 含义 |
 |---|---|---|
-| socks | socks_duration | 客户端本地 SOCKS5 阶段 |
+| socks | socks_duration | 客户端本地 SOCKS5 阶段，含前端交互等待 |
+| sfirst | socks_first_byte_duration | 从进入握手到收到首个 greeting 字节 |
+| smethod | socks_method_duration | 首字节后读取方法列表、选择方法并返回响应 |
+| sauth | socks_auth_duration | RFC 1929 凭据读取、验证及响应，未启用为 0 |
+| sreq | socks_request_duration | 读取并解析 CONNECT/UDP ASSOCIATE 请求 |
 | tcp | tcp_duration | 连接服务端，包含域名解析 |
 | tls | tls_duration | 客户端 TLS 握手 |
 | take | pool_acquire_duration | 取用备用连接 |
@@ -84,6 +101,8 @@ UDP 来源 IP 必须与 SOCKS TCP 对端相同。请求中非零源端口会被�
 | reply | reply_duration | 服务端成功响应及清理控制期限 |
 | idle | idle_duration | 服务端已认证备用连接的等待时间，单独列出 |
 | total | setup_duration | 客户端前台总建连时间；服务端建连活动时间，排除 idle，仍包含先前的 auth |
+
+SOCKS 子阶段均包含对端/网络等待，不能当作纯计算耗时；与总 socks 字段的边界有少量本地流程差异。失败时保留已尝试阶段的耗时，未进入的握手子阶段为 0，尚未读取请求则没有 sreq；不会输出用户名、密码或认证报文。TCP 和 UDP 共用这些计时字段，JSON 为整数纳秒。
 
 `pool=hit/miss/fallback` 表示备用命中、普通建连或备用传输失败后普通回退。命中时文本省略已在后台完成的 tcp/tls 字段，JSON 仍保留零值；不是说这些阶段没有 CPU 或网络成本。不同阶段的中位数不能相加当作总耗时中位数，客户端与服务端的 total 也不能直接相加。
 

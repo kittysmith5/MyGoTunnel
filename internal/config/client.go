@@ -12,6 +12,7 @@ type SOCKSAuth struct {
 }
 
 type ClientConfig struct {
+	UDPQueueConfig
 	SocksUsername          string     `json:"socks_username,omitempty"`
 	SocksPassword          string     `json:"socks_password,omitempty"`
 	SOCKSAuth              *SOCKSAuth `json:"socks_auth,omitempty"`
@@ -54,6 +55,9 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		}
 	}
 	if err := validateClient(&cfg); err != nil {
+		return nil, err
+	}
+	if err := cfg.UDPQueueConfig.validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+
+	"mygotunnel/internal/datagram"
 )
 
 const MaxDatagramSize = 65000
@@ -24,11 +26,42 @@ func WriteDatagram(w io.Writer, packet []byte) error {
 	if len(packet) == 0 || len(packet) > MaxDatagramSize {
 		return fmt.Errorf("invalid UDP datagram size %d", len(packet))
 	}
+	if buffered, ok := w.(*bufio.Writer); ok && buffered.Size() >= 2 {
+		// Reuse the existing buffer, including for the length prefix. The caller
+		// retains control of batching/Flush; no temporary whole-frame copy.
+		if buffered.Available() < 2 {
+			if err := buffered.Flush(); err != nil {
+				return err
+			}
+		}
+		header := buffered.AvailableBuffer()[:2]
+		binary.BigEndian.PutUint16(header, uint16(len(packet)))
+		if _, err := buffered.Write(header); err != nil {
+			return err
+		}
+		_, err := buffered.Write(packet)
+		return err
+	}
 	// Keep the length and payload in one write so TLS can use a single record.
 	frame := make([]byte, 2+len(packet))
 	binary.BigEndian.PutUint16(frame[:2], uint16(len(packet)))
 	copy(frame[2:], packet)
 	return writeFull(w, frame)
+}
+
+// WriteDatagramQueue drops expired packets at dequeue and flushes at most 32
+// fresh packets without waiting to fill a batch.
+func WriteDatagramQueue(w *bufio.Writer, queue *datagram.Queue) error {
+	for i := 0; i < 32; i++ {
+		packet, ok := queue.TryPop()
+		if !ok {
+			break
+		}
+		if err := WriteDatagram(w, packet.Data); err != nil {
+			return err
+		}
+	}
+	return w.Flush()
 }
 
 // WriteQueuedDatagrams batches only packets already queued, without waiting for

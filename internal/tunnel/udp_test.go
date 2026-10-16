@@ -128,3 +128,71 @@ func TestDatagramShortWrites(t *testing.T) {
 		t.Fatalf("short write round trip: got %d bytes, error %v", len(got), err)
 	}
 }
+
+func TestBufferedDatagramsAcrossBufferSizes(t *testing.T) {
+	for _, size := range []int{1, 2, 3, 16, 32768} {
+		var wire bytes.Buffer
+		writer := bufio.NewWriterSize(&wire, size)
+		for _, n := range []int{1, 13, 1024, MaxDatagramSize} {
+			want := bytes.Repeat([]byte{byte(n)}, n)
+			if err := WriteDatagram(writer, want); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := writer.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range []int{1, 13, 1024, MaxDatagramSize} {
+			got, err := ReadDatagram(&wire)
+			if err != nil || !bytes.Equal(got, bytes.Repeat([]byte{byte(n)}, n)) {
+				t.Fatalf("buffer=%d length=%d: %v", size, n, err)
+			}
+		}
+	}
+}
+
+func TestBufferedFramingDoesNotAllocate(t *testing.T) {
+	writer := bufio.NewWriterSize(io.Discard, 32768)
+	packet := make([]byte, 1024)
+	if n := testing.AllocsPerRun(100, func() {
+		if err := WriteDatagram(writer, packet); err != nil {
+			panic(err)
+		}
+		if err := writer.Flush(); err != nil {
+			panic(err)
+		}
+	}); n != 0 {
+		t.Fatalf("buffered frame allocated %v times", n)
+	}
+}
+
+func BenchmarkDatagramFraming(b *testing.B) {
+	packet := make([]byte, 1024)
+	for _, legacy := range []bool{true, false} {
+		name := "buffered"
+		if legacy {
+			name = "previous_frame_copy"
+		}
+		b.Run(name, func(b *testing.B) {
+			writer := bufio.NewWriterSize(io.Discard, 32768)
+			b.ReportAllocs()
+			b.SetBytes(int64(len(packet)))
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if legacy {
+					frame := make([]byte, 2+len(packet))
+					binary.BigEndian.PutUint16(frame[:2], uint16(len(packet)))
+					copy(frame[2:], packet)
+					if err := writeFull(writer, frame); err != nil {
+						b.Fatal(err)
+					}
+				} else if err := WriteDatagram(writer, packet); err != nil {
+					b.Fatal(err)
+				}
+				if err := writer.Flush(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

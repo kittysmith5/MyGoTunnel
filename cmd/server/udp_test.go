@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
 )
@@ -103,8 +104,8 @@ func TestUDPResponsesDropWhenQueueFull(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sender.Close()
-	queue := make(chan []byte, 1)
-	queue <- []byte("already queued")
+	queue := datagram.NewQueue(1, datagram.DefaultMaxBytes, datagram.DefaultMaxAge, nil)
+	queue.PushCopy([]byte("already queued"))
 	stop, finished := make(chan struct{}), make(chan struct{})
 	var received, dropped atomic.Uint64
 	target := &udpTarget{conn: conn, destination: socks5.UDPDatagram{Host: "127.0.0.1", Port: 53}}
@@ -128,8 +129,8 @@ func TestUDPResponsesDropWhenQueueFull(t *testing.T) {
 	for dropped.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if dropped.Load() != 1 || received.Load() != 0 || len(queue) != 1 || target.lastActivity.Load() == 0 {
-		t.Fatalf("received=%d dropped=%d queued=%d", received.Load(), dropped.Load(), len(queue))
+	if dropped.Load() != 1 || received.Load() != 0 || queue.Stats().Packets != 1 || target.lastActivity.Load() == 0 {
+		t.Fatalf("received=%d dropped=%d queued=%d", received.Load(), dropped.Load(), queue.Stats().Packets)
 	}
 }
 

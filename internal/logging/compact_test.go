@@ -148,3 +148,29 @@ func TestConnectionIDsAndStatsStop(t *testing.T) {
 		t.Fatal("stats missing or continued after stop")
 	}
 }
+
+func TestSOCKSStageFieldNamesAndJSONUnits(t *testing.T) {
+	for _, format := range []string{FormatText, FormatJSON} {
+		var out bytes.Buffer
+		logger, err := New(&out, Options{Component: "client", Format: format})
+		if err != nil {
+			t.Fatal(err)
+		}
+		logger.Info("ready", "socks_first_byte_duration", time.Millisecond, "socks_method_duration", 2*time.Millisecond, "socks_auth_duration", 3*time.Millisecond, "socks_request_duration", 4*time.Millisecond)
+		if format == FormatText {
+			if !strings.Contains(out.String(), "sfirst=1ms smethod=2ms sauth=3ms sreq=4ms") {
+				t.Fatal(out.String())
+			}
+		} else {
+			var entry map[string]any
+			if err := json.Unmarshal(out.Bytes(), &entry); err != nil {
+				t.Fatal(err)
+			}
+			for i, key := range []string{"socks_first_byte_duration", "socks_method_duration", "socks_auth_duration", "socks_request_duration"} {
+				if entry[key] != float64(time.Duration(i+1)*time.Millisecond) {
+					t.Fatal(entry)
+				}
+			}
+		}
+	}
+}

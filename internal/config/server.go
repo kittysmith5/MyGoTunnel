@@ -7,6 +7,7 @@ import (
 )
 
 type ServerConfig struct {
+	UDPQueueConfig
 	ListenAddr string `json:"listen_addr"`
 	AuthToken  string `json:"auth_token"`
 	CertFile   string `json:"cert_file"`
@@ -38,6 +39,9 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 
 	if cfg.KeyFile == "" {
 		cfg.KeyFile = "certs/key.pem"
+	}
+	if err := cfg.UDPQueueConfig.validate(); err != nil {
+		return nil, err
 	}
 
 	return &cfg, nil

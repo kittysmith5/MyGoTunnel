@@ -171,12 +171,19 @@ func handleClientContext(parent context.Context, clientConn net.Conn, cfg *confi
 	if username, password, enabled := cfg.SOCKSCredentials(); enabled {
 		socksAuth = &socks5.Credentials{Username: username, Password: password}
 	}
-	if err := socks5.HandshakeWithAuth(clientConn, socksAuth); err != nil {
+	handshakeTimings, err := socks5.HandshakeWithAuthTimings(clientConn, socksAuth)
+	connectionLogger = connectionLogger.With(
+		"socks_first_byte_duration", handshakeTimings.FirstByte,
+		"socks_method_duration", handshakeTimings.Method,
+		"socks_auth_duration", handshakeTimings.Auth)
+	if err != nil {
 		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
 
+	requestStarted := time.Now()
 	request, err := socks5.ReadRequestDetails(clientConn)
+	connectionLogger = connectionLogger.With("socks_request_duration", time.Since(requestStarted))
 	if err != nil {
 		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		_ = socks5.Reply(clientConn, socks5.ReplyCode(err))

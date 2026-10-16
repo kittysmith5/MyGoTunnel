@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/preconnect"
 	"mygotunnel/internal/socks5"
@@ -92,8 +93,9 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 
 	var clientUDP *net.UDPAddr
 	var clientUDPmu sync.Mutex
-	responses := make(chan []byte, 128)
-	requests := make(chan []byte, udpFrameQueueSize)
+	maxBytes, maxAge := cfg.QueueLimits()
+	responses := datagram.NewQueue(128, maxBytes, maxAge, nil)
+	requests := datagram.NewQueue(udpFrameQueueSize, maxBytes, maxAge, nil)
 	var uploaded atomic.Uint64
 	var downloaded atomic.Uint64
 	var dropped atomic.Uint64
@@ -101,7 +103,14 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 	defer func() {
 		stopSession()
 		workers.Wait()
-		logger.Info("closed", "transport", "udp", "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(), "dropped_datagrams", dropped.Load(), "udp_write_errors", writeErrors.Load(), "duration", time.Since(startedAt))
+		requests.Close()
+		responses.Close()
+		in, out := requests.Stats(), responses.Stats()
+		logger.Info("closed", "transport", "udp", "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(),
+			"dropped_datagrams", dropped.Load()+in.ExpiredDrops+out.ExpiredDrops,
+			"queue_full_drops", in.FullDrops+out.FullDrops, "queue_expired_drops", in.ExpiredDrops+out.ExpiredDrops,
+			"request_queue_peak_bytes", in.PeakBytes, "response_queue_peak_bytes", out.PeakBytes,
+			"udp_write_errors", writeErrors.Load(), "duration", time.Since(startedAt))
 	}()
 	workers.Add(4)
 	go func() {
@@ -114,8 +123,8 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 		writer := bufio.NewWriterSize(remoteConn, 32*1024)
 		for {
 			select {
-			case packet := <-requests:
-				if err := tunnel.WriteQueuedDatagrams(writer, packet, requests); err != nil {
+			case <-requests.Ready():
+				if err := tunnel.WriteDatagramQueue(writer, requests); err != nil {
 					logger.Debug("send UDP datagram through tunnel failed", "error", err)
 					stopSession()
 					return
@@ -134,10 +143,11 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 				return
 			}
 			select {
-			case responses <- response:
 			case <-stop:
 				return
 			default:
+			}
+			if !responses.Push(datagram.Packet{Data: response}) {
 				dropped.Add(1)
 			}
 		}
@@ -146,12 +156,21 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 		defer workers.Done()
 		for {
 			select {
-			case response := <-responses:
+			case <-responses.Ready():
+				response, ok := responses.TryPop()
+				if !ok {
+					continue
+				}
 				clientUDPmu.Lock()
 				peer := clientUDP
 				clientUDPmu.Unlock()
 				if peer != nil {
-					if _, err := udpConn.WriteToUDP(response, peer); err != nil {
+					if err := udpConn.SetWriteDeadline(time.Now().Add(maxAge)); err != nil {
+						writeErrors.Add(1)
+						dropped.Add(1)
+						continue
+					}
+					if _, err := udpConn.WriteToUDP(response.Data, peer); err != nil {
 						writeErrors.Add(1)
 						dropped.Add(1)
 					} else {
@@ -195,11 +214,13 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 			continue
 		}
 		select {
-		case requests <- append([]byte(nil), packet[:n]...):
-			uploaded.Add(1)
 		case <-stop:
 			return
 		default:
+		}
+		if requests.PushCopy(packet[:n]) {
+			uploaded.Add(1)
+		} else {
 			dropped.Add(1)
 		}
 	}
