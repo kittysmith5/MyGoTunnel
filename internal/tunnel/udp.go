@@ -57,7 +57,9 @@ func WriteDatagramQueue(w *bufio.Writer, queue *datagram.Queue) error {
 		if !ok {
 			break
 		}
-		if err := WriteDatagram(w, packet.Data); err != nil {
+		err := WriteDatagram(w, packet.Data)
+		packet.Release()
+		if err != nil {
 			return err
 		}
 	}

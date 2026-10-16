@@ -38,7 +38,7 @@ SOCKS5 应用
 1. 客户端一次写入 `AUTH <token>\nCONNECT <host:port>\n`；兼容旧客户端分两次发送。
 2. 服务端认证后返回 `OK\n` 或 `ERR\n`；失败时不得拨号目标。
 3. 客户端按顺序读取认证和 CONNECT 两条响应，服务端认证成功后读取 CONNECT。
-4. 服务端完成目标连接后返回 `OK\n`，失败时返回 `ERR\n`。
+4. 服务端完成目标连接后返回 `OK\n`，目标失败时返回固定白名单的 `ERR <CODE>\n`；客户端仍兼容旧 `ERR\n`，不增加控制往返。
 5. 成功后双方不再解析行协议，直接转发原始字节流。
 
 必须保持以下行为：
@@ -66,6 +66,7 @@ SOCKS5 应用
 - `sni`：可选；为空时从 `remote_addr` 推导主机名。
 - `certificate_fingerprint`：可选，服务端叶证书 DER 的 SHA-256 十六进制指纹；存在时使用固定指纹验证，否则使用系统 CA 和主机名验证。
 - 客户端和服务端均支持 `udp_queue_max_bytes`、`udp_queue_max_age_ms`；0/缺省为 1 MiB、250ms，非零范围分别 65000～67108864、1～60000。属于本地策略，不进入连接码。
+- 两端还支持 `udp_write_timeout_ms`（默认5000，非零1～600000）、`udp_max_sockets`（默认1024，非零1～65536）、`udp_memory_limit_bytes`（默认64MiB，非零262144～1073741824）；0/缺省取默认值，均不进入连接码。生产每个run创建一个共享Resources，不能给每个关联独立创建而绕过进程预算。
 
 服务端实际读取的字段只有：
 
@@ -146,7 +147,7 @@ go build ./cmd/...
 
 - 默认 text 必须紧凑英文，不重复 time=/level=/msg=/component=；使用 UTC 完整日期时间 `YYYY-MM-DD HH:MM:SS.mmm`，启动输出 timezone=UTC，C/S 区分两端。JSON 继续使用标准字段和现有长字段名，Duration 为纳秒整数，字节数为原始整数；时间统一 UTC。事件名使用 listening/ready/closed/failed/stats 等短英文。
 - 目标域名/IP:端口和 peer 保留；不解密 HTTPS、不记录 URL 路径、token、私钥、连接码或原始控制报文。文本属性中的控制字符必须转义，写入一次完整记录，并在 With/WithGroup 派生处理器间共享写锁。
-- connection_id/id 只在进程内关联，包含进程前缀和原子递增编号。本轮不改变协议，不宣称两端 ID 一致。
+- connection_id/id 只在进程内关联，包含进程前缀和原子递增编号，不通过协议传递ID，不宣称两端 ID 一致。
 - 上传/下载统一以 SOCKS5 应用为参照：↑/upload_bytes 向目标，↓/download_bytes 回到应用；保留 relay 的根失败方向 up/down，不被故意中断的反向超时覆盖。
 - text 阶段短名为 socks/sfirst/smethod/sauth/sreq/tcp/tls/take/ctl/auth/wait/dial/reply/idle/total，展示毫秒，最多 3 位小数。SOCKS 子阶段分别为首字节、方法协商、RFC 1929、请求读取，均含前端等待；JSON 对应 socks_first_byte_duration、socks_method_duration、socks_auth_duration、socks_request_duration，失败时未进入的握手子阶段为 0，尚未读取请求则无 sreq，不记录凭据。JSON 长字段定义见 README。服务端 total 排除 idle，但仍包含准备阶段 auth；连接生命周期 duration/dur 包含 idle。已预热池命中时 text 可省略零值 tcp/tls，JSON 保留。
 - failed 必须包含 stage 与 close_reason/reason；常见系统错误完整链进入 DEBUG，未知错误在 WARN 保留诊断信息。只有真正正常 EOF 才作为 INFO closed，不能把所有 reset/timeout 静默吞掉。
@@ -263,3 +264,11 @@ UDP 普通流程为一次写入 AUTH 与 UDP 两条命令，并依次读取两�
 每 UDP 帧包含 SOCKS 头且最多 65000 字节，读写上限一致；每次最多刷新 32 个已排队报文，不等待凑批，bufio 路径复用缓冲而非整帧临时拷贝。客户端出队列 256、回包队列 128，服务端各 256；另有配置的字节及年龄上限，入队/出队淘汰过期报文，满时拒绝。每会话最多 256 个目标 worker（退出中也占名额），独立拨号和发送，DNS 初始化并发最多 16，IP 绕过 DNS 名额；同目标初始化去重，待发送最多 32 包/64 KiB 负载，各目标共享配置的负载字节预算。分发时保留年龄，慢 DNS 等待也计入；元数据、读缓冲、帧头、在途包不计入负载预算。空闲 2 分钟回收，15 秒扫描，失效目标下次发包重建。已建立会话终止时取消阻塞并等待所有 worker，再输出统计。client upload 为入队数，download 为成功 UDP 写入数，udp_write_errors 为写入失败；server upload 为成功目标写入，download 为响应入队。queue_full_drops/queue_expired_drops 分别为容量/年龄丢弃，request_queue_peak_bytes/response_queue_peak_bytes 为收发队列峰值，target_queue_peak_bytes 为单目标负载队列峰值；full 与直接拒绝计数有重叠，不能相加。UDP write 成功不承诺应用收到。年龄只限制应用排队，不承诺传输 RTT 或清除内核积压。协议不消除 TCP 队头阻塞，不能称为原生 UDP。
 
 旧 socks_username/socks_password 字段保留读取，嵌套 socks_auth 优先，认证仍使用功能分支的固定 SHA-256 摘要常量时间比较；真实 SOCKS 凭据不进入连接码。测试需覆盖池命中/回退/显式拒绝、证书指纹、UDP 来源和失败恢复、setup/idle 名额释放及 grace 到期清理。
+
+UDP TLS写期限独立于队列年龄，默认每次底层Write最多5秒，空闲不超时且不设置读期限。写错误/超时必须终止整个关联并关闭底层连接，不能在部分帧后继续写；等待全部worker退出后输出首个终止stage/reason，正常EOF为closed，其他为failed。不得覆盖TCP CONNECT的半关闭语义。日志补udp_tunnel_write_calls/errors/timeouts/max_duration；max_duration为Duration（JSON纳秒，text毫秒）。进程stats补udp_sockets/max_sockets、buffer_bytes/cached_bytes/buffer_peak_bytes/memory_limit_bytes、socket_rejected/memory_rejected、sessions_closed/session_errors/tunnel_write_failures/write_timeouts（均以udp_为前缀）。进程写失败/超时只累计根终止会话，会话写调用统计可包含次生错误。
+
+UDP池化Packet为单所有者：Push成功转交所有权，失败仍由调用者Release；出队消费后、队列过期/关闭时必须Release，不能保留已释放Data切片。进程预算包含512～65536分级缓冲容量、空闲缓存、在途帧和65KB接收缓冲，缓存每级最多16块，预算紧张先驱逐空闲缓存；不宣称限制RSS或覆盖TLS/内核/元数据。Socket预算覆盖初始化与退出中的目标。帧读取资源拒绝时先丢弃完整帧保持流对齐，后续仍可恢复。queue_resource_drops统计复制入队时的资源拒绝。测试需覆盖并发预算、缓存驱逐、最大65000帧、零热路径读取分配、拒绝后帧对齐、跨关联共享限制和关闭后归还。
+
+进程终止原因计数udp_end_eof/timeout/reset/truncated/canceled/closed/error互斥，之和为udp_sessions_closed，只统计已经进入UDP转发的会话；不得把setup拒绝或次生错误重复计入。
+
+目标错误仅发送ERR白名单TIMEOUT/DNS/NETWORK/HOST/REFUSED/LIMIT/CANCELED/INTERNAL，不能传原始错误文本。新客户端兼容旧ERR，旧客户端非OK处理兼容新ERR；AUTH与PREPARE BUSY保持原响应。目标错误日志优先保留具体分类，SOCKS NETWORK=3，TIMEOUT/DNS/HOST=4，REFUSED=5，其余=1，不能把普通超时映射TTL expired=6。显式错误（含未知码的协议错误）不能触发备用传输回退。修改需覆盖普通/池命中、TCP/UDP的错误解析和SOCKS回复、新旧响应兼容。

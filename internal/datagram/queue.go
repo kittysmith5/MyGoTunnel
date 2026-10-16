@@ -16,8 +16,18 @@ const (
 // Packet retains its original queue time when forwarded to another queue.
 // A successful Push transfers ownership of Data to the queue.
 type Packet struct {
-	Data []byte
-	At   time.Time
+	Data   []byte
+	At     time.Time
+	buffer *buffer
+}
+
+// Release relinquishes this packet's ownership. Copies must not be released
+// after ownership has been transferred to a queue or another consumer.
+func (p *Packet) Release() {
+	if p.buffer != nil {
+		p.buffer.owner.release(p.buffer)
+	}
+	*p = Packet{}
 }
 
 func (p Packet) expired(now time.Time, maxAge time.Duration) bool {
@@ -55,34 +65,46 @@ func (b *Budget) release(n int) {
 }
 
 type Stats struct {
-	Packets, Bytes, PeakBytes int
-	FullDrops, ExpiredDrops   uint64
+	Packets, Bytes, PeakBytes              int
+	FullDrops, ExpiredDrops, ResourceDrops uint64
 }
 
 // Queue supports concurrent producers and one consumer. Payload ownership is
 // transferred on admission and relinquished on dequeue or Close.
 type Queue struct {
-	mu     sync.Mutex
-	ring   []Packet
-	head   int
-	size   int
-	bytes  int
-	max    int
-	age    time.Duration
-	budget *Budget
-	ready  chan struct{}
-	stats  Stats
-	closed bool
+	mu        sync.Mutex
+	ring      []Packet
+	head      int
+	size      int
+	bytes     int
+	max       int
+	age       time.Duration
+	budget    *Budget
+	resources *Resources
+	ready     chan struct{}
+	stats     Stats
+	closed    bool
 }
 
-func NewQueue(packets, bytes int, age time.Duration, budget *Budget) *Queue {
+func NewQueue(packets, bytes int, age time.Duration, budget *Budget, resources ...*Resources) *Queue {
 	if packets <= 0 || bytes <= 0 || age <= 0 {
 		panic("invalid datagram queue capacity")
 	}
-	return &Queue{ring: make([]Packet, packets), max: bytes, age: age, budget: budget, ready: make(chan struct{}, 1)}
+	q := &Queue{ring: make([]Packet, packets), max: bytes, age: age, budget: budget, ready: make(chan struct{}, 1)}
+	if len(resources) > 0 {
+		q.resources = resources[0]
+	}
+	return q
 }
 
 func (q *Queue) Ready() <-chan struct{} { return q.ready }
+
+func (q *Queue) Resources() *Resources {
+	if q.resources != nil {
+		return q.resources
+	}
+	return DefaultResources
+}
 
 func (q *Queue) notify() {
 	select {
@@ -119,7 +141,19 @@ func (q *Queue) push(p Packet, copyData bool) bool {
 		return false
 	}
 	if copyData {
-		p.Data = append([]byte(nil), p.Data...)
+		if q.resources != nil {
+			owned, err := q.resources.Borrow(n)
+			if err != nil {
+				q.budget.release(n)
+				q.stats.ResourceDrops++
+				return false
+			}
+			copy(owned.Data, p.Data)
+			owned.At = p.At
+			p = owned
+		} else {
+			p.Data = append([]byte(nil), p.Data...)
+		}
 	}
 	q.ring[(q.head+q.size)%len(q.ring)] = p
 	q.size++
@@ -141,7 +175,8 @@ func (q *Queue) remove() Packet {
 
 func (q *Queue) expire(now time.Time) {
 	for q.size > 0 && q.ring[q.head].expired(now, q.age) {
-		q.remove()
+		p := q.remove()
+		p.Release()
 		q.stats.ExpiredDrops++
 	}
 }
@@ -187,7 +222,8 @@ func (q *Queue) Close() {
 	q.expire(time.Now())
 	q.closed = true
 	for q.size > 0 {
-		q.remove()
+		p := q.remove()
+		p.Release()
 	}
 	q.notify() // wake an idle Pop so it can observe closed
 }

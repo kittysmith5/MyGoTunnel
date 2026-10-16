@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"mygotunnel/internal/config"
@@ -17,14 +18,21 @@ import (
 	"time"
 )
 
-func handleUDPAssociate(parent context.Context, clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time, releaseSetup func(), pool *preconnect.Pool) {
+func handleUDPAssociate(parent context.Context, clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time, releaseSetup func(), pool *preconnect.Pool, limits ...*datagram.Resources) {
 	const udpFrameQueueSize = 256
+	resources := datagram.SelectResources(limits)
 	tcpPeer, ok := clientConn.RemoteAddr().(*net.TCPAddr)
 	if !ok {
 		logger.Warn("SOCKS5 UDP control peer is not TCP")
 		_ = socks5.Reply(clientConn, 0x01)
 		return
 	}
+	if !resources.AcquireSocket() {
+		logging.Failure(logger, "udp_bind", datagram.ErrResourceLimit)
+		_ = socks5.Reply(clientConn, 0x01)
+		return
+	}
+	defer resources.ReleaseSocket()
 	bindIP := net.IPv4zero
 	if tcpLocal, ok := clientConn.LocalAddr().(*net.TCPAddr); ok && tcpLocal.IP.To4() == nil {
 		bindIP = net.IPv6unspecified
@@ -36,6 +44,13 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 		return
 	}
 	defer udpConn.Close()
+	scratch, err := resources.Borrow(tunnel.MaxDatagramSize + 1)
+	if err != nil {
+		logging.Failure(logger, "udp_bind", err)
+		_ = socks5.Reply(clientConn, 0x01)
+		return
+	}
+	defer scratch.Release()
 
 	socksDuration := time.Since(startedAt)
 	ctx, cancel := context.WithTimeout(parent, remoteDialTimeout+tunnel.ControlTimeout)
@@ -43,7 +58,7 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 	cancel()
 	if err != nil {
 		logging.Failure(logger, session.Stage, err)
-		_ = socks5.Reply(clientConn, 0x01)
+		_ = socks5.Reply(clientConn, socks5.ReplyCode(err))
 		return
 	}
 	remoteConn, reader := session.Conn, session.Reader
@@ -77,13 +92,14 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 
 	stop := make(chan struct{})
 	var stopOnce sync.Once
-	stopSession := func() {
+	var closeStage string
+	var closeErr error
+	stopSession := func(stage string, cause error) {
 		stopOnce.Do(func() {
+			closeStage, closeErr = stage, cause
 			close(stop)
 			_ = udpConn.Close()
-			if err := remoteConn.SetDeadline(time.Now()); err != nil {
-				_ = remoteConn.Close()
-			}
+			tunnel.AbortDatagramConn(remoteConn)
 			if err := clientConn.SetReadDeadline(time.Now()); err != nil {
 				_ = clientConn.Close()
 			}
@@ -94,39 +110,41 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 	var clientUDP *net.UDPAddr
 	var clientUDPmu sync.Mutex
 	maxBytes, maxAge := cfg.QueueLimits()
-	responses := datagram.NewQueue(128, maxBytes, maxAge, nil)
-	requests := datagram.NewQueue(udpFrameQueueSize, maxBytes, maxAge, nil)
+	responses := datagram.NewQueue(128, maxBytes, maxAge, nil, resources)
+	requests := datagram.NewQueue(udpFrameQueueSize, maxBytes, maxAge, nil, resources)
+	tunnelWriter := tunnel.NewDatagramWriter(remoteConn, cfg.WriteTimeout())
 	var uploaded atomic.Uint64
 	var downloaded atomic.Uint64
 	var dropped atomic.Uint64
 	var writeErrors atomic.Uint64
 	defer func() {
-		stopSession()
+		stopSession("udp_session", nil)
 		workers.Wait()
 		requests.Close()
 		responses.Close()
 		in, out := requests.Stats(), responses.Stats()
-		logger.Info("closed", "transport", "udp", "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(),
+		logging.LogUDPResult(logger, resources, closeStage, closeErr, tunnelWriter.Stats(), "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(),
 			"dropped_datagrams", dropped.Load()+in.ExpiredDrops+out.ExpiredDrops,
 			"queue_full_drops", in.FullDrops+out.FullDrops, "queue_expired_drops", in.ExpiredDrops+out.ExpiredDrops,
+			"queue_resource_drops", in.ResourceDrops+out.ResourceDrops,
 			"request_queue_peak_bytes", in.PeakBytes, "response_queue_peak_bytes", out.PeakBytes,
 			"udp_write_errors", writeErrors.Load(), "duration", time.Since(startedAt))
 	}()
 	workers.Add(4)
 	go func() {
 		defer workers.Done()
-		_, _ = io.Copy(io.Discard, clientConn)
-		stopSession()
+		_, err := io.Copy(io.Discard, clientConn)
+		stopSession("udp_control", err)
 	}()
 	go func() {
 		defer workers.Done()
-		writer := bufio.NewWriterSize(remoteConn, 32*1024)
+		writer := bufio.NewWriterSize(tunnelWriter, 32*1024)
 		for {
 			select {
 			case <-requests.Ready():
 				if err := tunnel.WriteDatagramQueue(writer, requests); err != nil {
 					logger.Debug("send UDP datagram through tunnel failed", "error", err)
-					stopSession()
+					stopSession("udp_tunnel_write", err)
 					return
 				}
 			case <-stop:
@@ -136,18 +154,25 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 	}()
 	go func() {
 		defer workers.Done()
-		defer stopSession()
+		frames := tunnel.NewDatagramReader(reader, resources)
 		for {
-			response, err := tunnel.ReadDatagram(reader)
+			response, err := frames.ReadPacket()
 			if err != nil {
+				if errors.Is(err, datagram.ErrResourceLimit) {
+					dropped.Add(1)
+					continue
+				}
+				stopSession("udp_tunnel_read", err)
 				return
 			}
 			select {
 			case <-stop:
+				response.Release()
 				return
 			default:
 			}
-			if !responses.Push(datagram.Packet{Data: response}) {
+			if !responses.Push(response) {
+				response.Release()
 				dropped.Add(1)
 			}
 		}
@@ -168,6 +193,7 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 					if err := udpConn.SetWriteDeadline(time.Now().Add(maxAge)); err != nil {
 						writeErrors.Add(1)
 						dropped.Add(1)
+						response.Release()
 						continue
 					}
 					if _, err := udpConn.WriteToUDP(response.Data, peer); err != nil {
@@ -177,15 +203,17 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 						downloaded.Add(1)
 					}
 				}
+				response.Release()
 			case <-stop:
 				return
 			}
 		}
 	}()
-	packet := make([]byte, tunnel.MaxDatagramSize+1)
+	packet := scratch.Data
 	for {
 		n, source, err := udpConn.ReadFromUDP(packet)
 		if err != nil {
+			stopSession("udp_read", err)
 			return
 		}
 		if n > tunnel.MaxDatagramSize {

@@ -61,3 +61,56 @@ func TestUDPQueueConfigDefaultsOverridesAndValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestUDPProcessAndWritePolicyValidation(t *testing.T) {
+	for _, tc := range []struct {
+		fields string
+		valid  bool
+	}{
+		{``, true},
+		{`,"udp_write_timeout_ms":20,"udp_max_sockets":2,"udp_memory_limit_bytes":262144`, true},
+		{`,"udp_write_timeout_ms":600000,"udp_max_sockets":65536,"udp_memory_limit_bytes":1073741824`, true},
+		{`,"udp_write_timeout_ms":-1`, false}, {`,"udp_write_timeout_ms":600001`, false},
+		{`,"udp_max_sockets":-1`, false}, {`,"udp_max_sockets":65537`, false},
+		{`,"udp_memory_limit_bytes":262143`, false}, {`,"udp_memory_limit_bytes":1073741825`, false},
+	} {
+		for _, side := range []string{"client", "server"} {
+			t.Run(side+tc.fields, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "config.json")
+				data := `{"auth_token":"test","remote_addr":"example.test:443"` + tc.fields + `}`
+				if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+					t.Fatal(err)
+				}
+				var c UDPQueueConfig
+				var err error
+				if side == "client" {
+					cfg, e := LoadClientConfig(path)
+					err = e
+					if cfg != nil {
+						c = cfg.UDPQueueConfig
+					}
+				} else {
+					cfg, e := LoadServerConfig(path)
+					err = e
+					if cfg != nil {
+						c = cfg.UDPQueueConfig
+					}
+				}
+				if (err == nil) != tc.valid {
+					t.Fatal(err)
+				}
+				if !tc.valid {
+					return
+				}
+				sockets, bytes := c.ProcessLimits()
+				if tc.fields == "" {
+					if c.WriteTimeout() != 5*time.Second || sockets != datagram.DefaultMaxSockets || bytes != datagram.DefaultMemoryLimit {
+						t.Fatal(c)
+					}
+				} else if c.WriteTimeout() == 0 || sockets == 0 || bytes == 0 {
+					t.Fatal(c)
+				}
+			})
+		}
+	}
+}

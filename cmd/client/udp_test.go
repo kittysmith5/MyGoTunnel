@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
 )
@@ -29,7 +30,7 @@ type udpAssociationTest struct {
 
 // Exercise the real uTLS connection and TCP peer addresses without using an
 // external server. The remote stub echoes framed SOCKS UDP packets unchanged.
-func newUDPAssociationTest(t *testing.T, request socks5.Request) udpAssociationTest {
+func newUDPAssociationTest(t *testing.T, request socks5.Request, limits ...*datagram.Resources) udpAssociationTest {
 	t.Helper()
 	certSource := httptest.NewTLSServer(nil)
 	cert := certSource.TLS.Certificates[0]
@@ -101,7 +102,7 @@ func newUDPAssociationTest(t *testing.T, request socks5.Request) udpAssociationT
 		pin := sha256.Sum256(cert.Certificate[0])
 		handleUDPAssociate(context.Background(), clientConn, request, &config.ClientConfig{
 			RemoteAddr: listener.Addr().String(), AuthToken: "test-token", CertificateFingerprint: hex.EncodeToString(pin[:]),
-		}, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now(), func() {}, nil)
+		}, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now(), func() {}, nil, limits...)
 	}()
 	t.Cleanup(func() {
 		_ = control.Close()
@@ -122,6 +123,37 @@ func newUDPAssociationTest(t *testing.T, request socks5.Request) udpAssociationT
 	return udpAssociationTest{
 		control: control, remote: <-remoteConn, done: done,
 		relay: &net.UDPAddr{IP: net.IP(reply[4:8]), Port: int(binary.BigEndian.Uint16(reply[8:]))},
+	}
+}
+
+func TestUDPAssociationReturnsAllManagedBuffers(t *testing.T) {
+	resources := datagram.NewResources(1, 1<<20)
+	defer resources.Close()
+	session := newUDPAssociationTest(t, socks5.Request{Command: 3, Address: "0.0.0.0"}, resources)
+	sender := testUDPSocket(t, "127.0.0.1")
+	packet := socks5.BuildUDPDatagram(socks5.UDPDatagram{Host: "example.test", Port: 53}, []byte("pooled"))
+	for i := 0; i < 10; i++ {
+		if _, err := sender.WriteToUDP(packet, session.relay); err != nil {
+			t.Fatal(err)
+		}
+		sender.SetReadDeadline(time.Now().Add(time.Second))
+		buf := make([]byte, 100)
+		if n, _, err := sender.ReadFromUDP(buf); err != nil || !bytes.Equal(buf[:n], packet) {
+			t.Fatal(err)
+		}
+	}
+	session.control.Close()
+	select {
+	case <-session.done:
+	case <-time.After(time.Second):
+		t.Fatal("association cleanup timeout")
+	}
+	if s := resources.Stats(); s.Sockets != 0 || s.BufferBytes != s.CachedBytes || s.PeakBytes > 1<<20 {
+		t.Fatal(s)
+	}
+	resources.Close()
+	if s := resources.Stats(); s.BufferBytes != 0 {
+		t.Fatal(s)
 	}
 }
 

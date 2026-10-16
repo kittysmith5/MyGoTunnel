@@ -56,13 +56,34 @@ UDP 来源 IP 必须与 SOCKS TCP 对端相同。请求中非零源端口会被�
 ```json
 {
   "udp_queue_max_bytes": 1048576,
-  "udp_queue_max_age_ms": 250
+  "udp_queue_max_age_ms": 250,
+  "udp_write_timeout_ms": 5000,
+  "udp_max_sockets": 1024,
+  "udp_memory_limit_bytes": 67108864
 }
 ```
 
 `udp_queue_max_bytes` 范围 65000～67108864，同时控制各方向队列与服务端共享目标预算；目标单队列仍受 64 KiB 限制。`udp_queue_max_age_ms` 范围 1～60000，可根据业务容忍度调高。年龄只在应用入队/出队时检查，不是网络 RTT 或送达期限，不能清除 TLS/TCP/内核已接收的积压；慢 DNS 期间超过年龄的待发送包同样会丢弃。队列和 worker 元数据、帧头、读缓冲及在途包不计入负载预算，不能把 1 MiB 当作整个关联的内存上限。
 
+两端每次 UDP 隧道 TLS Write 使用独立的 `udp_write_timeout_ms`，默认 5000ms，非零范围 1～600000；空闲时不计时，不限制读取。它与 250ms 队列年龄分开。超时或写错误会终止整个 UDP association、关闭底层连接并等待 worker 退出；不能跳过部分写出的帧继续复用该 TLS 流，应用需重建 association。它限制本地 Write 阻塞，不保证对端已收到，也不消除 TCP 重传的队头等待。TCP CONNECT 转发的期限和半关闭语义不变。
+
+每个进程共享 `udp_max_sockets`（默认1024，非零1～65536）和 `udp_memory_limit_bytes`（默认64MiB，非零262144～1073741824字节）。socket 预算包括客户端 UDP relay 和服务端初始化/转发/退出中的目标；各进程独立计数。内存预算按512、2048、8192、32768、65536字节分级缓冲的实际容量计费，包含活跃帧、在途帧、目标/客户端接收缓冲及缓存空闲帧；内存不足先驱逐空闲缓存。帧读取器复用长度前缀，包所有权随队列传递，在消费、拒绝、过期和退出时回收；每个尺寸最多缓存16块。上限不是整个进程RSS，TLS/bufio、队列/worker元数据和内核socket缓冲仍在其外。目标仍保留约65KB接收缓冲，但总量受进程预算约束。
+
+客户端 relay 创建时资源不足会拒绝 association；服务端新增目标超限时丢弃相应包。读取隧道帧遇到内存不足会消费并丢弃完整帧，保持后续流对齐；预算释放后可继续处理。上述三个新字段均为本地策略，不进入连接码，0/缺省使用默认值。
+
 会话日志保留 connection_id、transport=udp、资源与建连信息。client upload_datagrams 表示入隧道队列，download_datagrams 表示成功写入本地 UDP，udp_write_errors 记录写入失败，dropped_datagrams 包括来源、报文、队列和写入失败。server download_datagrams 为进入响应队列数量，upload_datagrams 为成功向目标写入数量。新增 queue_full_drops、queue_expired_drops 分别记录容量拒绝与年龄丢弃；request_queue_peak_bytes、response_queue_peak_bytes 记录收发队列数据峰值，server target_queue_peak_bytes 为单目标待发送队列负载峰值。client dropped_datagrams 包含年龄丢弃；server dropped_requests/dropped_responses 记录相应路径上的直接拒绝；queue_* 是队列维度统计，可与这些计数重叠，不能直接相加。统计在会话结束后输出。UDP write 成功不保证应用收到；TCP 丢包重传仍会延迟后续数据报，不宣称原生 UDP 延迟特性。
+
+UDP 结束记录首个根因的 `stage` / `close_reason`，包括 udp_control、udp_read、udp_tunnel_read、udp_tunnel_write。正常 EOF 为 INFO closed，超时/重置/截断为 WARN failed；人为关闭其他 worker 产生的次生错误不会覆盖根因。结束记录 `udp_tunnel_write_calls/errors/timeouts` 及 `udp_tunnel_write_max_duration`（text毫秒、JSON纳秒），后者包含成功或失败的底层写调用；`queue_resource_drops` 为队列复制时的进程内存拒绝。
+
+每30秒 stats 增加 `udp_sockets/udp_max_sockets`、`udp_buffer_bytes/udp_cached_bytes/udp_buffer_peak_bytes/udp_memory_limit_bytes`、`udp_socket_rejected/udp_memory_rejected`、`udp_sessions_closed/udp_session_errors/udp_tunnel_write_failures/udp_write_timeouts`。最后两项只累计以隧道写失败/写超时为根因结束的会话，不计人为打断产生的次生错误；会话内 write errors/timeouts 则统计写调用。拒绝数是资源申请次数，不能直接当应用丢包率。
+
+`udp_end_eof/timeout/reset/truncated/canceled/closed/error` 按首个根终止原因互斥累计已建立会话，之和为 `udp_sessions_closed`；error归并其他原因。setup阶段拒绝不计入这些结束计数。
+
+### 目标错误反馈兼容
+
+服务端目标拨号失败返回 `ERR <CODE>\n`，CODE 仅允许 TIMEOUT、DNS、NETWORK、HOST、REFUSED、LIMIT、CANCELED、INTERNAL，不发送系统错误原文。新客户端仍接受旧版 `ERR\n`；旧客户端沿用非OK即拒绝的处理。AUTH 失败仍为旧ERR，PREPARE BUSY不变；不增加控制往返，也不修改UDP数据帧。
+
+新错误在客户端日志区分 timeout、dns、unreachable、refused、limit、canceled、error，并映射到 SOCKS 回复：NETWORK=3，TIMEOUT/DNS/HOST=4，REFUSED=5，其余=1。6是TTL expired，不用于一般拨号超时。旧ERR保持原客户端CONNECT拒绝语义；未知错误码按协议错误处理。任何明确错误响应都不触发备用连接的传输回退，只有原有传输失败路径允许回退。
 
 ## 日志
 

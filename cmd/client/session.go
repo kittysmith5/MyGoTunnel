@@ -74,7 +74,7 @@ func openRemoteCommand(ctx context.Context, cfg *config.ClientConfig, target str
 			}
 			entry.Conn.Close()
 			if err == nil {
-				return session, errTargetRejected
+				return session, tunnel.ParseConnectResponse(response)
 			}
 			if ctx.Err() != nil {
 				return session, ctx.Err()
@@ -129,8 +129,8 @@ func openRemoteCommand(ctx context.Context, cfg *config.ClientConfig, target str
 	if err != nil {
 		return session, err
 	}
-	if response != "OK" {
-		return session, errTargetRejected
+	if err = tunnel.ParseConnectResponse(response); err != nil {
+		return session, err
 	}
 	session.Conn = conn
 	session.Reader = reader

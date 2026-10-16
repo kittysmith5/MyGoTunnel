@@ -18,6 +18,7 @@ import (
 
 	"mygotunnel/internal/admission"
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/diagnostics"
 	"mygotunnel/internal/dialmetrics"
 	"mygotunnel/internal/logging"
@@ -112,6 +113,8 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	resources := datagram.NewResources(cfg.ProcessLimits())
+	defer resources.Close()
 
 	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
 	if err != nil {
@@ -138,11 +141,11 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	idleSlots := make(chan struct{}, opts.maxIdle)
 	metrics := &admission.Counters{}
 	stopStats := logging.StartStats(logger, 30*time.Second, func() []any {
-		return []any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", len(idleSlots), "max_idle", opts.maxIdle, "rejected", metrics.Rejected.Load()}
+		return append([]any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", len(idleSlots), "max_idle", opts.maxIdle, "rejected", metrics.Rejected.Load()}, logging.UDPResourceAttrs(resources)...)
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleTunnelContext(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire})
+		handleTunnelContext(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire}, resources)
 	}, nil, metrics)
 }
 
@@ -159,7 +162,7 @@ func handleTunnelWithPool(tunnelConn net.Conn, cfg *config.ServerConfig, logger 
 	handleTunnelContext(context.Background(), tunnelConn, cfg, logger, releaseSetup, poolOptions)
 }
 
-func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, releaseSetup func(), poolOptions *serverPoolOptions) {
+func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, releaseSetup func(), poolOptions *serverPoolOptions, resources ...*datagram.Resources) {
 	defer tunnelConn.Close()
 
 	remoteAddr := tunnelConn.RemoteAddr().String()
@@ -230,7 +233,7 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 			return
 		}
 		if !poolOptions.resumeSetup() {
-			_ = tunnel.SendERR(tunnelConn)
+			_ = tunnel.SendTargetError(tunnelConn, syscall.ENOBUFS)
 			return
 		}
 		pooled = true
@@ -245,7 +248,7 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 	if line == "UDP" {
 		handleUDPTunnel(tunnelConn, reader, connectionLogger.With(
 			"pool_connection", pooled, "auth_duration", authDuration, "idle_duration", idleDuration,
-			"wait_duration", time.Since(connectStarted)), startedAt, idleDuration, releaseSetup, cfg.UDPQueueConfig)
+			"wait_duration", time.Since(connectStarted)), startedAt, idleDuration, releaseSetup, cfg.UDPQueueConfig, resources...)
 		return
 	}
 
@@ -272,7 +275,7 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 	cancel()
 	if err != nil {
 		logging.Failure(requestLogger, "dial", err, "dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "setup_duration", time.Since(startedAt)-idleDuration)
-		_ = tunnel.SendERR(tunnelConn)
+		_ = tunnel.SendTargetError(tunnelConn, err)
 		return
 	}
 	defer targetConn.Close()

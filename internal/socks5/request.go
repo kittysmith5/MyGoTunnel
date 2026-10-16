@@ -27,6 +27,10 @@ func ReplyCode(err error) byte {
 	if errors.As(err, &requestErr) {
 		return requestErr.Rep
 	}
+	var coded interface{ SOCKSReplyCode() byte }
+	if errors.As(err, &coded) {
+		return coded.SOCKSReplyCode()
+	}
 	return 0x01
 }
 

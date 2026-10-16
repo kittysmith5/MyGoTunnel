@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/tunnel"
 	"net"
 	"sync"
@@ -45,6 +46,14 @@ func Reason(err error) string {
 	if err == nil {
 		return "eof"
 	}
+	var target *tunnel.TargetError
+	if errors.As(err, &target) {
+		return target.Reason()
+	}
+	var dns *net.DNSError
+	if errors.As(err, &dns) {
+		return "dns"
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout"
 	}
@@ -58,8 +67,13 @@ func Reason(err error) string {
 	switch {
 	case errors.Is(err, tunnel.ErrAuthRejected), errors.Is(err, tunnel.ErrConnectRejected):
 		return "rejected"
-	case errors.Is(err, tunnel.ErrControlLineTooLong):
+	case errors.Is(err, tunnel.ErrControlLineTooLong), errors.Is(err, datagram.ErrResourceLimit),
+		errors.Is(err, syscall.EMFILE), errors.Is(err, syscall.ENFILE), errors.Is(err, syscall.ENOBUFS), errors.Is(err, syscall.ENOMEM):
 		return "limit"
+	case errors.Is(err, syscall.ENETUNREACH), errors.Is(err, syscall.EHOSTUNREACH):
+		return "unreachable"
+	case errors.Is(err, tunnel.ErrConnectResponse):
+		return "protocol"
 	case errors.Is(err, syscall.ECONNRESET):
 		return "reset"
 	case errors.Is(err, syscall.ECONNREFUSED):

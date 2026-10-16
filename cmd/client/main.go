@@ -14,6 +14,7 @@ import (
 
 	"mygotunnel/internal/admission"
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/diagnostics"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/preconnect"
@@ -97,6 +98,8 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	resources := datagram.NewResources(cfg.ProcessLimits())
+	defer resources.Close()
 
 	ln, err := net.Listen("tcp", cfg.LocalAddr)
 	if err != nil {
@@ -140,11 +143,11 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 			ps = pool.Stats()
 			idle = ps.Idle
 		}
-		return []any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", ps.Max, "rejected", metrics.Rejected.Load(), "pool_hits", ps.Hits, "pool_misses", ps.Misses, "pool_fallbacks", ps.Fallbacks, "pool_hit_rate", ps.HitRate, "pool_target", ps.Target, "pool_filling", ps.Filling, "pool_renewed", ps.Renewed, "pool_retry", ps.Retry}
+		return append([]any{"active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", ps.Max, "rejected", metrics.Rejected.Load(), "pool_hits", ps.Hits, "pool_misses", ps.Misses, "pool_fallbacks", ps.Fallbacks, "pool_hit_rate", ps.HitRate, "pool_target", ps.Target, "pool_filling", ps.Filling, "pool_renewed", ps.Renewed, "pool_retry", ps.Retry}, logging.UDPResourceAttrs(resources)...)
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleClientContext(ctx, conn, cfg, logger, permit.Release, pool)
+		handleClientWithResources(ctx, conn, cfg, logger, permit.Release, pool, resources)
 	}, nil, metrics)
 }
 
@@ -153,6 +156,14 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Lo
 }
 
 func handleClientContext(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pools ...*preconnect.Pool) {
+	var pool *preconnect.Pool
+	if len(pools) > 0 {
+		pool = pools[0]
+	}
+	handleClientWithResources(parent, clientConn, cfg, logger, releaseSetup, pool, datagram.DefaultResources)
+}
+
+func handleClientWithResources(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pool *preconnect.Pool, resources *datagram.Resources) {
 	defer clientConn.Close()
 
 	clientAddr := clientConn.RemoteAddr().String()
@@ -195,11 +206,7 @@ func handleClientContext(parent context.Context, clientConn net.Conn, cfg *confi
 			logging.Failure(connectionLogger, "socks", err)
 			return
 		}
-		var pool *preconnect.Pool
-		if len(pools) > 0 {
-			pool = pools[0]
-		}
-		handleUDPAssociate(parent, clientConn, request, cfg, connectionLogger, startedAt, releaseSetup, pool)
+		handleUDPAssociate(parent, clientConn, request, cfg, connectionLogger, startedAt, releaseSetup, pool, resources)
 		return
 	}
 	targetAddr := net.JoinHostPort(request.Address, fmt.Sprint(request.Port))
@@ -213,17 +220,14 @@ func handleClientContext(parent context.Context, clientConn net.Conn, cfg *confi
 		return
 	}
 	socksDuration := time.Since(startedAt)
-	var pool *preconnect.Pool
-	if len(pools) > 0 {
-		pool = pools[0]
-	}
 	ctx, cancel := context.WithTimeout(parent, remoteDialTimeout+tunnel.ControlTimeout)
 	session, err := openRemote(ctx, cfg, targetAddr, pool)
 	cancel()
 	if err != nil {
 		logging.Failure(requestLogger, session.Stage, err, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "setup_duration", time.Since(startedAt))
-		code := byte(1)
-		if errors.Is(err, errTargetRejected) {
+		code := socks5.ReplyCode(err)
+		var typed *tunnel.TargetError
+		if !errors.As(err, &typed) && errors.Is(err, errTargetRejected) {
 			code = 5
 		}
 		_ = socks5.Reply(clientConn, code)

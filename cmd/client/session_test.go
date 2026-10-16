@@ -8,6 +8,8 @@ import (
 	"io"
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/preconnect"
+	"mygotunnel/internal/socks5"
+	"mygotunnel/internal/tunnel"
 	"net"
 	"path/filepath"
 	"sync/atomic"
@@ -17,7 +19,7 @@ import (
 
 func TestPreparedTransportFallbackAndExplicitRejection(t *testing.T) {
 	for _, command := range []string{"tcp", "udp"} {
-		for _, mode := range []string{"transport failure", "explicit rejection"} {
+		for _, mode := range []string{"transport failure", "explicit rejection", "TIMEOUT", "DNS", "NETWORK", "HOST", "REFUSED", "LIMIT", "CANCELED", "INTERNAL"} {
 			t.Run(command+"/"+mode, func(t *testing.T) {
 				wantCommand := "CONNECT target.test:443\n"
 				if command == "udp" {
@@ -90,8 +92,12 @@ func TestPreparedTransportFallbackAndExplicitRejection(t *testing.T) {
 						if err == nil && line != wantCommand {
 							err = io.ErrUnexpectedEOF
 						}
-						if err == nil && mode == "explicit rejection" {
-							_, err = io.WriteString(b, "ERR\n")
+						if err == nil && mode != "transport failure" {
+							response := "ERR\n"
+							if mode != "explicit rejection" {
+								response = "ERR " + mode + "\n"
+							}
+							_, err = io.WriteString(b, response)
 						}
 						peerDone <- err
 					}()
@@ -125,7 +131,13 @@ func TestPreparedTransportFallbackAndExplicitRejection(t *testing.T) {
 					t.Fatalf("pool counters: %+v", stats)
 				}
 
-				if mode == "explicit rejection" {
+				if mode != "transport failure" {
+					if mode != "explicit rejection" {
+						var target *tunnel.TargetError
+						if !errors.As(err, &target) || target.Code != mode || socks5.ReplyCode(err) != target.SOCKSReplyCode() {
+							t.Fatal("typed rejection lost", err)
+						}
+					}
 					if !errors.Is(err, errTargetRejected) || session.PoolFallback {
 						t.Fatal("explicit rejection was retried")
 					}

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"strconv"
@@ -38,12 +39,13 @@ type udpTarget struct {
 
 type udpDialFunc func(context.Context, string, string) (net.Conn, error)
 
-func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Logger, startedAt time.Time, idleDuration time.Duration, releaseSetup func(), queueConfig config.UDPQueueConfig) {
+func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Logger, startedAt time.Time, idleDuration time.Duration, releaseSetup func(), queueConfig config.UDPQueueConfig, limits ...*datagram.Resources) {
 	dialer := &net.Dialer{}
-	handleUDPTunnelWithDial(tunnelConn, reader, logger, startedAt, idleDuration, releaseSetup, queueConfig, dialer.DialContext)
+	handleUDPTunnelWithDial(tunnelConn, reader, logger, startedAt, idleDuration, releaseSetup, queueConfig, dialer.DialContext, limits...)
 }
 
-func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Logger, startedAt time.Time, idleDuration time.Duration, releaseSetup func(), queueConfig config.UDPQueueConfig, dial udpDialFunc) {
+func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Logger, startedAt time.Time, idleDuration time.Duration, releaseSetup func(), queueConfig config.UDPQueueConfig, dial udpDialFunc, limits ...*datagram.Resources) {
+	resources := datagram.SelectResources(limits)
 	replyStarted := time.Now()
 	if err := tunnel.SendOK(tunnelConn); err != nil {
 		logger.Warn("send UDP response failed", "error", err)
@@ -58,18 +60,20 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 	ctx, cancel := context.WithCancel(context.Background())
 	done := ctx.Done()
 	var stopOnce sync.Once
-	stop := func() {
+	var closeStage string
+	var closeErr error
+	stop := func(stage string, cause error) {
 		stopOnce.Do(func() {
+			closeStage, closeErr = stage, cause
 			cancel()
-			if err := tunnelConn.SetDeadline(time.Now()); err != nil {
-				_ = tunnelConn.Close()
-			}
+			tunnel.AbortDatagramConn(tunnelConn)
 		})
 	}
 	var workers sync.WaitGroup
 	maxBytes, maxAge := queueConfig.QueueLimits()
-	requests := datagram.NewQueue(udpFrameQueueSize, maxBytes, maxAge, nil)
-	responses := datagram.NewQueue(udpFrameQueueSize, maxBytes, maxAge, nil)
+	requests := datagram.NewQueue(udpFrameQueueSize, maxBytes, maxAge, nil, resources)
+	responses := datagram.NewQueue(udpFrameQueueSize, maxBytes, maxAge, nil, resources)
+	tunnelWriter := tunnel.NewDatagramWriter(tunnelConn, queueConfig.WriteTimeout())
 	// All per-target pending queues share a separate session-wide byte budget.
 	pendingBudget := datagram.NewBudget(maxBytes)
 	dnsSlots := make(chan struct{}, udpDNSConcurrency)
@@ -88,7 +92,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 		targetPeakBytes = max(targetPeakBytes, uint64(stats.PeakBytes))
 	}
 	defer func() {
-		stop()
+		stop("udp_session", nil)
 		for _, target := range targets {
 			retire(target)
 		}
@@ -96,11 +100,12 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 		requests.Close()
 		responses.Close()
 		in, out := requests.Stats(), responses.Stats()
-		logger.Info("closed", "transport", "udp",
+		logging.LogUDPResult(logger, resources, closeStage, closeErr, tunnelWriter.Stats(),
 			"upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(),
 			"dropped_requests", droppedRequests.Load(), "dropped_responses", droppedResponses.Load(),
 			"queue_full_drops", in.FullDrops+out.FullDrops+targetFull,
 			"queue_expired_drops", in.ExpiredDrops+out.ExpiredDrops+targetExpired,
+			"queue_resource_drops", in.ResourceDrops+out.ResourceDrops,
 			"request_queue_peak_bytes", in.PeakBytes, "response_queue_peak_bytes", out.PeakBytes,
 			"target_queue_peak_bytes", targetPeakBytes,
 			"expired_targets", expiredTargets, "peak_targets", peakTargets,
@@ -110,13 +115,19 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 	workers.Add(2)
 	go func() {
 		defer workers.Done()
+		frames := tunnel.NewDatagramReader(reader, resources)
 		for {
-			packet, err := tunnel.ReadDatagram(reader)
+			packet, err := frames.ReadPacket()
 			if err != nil {
-				stop()
+				if errors.Is(err, datagram.ErrResourceLimit) {
+					droppedRequests.Add(1)
+					continue
+				}
+				stop("udp_tunnel_read", err)
 				return
 			}
-			if !requests.Push(datagram.Packet{Data: packet}) {
+			if !requests.Push(packet) {
+				packet.Release()
 				droppedRequests.Add(1)
 			}
 			if ctx.Err() != nil {
@@ -126,14 +137,13 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 	}()
 	go func() {
 		defer workers.Done()
-		writer := bufio.NewWriterSize(tunnelConn, 32*1024)
+		writer := bufio.NewWriterSize(tunnelWriter, 32*1024)
 		for {
 			select {
 			case <-responses.Ready():
 				if err := tunnel.WriteDatagramQueue(writer, responses); err != nil {
 					logger.Debug("write tunneled UDP response failed", "error", err)
-					stop()
-					_ = tunnelConn.Close()
+					stop("udp_tunnel_write", err)
 					return
 				}
 			case <-done:
@@ -154,6 +164,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 			}
 			destination, payload, err := socks5.ParseUDPDatagram(frame.Data)
 			if err != nil {
+				frame.Release()
 				droppedRequests.Add(1)
 				logger.Debug("drop invalid tunneled UDP packet", "error", err)
 				continue
@@ -170,6 +181,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 			}
 			if target == nil {
 				if len(targets) >= udpTargetLimit {
+					frame.Release()
 					droppedRequests.Add(1)
 					continue
 				}
@@ -177,17 +189,26 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 				select {
 				case targetSlots <- struct{}{}:
 				default:
+					frame.Release()
+					droppedRequests.Add(1)
+					continue
+				}
+				if !resources.AcquireSocket() {
+					<-targetSlots
+					frame.Release()
 					droppedRequests.Add(1)
 					continue
 				}
 				targetCtx, targetCancel := context.WithCancel(ctx)
 				target = &udpTarget{
 					destination: destination, cancel: targetCancel,
-					pending: datagram.NewQueue(udpTargetQueueSize, min(udpTargetQueueBytes, maxBytes), maxAge, pendingBudget),
+					pending: datagram.NewQueue(udpTargetQueueSize, min(udpTargetQueueBytes, maxBytes), maxAge, pendingBudget, resources),
 				}
 				if !target.pending.Push(frame) {
+					frame.Release()
 					retire(target)
 					<-targetSlots
+					resources.ReleaseSocket()
 					droppedRequests.Add(1)
 					continue
 				}
@@ -197,12 +218,13 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 				workers.Add(1)
 				go func(targetCtx context.Context, target *udpTarget, address string) {
 					defer workers.Done()
-					defer func() { <-targetSlots }()
+					defer func() { <-targetSlots; resources.ReleaseSocket() }()
 					runUDPTarget(targetCtx, target, address, dial, dnsSlots, responses, &uploaded, &downloaded, &droppedResponses, logger)
 				}(targetCtx, target, address)
 				continue
 			}
 			if !target.pending.Push(frame) {
+				frame.Release()
 				droppedRequests.Add(1)
 			}
 		case now := <-ticker.C:
@@ -265,9 +287,12 @@ func runUDPTarget(ctx context.Context, target *udpTarget, address string, dial u
 			return
 		}
 		if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			packet.Release()
 			return
 		}
-		if _, err := conn.Write(packet.Data); err != nil {
+		_, err := conn.Write(packet.Data)
+		packet.Release()
+		if err != nil {
 			logger.Debug("write target UDP failed", "error", err)
 			return
 		}
@@ -284,7 +309,15 @@ func readUDPResponses(target *udpTarget, responses *datagram.Queue, done <-chan 
 	header := socks5.BuildUDPDatagram(target.destination, nil)
 	// Leave one extra byte to detect oversized/truncated payloads, including
 	// their SOCKS header. Build the invariant header only once per target.
-	buffer := make([]byte, tunnel.MaxDatagramSize+1)
+	resources := responses.Resources()
+	scratch, err := resources.Borrow(tunnel.MaxDatagramSize + 1)
+	if err != nil {
+		dropped.Add(1)
+		logger.Debug("UDP response buffer limit", "error", err)
+		return
+	}
+	defer scratch.Release()
+	buffer := scratch.Data
 	copy(buffer, header)
 	for {
 		n, err := target.conn.Read(buffer[len(header):])
