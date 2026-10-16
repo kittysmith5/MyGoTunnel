@@ -10,12 +10,15 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/relay"
+	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
 )
 
@@ -104,6 +107,10 @@ func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Lo
 	}
 
 	if !strings.HasPrefix(line, "CONNECT ") {
+		if line == "UDP" {
+			handleUDPTunnel(tunnelConn, reader, connectionLogger, startedAt)
+			return
+		}
 		connectionLogger.Warn("invalid tunnel command")
 		return
 	}
@@ -133,6 +140,78 @@ func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Lo
 	requestLogger.Info("tunnel established")
 	result := relay.CopyBidirectional(tunnelConn, reader, targetConn, targetConn)
 	logging.LogTunnelResult(requestLogger, result, startedAt)
+}
+
+func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Logger, startedAt time.Time) {
+	if err := tunnel.SendOK(tunnelConn); err != nil {
+		logger.Warn("send UDP response failed", "error", err)
+		return
+	}
+	var writeMu sync.Mutex
+	var socketsMu sync.Mutex
+	sockets := make(map[string]*net.UDPConn)
+	defer func() {
+		socketsMu.Lock()
+		defer socketsMu.Unlock()
+		for _, conn := range sockets {
+			_ = conn.Close()
+		}
+	}()
+	for {
+		frame, err := tunnel.ReadDatagram(reader)
+		if err != nil {
+			return
+		}
+		destination, payload, err := socks5.ParseUDPDatagram(frame)
+		if err != nil {
+			logger.Debug("drop invalid tunneled UDP packet", "error", err)
+			continue
+		}
+		address := net.JoinHostPort(destination.Host, strconv.Itoa(int(destination.Port)))
+		udpAddr, err := net.ResolveUDPAddr("udp", address)
+		if err != nil {
+			continue
+		}
+		socketsMu.Lock()
+		udpConn := sockets[address]
+		if udpConn == nil {
+			if len(sockets) >= 256 {
+				socketsMu.Unlock()
+				logger.Debug("UDP session destination limit reached")
+				continue
+			}
+			udpConn, err = net.DialUDP("udp", nil, udpAddr)
+			if err == nil {
+				sockets[address] = udpConn
+				go readUDPResponses(udpConn, destination, tunnelConn, &writeMu, logger)
+			}
+		}
+		socketsMu.Unlock()
+		if err != nil {
+			continue
+		}
+		if _, err := udpConn.Write(payload); err != nil {
+			logger.Debug("write target UDP failed", "error", err)
+		}
+	}
+}
+
+func readUDPResponses(conn *net.UDPConn, destination socks5.UDPDatagram, tunnelConn net.Conn, writeMu *sync.Mutex, logger *slog.Logger) {
+	buffer := make([]byte, tunnel.MaxDatagramSize)
+	for {
+		n, err := conn.Read(buffer)
+		if err != nil {
+			return
+		}
+		packet := socks5.BuildUDPDatagram(destination, buffer[:n])
+		writeMu.Lock()
+		err = tunnel.WriteDatagram(tunnelConn, packet)
+		writeMu.Unlock()
+		if err != nil {
+			logger.Debug("write tunneled UDP response failed", "error", err)
+			return
+		}
+	}
 }
 
 func checkAuth(conn net.Conn, reader *bufio.Reader, expectedToken string) (authErr error) {

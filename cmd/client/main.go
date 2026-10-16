@@ -5,9 +5,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"mygotunnel/internal/config"
@@ -80,17 +82,23 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Lo
 		connectionLogger.Debug("connection closed", "duration", time.Since(startedAt))
 	}()
 
-	if err := socks5.Handshake(clientConn); err != nil {
+	username, password, requireSOCKSAuth := cfg.SOCKSCredentials()
+	if err := socks5.HandshakeWithCredentials(clientConn, username, password, requireSOCKSAuth); err != nil {
 		connectionLogger.Warn("SOCKS5 handshake failed", "error", err)
 		return
 	}
 
-	targetAddr, err := socks5.ReadRequest(clientConn)
+	request, err := socks5.ReadRequestDetails(clientConn)
 	if err != nil {
 		connectionLogger.Warn("SOCKS5 request failed", "error", err)
 		_ = socks5.Reply(clientConn, 0x01)
 		return
 	}
+	if request.Command == socks5.CommandUDPAssociate {
+		handleUDPAssociate(clientConn, request, cfg, connectionLogger, startedAt)
+		return
+	}
+	targetAddr := net.JoinHostPort(request.Address, fmt.Sprint(request.Port))
 
 	requestLogger := connectionLogger.With("target_addr", targetAddr)
 	requestLogger.Debug("SOCKS5 CONNECT received")
@@ -153,4 +161,148 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Lo
 	requestLogger.Info("tunnel established", "remote_addr", cfg.RemoteAddr)
 	result := relay.CopyBidirectional(clientConn, clientConn, remoteConn, remoteReader)
 	logging.LogTunnelResult(requestLogger, result, startedAt)
+}
+
+func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time) {
+	bindIP := net.IPv4zero
+	if tcpLocal, ok := clientConn.LocalAddr().(*net.TCPAddr); ok && tcpLocal.IP.To4() == nil {
+		bindIP = net.IPv6unspecified
+	}
+	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: bindIP})
+	if err != nil {
+		logger.Warn("bind SOCKS5 UDP relay failed", "error", err)
+		_ = socks5.Reply(clientConn, 0x01)
+		return
+	}
+	defer udpConn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	remoteConn, err := utlsconn.Dial(ctx, cfg.RemoteAddr, cfg.SNI)
+	cancel()
+	if err != nil {
+		logger.Warn("dial remote uTLS server failed", "remote_addr", cfg.RemoteAddr, "error", err)
+		return
+	}
+	defer remoteConn.Close()
+	reader := bufio.NewReader(remoteConn)
+	if err := tunnel.SendAuth(remoteConn, cfg.AuthToken); err != nil {
+		logger.Warn("send authentication request failed", "error", err)
+		return
+	}
+	response, err := tunnel.ReadLine(reader)
+	if err != nil || response != "OK" {
+		logger.Warn("remote authentication failed", "error", err)
+		return
+	}
+	if err := tunnel.SendUDPAssociate(remoteConn); err != nil {
+		logger.Warn("send UDP ASSOCIATE request failed", "error", err)
+		return
+	}
+	response, err = tunnel.ReadLine(reader)
+	if err != nil || response != "OK" {
+		logger.Warn("remote UDP ASSOCIATE failed", "error", err)
+		_ = socks5.Reply(clientConn, 0x01)
+		return
+	}
+	bound := *udpConn.LocalAddr().(*net.UDPAddr)
+	if tcpLocal, ok := clientConn.LocalAddr().(*net.TCPAddr); ok {
+		bound.IP = tcpLocal.IP
+	}
+	if bound.IP == nil || bound.IP.IsUnspecified() {
+		bound.IP = net.IPv4(127, 0, 0, 1)
+	}
+	if err := socks5.ReplyBound(clientConn, 0x00, &bound); err != nil {
+		logger.Warn("send UDP ASSOCIATE response failed", "error", err)
+		return
+	}
+	logger.Info("UDP tunnel established", "remote_addr", cfg.RemoteAddr)
+
+	stop := make(chan struct{})
+	var stopOnce sync.Once
+	stopSession := func() { stopOnce.Do(func() { close(stop) }) }
+	defer stopSession()
+	go func() {
+		_, _ = io.Copy(io.Discard, clientConn)
+		stopSession()
+	}()
+	go func() {
+		<-stop
+		_ = udpConn.SetReadDeadline(time.Now())
+		_ = remoteConn.SetDeadline(time.Now())
+	}()
+
+	var clientUDP *net.UDPAddr
+	var clientUDPmu sync.Mutex
+	responses := make(chan []byte, 128)
+	remoteDone := make(chan struct{})
+	go func() {
+		defer close(remoteDone)
+		for {
+			response, err := tunnel.ReadDatagram(reader)
+			if err != nil {
+				return
+			}
+			select {
+			case responses <- response:
+			case <-stop:
+				return
+			}
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case response := <-responses:
+				clientUDPmu.Lock()
+				peer := clientUDP
+				clientUDPmu.Unlock()
+				if peer != nil {
+					_, _ = udpConn.WriteToUDP(response, peer)
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
+	packet := make([]byte, tunnel.MaxDatagramSize+1)
+	for {
+		_ = udpConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		n, source, err := udpConn.ReadFromUDP(packet)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				select {
+				case <-stop:
+					return
+				case <-remoteDone:
+					return
+				default:
+				}
+				continue
+			}
+			return
+		}
+		clientUDPmu.Lock()
+		if clientUDP == nil {
+			if request.Address != "" && request.Address != "0.0.0.0" && request.Address != "::" && source.IP.String() != request.Address {
+				logger.Warn("drop UDP packet from unexpected client address")
+				clientUDPmu.Unlock()
+				continue
+			}
+			clientUDP = source
+		}
+		if source.String() != clientUDP.String() {
+			clientUDPmu.Unlock()
+			continue
+		}
+		clientUDPmu.Unlock()
+		destination, payload, err := socks5.ParseUDPDatagram(packet[:n])
+		if err != nil {
+			logger.Debug("drop malformed SOCKS5 UDP datagram", "error", err)
+			continue
+		}
+		if err := tunnel.WriteDatagram(remoteConn, socks5.BuildUDPDatagram(destination, payload)); err != nil {
+			logger.Warn("send UDP datagram through tunnel failed", "error", err)
+			return
+		}
+	}
 }

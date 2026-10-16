@@ -1,5 +1,13 @@
 # MyGoTunnel
 
+## SOCKS5 UDP
+
+The local SOCKS5 listener supports `CONNECT` and `UDP ASSOCIATE`. Configure the existing `socks_auth` object with `username` and `password` to require SOCKS5 username/password authentication; the legacy `socks_username` and `socks_password` fields are also read. When credentials are configured, the client rejects no-auth fallback.
+
+UDP packets are relayed through the existing TLS/TCP tunnel using length-prefixed datagram frames, then sent to their destinations with UDP by the server. Keep the SOCKS5 TCP control connection open for the lifetime of a UDP association. Fragmented SOCKS5 UDP packets are dropped.
+
+Because UDP datagrams share a TCP stream, packet loss and retransmission on that stream can delay later packets. This mode improves UDP application compatibility, while latency-sensitive traffic may perform better with a future native UDP transport.
+
 ## 日志
 
 项目使用 Go 标准库 `log/slog` 输出结构化、分级日志，不需要额外的第三方日志依赖。日志写入标准错误流，默认使用 `text` 格式和 `info` 级别。

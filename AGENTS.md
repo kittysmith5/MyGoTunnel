@@ -24,7 +24,7 @@ SOCKS5 应用
 - `cmd/server`：加载服务端配置和证书、校验认证信息、连接目标地址并组织转发。
 - `internal/config`：客户端和服务端 JSON 配置结构、默认值及必填项校验。
 - `internal/logging`：基于标准库 `log/slog` 创建统一的分级、结构化日志记录器。
-- `internal/socks5`：SOCKS5 无认证握手、仅支持 TCP `CONNECT` 的请求解析和响应。
+- `internal/socks5`：SOCKS5 无认证或用户名/密码握手、TCP `CONNECT` 与 UDP `ASSOCIATE` 请求解析和响应。
 - `internal/tunnel`：`AUTH`、`CONNECT`、`OK`、`ERR` 控制消息的读写。
 - `internal/utlsconn`：使用 Chrome ClientHello 指纹建立 uTLS 客户端连接。
 - `internal/relay`：保留缓冲数据并执行带半关闭语义的双向复制。
@@ -47,7 +47,7 @@ SOCKS5 应用
 - 从控制协议切换到转发时，继续使用既有的 `bufio.Reader`。其中可能已经预读了应用数据，改回直接读取底层连接会丢数据。
 - 服务端认证比较使用常量时间比较；不要记录、回显或以普通字符串比较替代认证令牌。
 - 认证读取的 deadline 必须在结束后清除，避免影响后续连接阶段。
-- SOCKS5 当前仅支持版本 5、无认证方式和 TCP `CONNECT`，地址支持 IPv4、域名及 IPv6。不要在未同步协议、响应和测试的情况下宣称支持 UDP 或其他认证方式。
+- SOCKS5 支持版本 5、无认证或配置的用户名/密码认证，以及 TCP `CONNECT` 和 UDP `ASSOCIATE`，地址支持 IPv4、域名及 IPv6。修改时同步协议、响应、配置和测试。
 - uTLS 客户端使用 `HelloChrome_Auto`，客户端与服务端均协商 `http/1.1` ALPN。相关值属于连接兼容性的一部分。
 - `InsecureSkipVerify` 是当前实现的一部分，也是明确的安全敏感点。除非任务要求，不要顺手改变；若改变，需同时说明证书信任、SNI 和部署配置的迁移方式。
 - 保留 `relay.CopyBidirectional` 的半关闭语义：正常 EOF 后等待反向数据排空；复制或半关闭失败时解除另一方向的阻塞，并在两个复制 goroutine 都退出后返回。修改转发退出策略时要考虑一侧 EOF、仍在返回的数据、阻塞 goroutine、字节统计和连接释放。
