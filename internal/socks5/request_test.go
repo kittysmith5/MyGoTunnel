@@ -34,7 +34,7 @@ func TestReadRequest(t *testing.T) {
 		{"IPv6", append(append([]byte{5, 1, 0, 4}, net.ParseIP("::1").To16()...), 0, 80), "[::1]:80", 0},
 		{"invalid version", []byte{4, 1, 0, 1}, "", 1},
 		{"invalid reserved", []byte{5, 1, 1, 1}, "", 1},
-		{"unsupported command", []byte{5, 3, 0, 1}, "", 7},
+		{"unsupported command", []byte{5, 2, 0, 1}, "", 7},
 		{"unsupported address", []byte{5, 1, 0, 9}, "", 8},
 		{"empty domain", domain("", []byte{0, 80}), "", 8},
 		{"newline", domain("a\nCONNECT b", []byte{0, 80}), "", 8},

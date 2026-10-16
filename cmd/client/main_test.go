@@ -68,7 +68,7 @@ func TestHandleClientRejectsUnsupportedCommand(t *testing.T) {
 	if _, err := io.ReadFull(b, response); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Write([]byte{5, 3, 0, 1}); err != nil {
+	if _, err := b.Write([]byte{5, 2, 0, 1}); err != nil {
 		t.Fatal(err)
 	}
 	response = make([]byte, 10)

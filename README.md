@@ -41,6 +41,16 @@ go run ./cmd/server -export -config configs/server.json -public-addr example.com
 客户端新增 `certificate_fingerprint` 配置项：导入后使用固定证书指纹验证服务端，替代公共 CA 验证；证书变更后需重新导出、导入。没有指纹的旧配置改为使用系统 CA 及主机名验证，因此旧的自签名部署需要先导出连接码再导入。SNI 默认取远端地址中的主机名。没有新增协议消息，AUTH/CONNECT 保持不变。
 
 
+## SOCKS5 UDP
+
+SOCKS5 同时支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 经现有 TLS/TCP 隧道按长度封装，在服务端还原为 UDP；保留 TCP 控制连接。UDP 使用与 TCP 相同的证书指纹/CA 校验、认证、控制阶段超时、预连接池、连接准入和优雅退出，不额外退回跳过证书验证。普通建连可合并发送 AUTH 与 UDP，备用命中只发送 UDP。进入转发前释放 setup 名额；UDP association 仍占总连接名额。
+
+UDP 来源 IP 必须与 SOCKS TCP 对端相同。请求中非零源端口会被约束；否则第一个合法报文绑定端口。畸形报文、其他来源、分片报文与含 SOCKS 头超过 65000 字节的报文被丢弃。客户端 legacy socks_username/socks_password 仍可读取，嵌套 socks_auth 优先；认证禁止免认证降级。
+
+出错目标 socket 下次发包重建，空闲 2 分钟后回收（15 秒扫描），每会话最多 256 个目标。客户端出站/入站队列为 256/128，服务端双向各 256，满时丢包。每批最多刷新 32 个已排队帧，不额外等待。目标拨号与写入各受 5 秒期限约束，断开隧道取消目标解析/拨号并等待所有 worker。进程取消后，已建立会话继续到 grace 结束或正常断开；不会在进程取消瞬间无条件中断所有 UDP。
+
+会话日志保留 connection_id、transport=udp、资源与建连信息。client upload_datagrams 表示入隧道队列，download_datagrams 表示成功写入本地 UDP，udp_write_errors 记录写入失败，dropped_datagrams 包括来源、报文、队列和写入失败。server download_datagrams 为进入响应队列数量。UDP write 成功不保证应用收到；TCP 丢包重传仍会延迟后续数据报，不宣称原生 UDP 延迟特性。
+
 ## 日志
 
 日志使用 Go `log/slog`，写到 stderr，默认 `-log-level info -log-format text`。消息保持英文；文本采用紧凑格式，去掉重复的 `time=`、`level=`、`msg=`、`component=`。日期完整，UTC 时间精确到毫秒，启动时输出 `timezone=UTC`；`C` / `S` 分别表示客户端 / 服务端。

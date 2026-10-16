@@ -94,3 +94,10 @@ func authenticate(conn net.Conn, auth *Credentials) error {
 	_, err := conn.Write([]byte{1, 0})
 	return err
 }
+
+func HandshakeWithCredentials(conn net.Conn, username, password string, requireAuth bool) error {
+	if !requireAuth {
+		return HandshakeWithAuth(conn, nil)
+	}
+	return HandshakeWithAuth(conn, &Credentials{Username: username, Password: password})
+}

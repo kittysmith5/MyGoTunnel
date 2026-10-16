@@ -242,6 +242,13 @@ func handleTunnelContext(parent context.Context, tunnelConn net.Conn, cfg *confi
 		}
 	}
 
+	if line == "UDP" {
+		handleUDPTunnel(tunnelConn, reader, connectionLogger.With(
+			"pool_connection", pooled, "auth_duration", authDuration, "idle_duration", idleDuration,
+			"wait_duration", time.Since(connectStarted)), startedAt, idleDuration, releaseSetup)
+		return
+	}
+
 	if !strings.HasPrefix(line, "CONNECT ") {
 		connectionLogger.Warn("failed", "stage", "connect", "close_reason", "protocol")
 		return

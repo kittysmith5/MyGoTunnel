@@ -115,7 +115,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"listen_addr", cfg.LocalAddr,
 		"remote_addr", cfg.RemoteAddr,
 		"sni", cfg.SNI,
-		"socks_auth", cfg.SOCKSAuth != nil,
+		"socks_auth", cfg.SOCKSAuth != nil || cfg.SocksUsername != "" || cfg.SocksPassword != "",
 		"timezone", "UTC",
 		"max_connections", opts.maxConnections,
 		"max_setup", maxSetup,
@@ -168,20 +168,34 @@ func handleClientContext(parent context.Context, clientConn net.Conn, cfg *confi
 		return
 	}
 	var socksAuth *socks5.Credentials
-	if cfg.SOCKSAuth != nil {
-		socksAuth = &socks5.Credentials{Username: cfg.SOCKSAuth.Username, Password: cfg.SOCKSAuth.Password}
+	if username, password, enabled := cfg.SOCKSCredentials(); enabled {
+		socksAuth = &socks5.Credentials{Username: username, Password: password}
 	}
 	if err := socks5.HandshakeWithAuth(clientConn, socksAuth); err != nil {
 		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
 
-	targetAddr, err := socks5.ReadRequest(clientConn)
+	request, err := socks5.ReadRequestDetails(clientConn)
 	if err != nil {
 		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		_ = socks5.Reply(clientConn, socks5.ReplyCode(err))
 		return
 	}
+
+	if request.Command == socks5.CommandUDPAssociate {
+		if err := clientConn.SetDeadline(time.Now().Add(remoteDialTimeout + tunnel.ControlTimeout + socks5Timeout)); err != nil {
+			logging.Failure(connectionLogger, "socks", err)
+			return
+		}
+		var pool *preconnect.Pool
+		if len(pools) > 0 {
+			pool = pools[0]
+		}
+		handleUDPAssociate(parent, clientConn, request, cfg, connectionLogger, startedAt, releaseSetup, pool)
+		return
+	}
+	targetAddr := net.JoinHostPort(request.Address, fmt.Sprint(request.Port))
 
 	requestLogger := connectionLogger.With("target_addr", targetAddr)
 	requestLogger.Debug("connect")

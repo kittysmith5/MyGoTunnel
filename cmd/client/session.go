@@ -33,6 +33,14 @@ func controlDeadline(ctx context.Context) time.Time {
 	return deadline
 }
 func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, pool *preconnect.Pool) (session *remoteSession, err error) {
+	return openRemoteCommand(ctx, cfg, target, pool, false)
+}
+
+func openRemoteUDP(ctx context.Context, cfg *config.ClientConfig, pool *preconnect.Pool) (*remoteSession, error) {
+	return openRemoteCommand(ctx, cfg, "", pool, true)
+}
+
+func openRemoteCommand(ctx context.Context, cfg *config.ClientConfig, target string, pool *preconnect.Pool, udp bool) (session *remoteSession, err error) {
 	session = &remoteSession{Stage: "pool"}
 	if pool != nil {
 		start := time.Now()
@@ -46,7 +54,11 @@ func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, po
 			start = time.Now()
 			err = entry.Conn.SetDeadline(controlDeadline(ctx))
 			if err == nil {
-				err = tunnel.SendConnect(entry.Conn, target)
+				if udp {
+					err = tunnel.SendUDPAssociate(entry.Conn)
+				} else {
+					err = tunnel.SendConnect(entry.Conn, target)
+				}
 			}
 			var response string
 			if err == nil {
@@ -96,7 +108,12 @@ func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, po
 	session.Stage = "auth"
 	start := time.Now()
 	defer func() { session.ControlDuration += time.Since(start) }()
-	if err = tunnel.SendSetup(conn, cfg.AuthToken, target); err != nil {
+	if udp {
+		err = tunnel.SendUDPSetup(conn, cfg.AuthToken)
+	} else {
+		err = tunnel.SendSetup(conn, cfg.AuthToken, target)
+	}
+	if err != nil {
 		return session, err
 	}
 	reader := bufio.NewReader(conn)

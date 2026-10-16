@@ -31,10 +31,21 @@ func ReplyCode(err error) byte {
 }
 
 func ReadRequest(conn net.Conn) (string, error) {
+	request, err := ReadRequestDetails(conn)
+	if err != nil {
+		return "", err
+	}
+	if request.Command != CommandConnect {
+		return "", requestError(0x07, "only TCP CONNECT is supported")
+	}
+	return net.JoinHostPort(request.Address, strconv.Itoa(int(request.Port))), nil
+}
+
+func ReadRequestDetails(conn net.Conn) (Request, error) {
 	header := make([]byte, 4)
 
 	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", err
+		return Request{}, err
 	}
 
 	ver := header[0]
@@ -42,14 +53,14 @@ func ReadRequest(conn net.Conn) (string, error) {
 	atyp := header[3]
 
 	if ver != 0x05 {
-		return "", errors.New("invalid SOCKS version")
+		return Request{}, errors.New("invalid SOCKS version")
 	}
 
 	if header[2] != 0x00 {
-		return "", requestError(0x01, "invalid SOCKS5 reserved byte")
+		return Request{}, requestError(0x01, "invalid SOCKS5 reserved byte")
 	}
-	if cmd != 0x01 {
-		return "", requestError(0x07, "only TCP CONNECT is supported")
+	if cmd != CommandConnect && cmd != CommandUDPAssociate {
+		return Request{}, requestError(0x07, "unsupported SOCKS command")
 	}
 
 	var host string
@@ -58,53 +69,53 @@ func ReadRequest(conn net.Conn) (string, error) {
 	case 0x01:
 		addr := make([]byte, 4)
 		if _, err := io.ReadFull(conn, addr); err != nil {
-			return "", err
+			return Request{}, err
 		}
 		host = net.IP(addr).String()
 
 	case 0x03:
 		lenBuf := make([]byte, 1)
 		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			return "", err
+			return Request{}, err
 		}
 
 		hostLen := int(lenBuf[0])
 		hostBuf := make([]byte, hostLen)
 
 		if _, err := io.ReadFull(conn, hostBuf); err != nil {
-			return "", err
+			return Request{}, err
 		}
 
 		host = string(hostBuf)
 		if host == "" || strings.ContainsAny(host, ":/\\[]") {
-			return "", requestError(0x08, "invalid SOCKS5 domain")
+			return Request{}, requestError(0x08, "invalid SOCKS5 domain")
 		}
 		for _, character := range host {
 			if character < 0x20 || character == 0x7f || unicode.IsSpace(character) {
-				return "", requestError(0x08, "invalid SOCKS5 domain")
+				return Request{}, requestError(0x08, "invalid SOCKS5 domain")
 			}
 		}
 
 	case 0x04:
 		addr := make([]byte, 16)
 		if _, err := io.ReadFull(conn, addr); err != nil {
-			return "", err
+			return Request{}, err
 		}
 		host = net.IP(addr).String()
 
 	default:
-		return "", requestError(0x08, "unsupported address type")
+		return Request{}, requestError(0x08, "unsupported address type")
 	}
 
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		return "", err
+		return Request{}, err
 	}
 
 	port := binary.BigEndian.Uint16(portBuf)
-	if port == 0 {
-		return "", requestError(0x01, "invalid SOCKS5 target port")
+	if port == 0 && cmd == CommandConnect {
+		return Request{}, requestError(0x01, "invalid SOCKS5 target port")
 	}
 
-	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
+	return Request{Command: cmd, Address: host, Port: port}, nil
 }

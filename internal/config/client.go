@@ -12,6 +12,8 @@ type SOCKSAuth struct {
 }
 
 type ClientConfig struct {
+	SocksUsername          string     `json:"socks_username,omitempty"`
+	SocksPassword          string     `json:"socks_password,omitempty"`
 	SOCKSAuth              *SOCKSAuth `json:"socks_auth,omitempty"`
 	LocalAddr              string     `json:"local_addr"`
 	RemoteAddr             string     `json:"remote_addr"`
@@ -43,6 +45,9 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		return nil, fmt.Errorf("auth_token is empty")
 	}
 
+	if cfg.SOCKSAuth == nil && (cfg.SocksUsername != "" || cfg.SocksPassword != "") {
+		cfg.SOCKSAuth = &SOCKSAuth{Username: cfg.SocksUsername, Password: cfg.SocksPassword}
+	}
 	if cfg.SOCKSAuth != nil {
 		if len(cfg.SOCKSAuth.Username) < 1 || len(cfg.SOCKSAuth.Username) > 255 || len(cfg.SOCKSAuth.Password) < 1 || len(cfg.SOCKSAuth.Password) > 255 {
 			return nil, fmt.Errorf("socks_auth username and password must each be 1..255 bytes")
@@ -52,4 +57,11 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func (cfg *ClientConfig) SOCKSCredentials() (string, string, bool) {
+	if cfg.SOCKSAuth != nil {
+		return cfg.SOCKSAuth.Username, cfg.SOCKSAuth.Password, true
+	}
+	return cfg.SocksUsername, cfg.SocksPassword, cfg.SocksUsername != "" || cfg.SocksPassword != ""
 }
