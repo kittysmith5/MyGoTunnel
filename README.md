@@ -8,6 +8,8 @@ UDP packets are relayed through the existing TLS/TCP tunnel using length-prefixe
 
 Because UDP datagrams share a TCP stream, packet loss and retransmission on that stream can delay later packets. This mode improves UDP application compatibility, while latency-sensitive traffic may perform better with a future native UDP transport.
 
+Each datagram's length header and payload are written together to reduce TLS records. Up to 32 already-queued packets are batched per flush, with no delay to wait for more packets. The client uses bounded queues (256 outgoing packets, 128 incoming packets); full queues drop packets instead of accumulating stale UDP traffic. The server queues up to 256 packets per direction and reclaims destination sockets after two minutes of inactivity, checked every 15 seconds. Each association can hold at most 256 destination sockets. Session-close logs include packet and queue-drop counters; client upload/download counters count packets accepted into their queues. The wire format remains compatible with the original UDP implementation.
+
 ## 日志
 
 项目使用 Go 标准库 `log/slog` 输出结构化、分级日志，不需要额外的第三方日志依赖。日志写入标准错误流，默认使用 `text` 格式和 `info` 级别。

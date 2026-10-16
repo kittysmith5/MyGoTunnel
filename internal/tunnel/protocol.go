@@ -40,12 +40,35 @@ func WriteDatagram(w io.Writer, packet []byte) error {
 	if len(packet) == 0 || len(packet) > MaxDatagramSize {
 		return fmt.Errorf("invalid UDP datagram size %d", len(packet))
 	}
-	var size [2]byte
-	binary.BigEndian.PutUint16(size[:], uint16(len(packet)))
-	if err := writeFull(w, size[:]); err != nil {
-		return err
+	// Keep the length and payload in one write so TLS can use a single record.
+	frame := make([]byte, 2+len(packet))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(packet)))
+	copy(frame[2:], packet)
+	return writeFull(w, frame)
+}
+
+// WriteQueuedDatagrams batches only packets already queued, without waiting for
+// more traffic. A bounded batch limits both buffering and flush latency.
+func WriteQueuedDatagrams(w *bufio.Writer, first []byte, queued <-chan []byte) error {
+	packet := first
+	for i := 0; i < 32; i++ {
+		if err := WriteDatagram(w, packet); err != nil {
+			return err
+		}
+		if i == 31 {
+			break
+		}
+		select {
+		case next, ok := <-queued:
+			if !ok {
+				return w.Flush()
+			}
+			packet = next
+		default:
+			return w.Flush()
+		}
 	}
-	return writeFull(w, packet)
+	return w.Flush()
 }
 
 func writeFull(w io.Writer, data []byte) error {

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mygotunnel/internal/config"
@@ -164,6 +165,7 @@ func handleClient(clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Lo
 }
 
 func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time) {
+	const udpFrameQueueSize = 256
 	bindIP := net.IPv4zero
 	if tcpLocal, ok := clientConn.LocalAddr().(*net.TCPAddr); ok && tcpLocal.IP.To4() == nil {
 		bindIP = net.IPv6unspecified
@@ -234,7 +236,30 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 	var clientUDP *net.UDPAddr
 	var clientUDPmu sync.Mutex
 	responses := make(chan []byte, 128)
+	requests := make(chan []byte, udpFrameQueueSize)
 	remoteDone := make(chan struct{})
+	var uploaded atomic.Uint64
+	var downloaded atomic.Uint64
+	var dropped atomic.Uint64
+	defer func() {
+		logger.Info("UDP tunnel closed", "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(), "dropped_datagrams", dropped.Load(), "duration", time.Since(startedAt))
+	}()
+	go func() {
+		writer := bufio.NewWriterSize(remoteConn, 32*1024)
+		for {
+			select {
+			case packet := <-requests:
+				if err := tunnel.WriteQueuedDatagrams(writer, packet, requests); err != nil {
+					logger.Debug("send UDP datagram through tunnel failed", "error", err)
+					stopSession()
+					_ = remoteConn.Close()
+					return
+				}
+			case <-stop:
+				return
+			}
+		}
+	}()
 	go func() {
 		defer close(remoteDone)
 		for {
@@ -244,8 +269,11 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 			}
 			select {
 			case responses <- response:
+				downloaded.Add(1)
 			case <-stop:
 				return
+			default:
+				dropped.Add(1)
 			}
 		}
 	}()
@@ -281,6 +309,10 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 			}
 			return
 		}
+		if n > tunnel.MaxDatagramSize {
+			dropped.Add(1)
+			continue
+		}
 		clientUDPmu.Lock()
 		if clientUDP == nil {
 			if request.Address != "" && request.Address != "0.0.0.0" && request.Address != "::" && source.IP.String() != request.Address {
@@ -300,9 +332,13 @@ func handleUDPAssociate(clientConn net.Conn, request socks5.Request, cfg *config
 			logger.Debug("drop malformed SOCKS5 UDP datagram", "error", err)
 			continue
 		}
-		if err := tunnel.WriteDatagram(remoteConn, socks5.BuildUDPDatagram(destination, payload)); err != nil {
-			logger.Warn("send UDP datagram through tunnel failed", "error", err)
+		select {
+		case requests <- socks5.BuildUDPDatagram(destination, payload):
+			uploaded.Add(1)
+		case <-stop:
 			return
+		default:
+			dropped.Add(1)
 		}
 	}
 }

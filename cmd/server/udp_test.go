@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,6 +13,47 @@ import (
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
 )
+
+func TestUDPResponsesDropWhenQueueFull(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	sender, err := net.DialUDP("udp4", nil, conn.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	queue := make(chan []byte, 1)
+	queue <- []byte("already queued")
+	stop, finished := make(chan struct{}), make(chan struct{})
+	var received, dropped atomic.Uint64
+	target := &udpTarget{conn: conn, destination: socks5.UDPDatagram{Host: "127.0.0.1", Port: 53}}
+	go func() {
+		readUDPResponses(target, queue, stop, &received, &dropped, slog.New(slog.NewTextHandler(io.Discard, nil)))
+		close(finished)
+	}()
+	defer func() {
+		close(stop)
+		_ = conn.Close()
+		select {
+		case <-finished:
+		case <-time.After(3 * time.Second):
+			t.Error("response worker did not stop")
+		}
+	}()
+	if _, err := sender.Write([]byte("response")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for dropped.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if dropped.Load() != 1 || received.Load() != 0 || len(queue) != 1 || target.lastActivity.Load() == 0 {
+		t.Fatalf("received=%d dropped=%d queued=%d", received.Load(), dropped.Load(), len(queue))
+	}
+}
 
 func TestUDPTunnelRelaysDatagram(t *testing.T) {
 	echo, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
