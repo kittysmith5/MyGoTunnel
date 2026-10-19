@@ -46,6 +46,11 @@ func TestCompactPoolAndStats(t *testing.T) {
 		t.Fatal(got)
 	}
 	out.Reset()
+	logger.Warn("failed", "stage", "dial", "close_reason", "dns_timeout", "dns_retry_count", 1)
+	if !strings.Contains(out.String(), "reason=dns_timeout dns_retry=1") {
+		t.Fatal(out.String())
+	}
+	out.Reset()
 	logger.Info("ready", "pool_hit", false, "pool_fallback", true)
 	if !strings.Contains(out.String(), "pool=fallback") {
 		t.Fatal(out.String())

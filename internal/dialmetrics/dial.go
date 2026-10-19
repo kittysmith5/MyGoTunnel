@@ -4,15 +4,61 @@ package dialmetrics
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http/httptrace"
 	"sync"
 	"time"
 )
 
-type Timings struct{ DNS, TCP time.Duration }
+const dnsRetryDelay = 100 * time.Millisecond
+
+type Timings struct {
+	DNS, TCP   time.Duration
+	DNSRetries int
+}
 
 func Dial(ctx context.Context, dialer *net.Dialer, network, address string) (net.Conn, Timings, error) {
+	return dialWith(ctx, dialer.DialContext, network, address)
+}
+
+type dialFunc func(context.Context, string, string) (net.Conn, error)
+
+func dialWith(ctx context.Context, dial dialFunc, network, address string) (net.Conn, Timings, error) {
+	var total Timings
+	for attempt := 0; attempt < 2; attempt++ {
+		conn, timings, err := dialOnce(ctx, dial, network, address)
+		total.DNS += timings.DNS
+		total.TCP += timings.TCP
+		if err == nil {
+			return conn, total, nil
+		}
+		if attempt != 0 || !retryableDNS(err) || ctx.Err() != nil {
+			return nil, total, err
+		}
+		total.DNSRetries++
+		timer := time.NewTimer(dnsRetryDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, total, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, total, errors.New("unreachable dial retry state")
+}
+
+func retryableDNS(err error) bool {
+	var dns *net.DNSError
+	return errors.As(err, &dns) && !dns.IsNotFound && (dns.IsTimeout || dns.IsTemporary)
+}
+
+func dialOnce(ctx context.Context, dial dialFunc, network, address string) (net.Conn, Timings, error) {
 	var mu sync.Mutex
 	var dnsStart, tcpStart time.Time
 	var dns time.Duration
@@ -34,7 +80,7 @@ func Dial(ctx context.Context, dialer *net.Dialer, network, address string) (net
 			mu.Unlock()
 		},
 	}
-	conn, err := dialer.DialContext(httptrace.WithClientTrace(ctx, trace), network, address)
+	conn, err := dial(httptrace.WithClientTrace(ctx, trace), network, address)
 	now := time.Now()
 	mu.Lock()
 	result := Timings{DNS: dns}

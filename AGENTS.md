@@ -47,7 +47,7 @@ SOCKS5 应用
 - 从控制协议切换到转发时，继续使用既有的 `bufio.Reader`。其中可能已经预读了应用数据，改回直接读取底层连接会丢数据。
 - 服务端认证比较使用常量时间比较；不要记录、回显或以普通字符串比较替代认证令牌。
 - 认证读取的 deadline 必须在结束后清除，避免影响后续连接阶段。
-- SOCKS5 支持版本 5、可选 RFC 1929 用户名密码认证、TCP `CONNECT` 和 UDP `ASSOCIATE`，地址支持 IPv4、域名及 IPv6。UDP 来源必须匹配 TCP 对端 IP，先校验报文再绑定端口。
+- SOCKS5 支持版本 5、可选 RFC 1929 用户名密码认证、TCP `CONNECT` 和 UDP `ASSOCIATE`，地址支持 IPv4、域名及 IPv6。UDP 来源使用 ASSOCIATE 声明的具体地址/端口约束；全零地址回退到 TCP 对端 IP，先校验报文再绑定来源端口。
 - uTLS 客户端使用固定 `HelloChrome_133` 基线并适配 ALPN，客户端与服务端均协商 `http/1.1` ALPN。相关值属于连接兼容性的一部分。
 - 有导入指纹时，`InsecureSkipVerify` 仅用于替代公共 CA 验证，必须同时通过 `VerifyPeerCertificate` 校验固定证书指纹；没有指纹时使用系统 CA 和主机名验证。修改时同步说明证书信任、SNI 和部署迁移。
 - 旧预连接协议为AUTH → OK → PREPARE → READY → CONNECT（或UDP）→ OK；新连接可协商PREPARE ACK / READY ACK，命令后先ACK再原OK/ERR。只有本连接成功协商才启用ACK，旧流程不发送额外ACK。原有普通流程继续兼容。备用连接有独立数量/闲置限制，取用后不得回池；后台读取必须在交接前停止。
@@ -167,7 +167,7 @@ go build ./cmd/...
 
 每 30 秒 stats 新增：JSON `pool_hits/pool_misses/pool_fallbacks/pool_hit_rate/pool_target/pool_filling`，文本 `hit/miss/fallbacks/hit_pct/pool_target/filling`。hit/miss 统计启动以来的 Take 调用结果；命中指有效备用连接成功交接，不代表目标拨号成功；命中后传输错误转普通建连时同时增加 fallback。百分比为 100*hit/(hit+miss)，无请求为 0；禁用池时这些计数为 0，不将普通连接计为 miss。计数快照加锁，不改变流量和重试语义。
 
-服务端 ready 与拨号失败日志增加 `dns_duration`（text: dns）及 `target_tcp_duration`（text: target_tcp），原 `target_dial_duration`（dial）继续表示 DNS+TCP 总拨号墙钟耗时。通过标准库 httptrace 的网络事件观察 net.Dialer，不自行解析再顺序拨 IP，保留标准解析器、IPv4/IPv6 并行回退及原 deadline。IP 字面量 dns=0；TCP 从首次地址尝试到拨号返回，包含双栈回退等待，不能把并发尝试分别相加。DNS 时间包含系统解析器处理，不能当作纯公网 DNS RTT；两个子阶段之和与总耗时可有调度开销差异。不引入 DNS 缓存或修改双栈策略。
+服务端 ready 与拨号失败日志包含 `dns_duration`（text: dns）、`target_tcp_duration`（text: target_tcp）、`dns_retry_count`（text: dns_retry）及 `target_dial_duration`（dial，DNS+TCP总墙钟耗时）。通过标准库 httptrace 观察 net.Dialer，不自行解析再顺序拨 IP，保留系统解析器和IPv4/IPv6并行回退。临时 DNS 错误或 DNS 超时最多重试一次，等待100ms并受原连接 deadline 约束；NXDOMAIN 不重试。日志 close_reason 对 DNS 区分 dns_not_found、dns_timeout、dns_temporary 和其他 dns。各次尝试的 DNS/TCP 时间累加；IP字面量dns=0。TCP从首次地址尝试到拨号返回，包含双栈回退等待，不能把并发尝试分别相加。DNS时间包含系统解析器处理，不能当作纯公网DNS RTT；两个子阶段之和与总耗时可有调度开销差异。不引入DNS缓存。
 
 ## 大流量吞吐基准
 

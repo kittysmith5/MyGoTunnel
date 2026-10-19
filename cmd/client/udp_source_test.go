@@ -13,30 +13,28 @@ import (
 	"mygotunnel/internal/socks5"
 )
 
-func TestValidateUDPAssociateSource(t *testing.T) {
+func TestResolveUDPAssociateSource(t *testing.T) {
 	for _, tc := range []struct {
 		name, source, peer string
+		wantIPs            []string
 		addresses          []net.IPAddr
 		lookupErr          error
 		rep                byte
 		lookups            int
 	}{
-		{name: "empty wildcard", peer: "127.0.0.1"},
-		{name: "IPv4 wildcard", source: "0.0.0.0", peer: "127.0.0.1"},
-		{name: "IPv6 wildcard", source: "::", peer: "::1"},
-		{name: "explicit IPv4", source: "127.0.0.1", peer: "127.0.0.1"},
-		{name: "explicit IPv6", source: "0:0:0:0:0:0:0:1", peer: "::1"},
-		{name: "mapped IPv4", source: "::ffff:127.0.0.1", peer: "127.0.0.1"},
-		{name: "different IP", source: "127.0.0.2", peer: "127.0.0.1", rep: 2},
-		{name: "domain IPv4", source: "localhost", peer: "127.0.0.1", addresses: []net.IPAddr{{IP: net.ParseIP("::1")}, {IP: net.ParseIP("127.0.0.1")}}, lookups: 1},
-		{name: "domain IPv6", source: "localhost", peer: "::1", addresses: []net.IPAddr{{IP: net.ParseIP("::1")}}, lookups: 1},
-		{name: "domain mismatch", source: "other.test", peer: "127.0.0.1", addresses: []net.IPAddr{{IP: net.ParseIP("127.0.0.2")}}, rep: 2, lookups: 1},
+		{name: "empty wildcard uses TCP peer", peer: "127.0.0.1", wantIPs: []string{"127.0.0.1"}},
+		{name: "IPv4 wildcard uses TCP peer", source: "0.0.0.0", peer: "127.0.0.1", wantIPs: []string{"127.0.0.1"}},
+		{name: "IPv6 wildcard uses TCP peer", source: "::", peer: "::1", wantIPs: []string{"::1"}},
+		{name: "explicit IPv4 may differ from TCP peer", source: "127.0.0.2", peer: "127.0.0.1", wantIPs: []string{"127.0.0.2"}},
+		{name: "explicit IPv6", source: "0:0:0:0:0:0:0:1", peer: "::2", wantIPs: []string{"::1"}},
+		{name: "mapped IPv4", source: "::ffff:127.0.0.1", peer: "127.0.0.2", wantIPs: []string{"127.0.0.1"}},
+		{name: "domain resolves expected UDP endpoints", source: "source.test", peer: "127.0.0.1", wantIPs: []string{"::1", "127.0.0.2"}, addresses: []net.IPAddr{{IP: net.ParseIP("::1")}, {IP: net.ParseIP("127.0.0.2")}}, lookups: 1},
 		{name: "empty resolution", source: "missing.test", peer: "127.0.0.1", rep: 2, lookups: 1},
 		{name: "DNS failure", source: "missing.test", peer: "127.0.0.1", lookupErr: &net.DNSError{Err: "no such host", IsNotFound: true}, rep: 4, lookups: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
-			rep, err := validateUDPAssociateSource(context.Background(), tc.source, net.ParseIP(tc.peer), func(_ context.Context, host string) ([]net.IPAddr, error) {
+			allowed, rep, err := resolveUDPAssociateSource(context.Background(), tc.source, net.ParseIP(tc.peer), func(_ context.Context, host string) ([]net.IPAddr, error) {
 				calls++
 				if host != tc.source {
 					t.Errorf("resolved %q instead of source %q", host, tc.source)
@@ -46,6 +44,14 @@ func TestValidateUDPAssociateSource(t *testing.T) {
 			if rep != tc.rep || (err != nil) != (tc.rep != 0) || calls != tc.lookups {
 				t.Fatalf("rep=%d error=%v lookups=%d; want rep=%d lookups=%d", rep, err, calls, tc.rep, tc.lookups)
 			}
+			if len(allowed) != len(tc.wantIPs) {
+				t.Fatalf("allowed source IPs = %v, want %v", allowed, tc.wantIPs)
+			}
+			for i, want := range tc.wantIPs {
+				if !allowed[i].Equal(net.ParseIP(want)) {
+					t.Fatalf("allowed source IP %d = %v, want %s", i, allowed[i], want)
+				}
+			}
 		})
 	}
 }
@@ -54,7 +60,7 @@ func TestUDPAssociateSourceLookupHonorsCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	rep, err := validateUDPAssociateSource(ctx, "source.test", net.ParseIP("127.0.0.1"), func(lookupCtx context.Context, _ string) ([]net.IPAddr, error) {
+	_, rep, err := resolveUDPAssociateSource(ctx, "source.test", net.ParseIP("127.0.0.1"), func(lookupCtx context.Context, _ string) ([]net.IPAddr, error) {
 		<-lookupCtx.Done()
 		return nil, lookupCtx.Err()
 	})
@@ -63,7 +69,7 @@ func TestUDPAssociateSourceLookupHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestUDPAssociationSourceDomainIsResolvedOnceAndKeepsTCPPeerRestriction(t *testing.T) {
+func TestUDPAssociationUsesDeclaredSourceDomainAndResolvesItOnce(t *testing.T) {
 	var calls atomic.Int32
 	session := newUDPAssociationTestReply(t, socks5.Request{Command: 3, Address: "localhost"}, 0, func(ctx context.Context, host string) ([]net.IPAddr, error) {
 		calls.Add(1)
@@ -74,17 +80,17 @@ func TestUDPAssociationSourceDomainIsResolvedOnceAndKeepsTCPPeerRestriction(t *t
 		if !ok || time.Until(deadline) > socks5Timeout || time.Until(deadline) <= 0 {
 			t.Errorf("source lookup has no bounded setup deadline: %v", deadline)
 		}
-		return []net.IPAddr{{IP: net.ParseIP("127.0.0.2")}, {IP: net.ParseIP("127.0.0.1")}}, nil
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.2")}}, nil
 	})
-	foreign := testUDPSocket(t, "127.0.0.2")
-	sender := testUDPSocket(t, "127.0.0.1")
+	foreign := testUDPSocket(t, "127.0.0.3")
+	sender := testUDPSocket(t, "127.0.0.2")
 	packet := socks5.BuildUDPDatagram(socks5.UDPDatagram{Host: "target.test", Port: 53}, nil)
 	if _, err := foreign.WriteToUDP(packet, session.relay); err != nil {
 		t.Fatal(err)
 	}
 	_ = foreign.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 	if _, _, err := foreign.ReadFromUDP(make([]byte, 100)); err == nil {
-		t.Fatal("source domain authorized an address other than TCP peer")
+		t.Fatal("source domain authorized an address outside its resolved endpoint set")
 	}
 	for _, payload := range [][]byte{nil, []byte("domain target")} {
 		packet = socks5.BuildUDPDatagram(socks5.UDPDatagram{Host: "target.test", Port: 53}, payload)
@@ -110,8 +116,6 @@ func TestUDPAssociationRejectsSourceBeforeOpeningRemote(t *testing.T) {
 		lookupErr    error
 		rep          byte
 	}{
-		{name: "domain mismatch", source: "other.test", addresses: []net.IPAddr{{IP: net.ParseIP("127.0.0.2")}}, rep: 2},
-		{name: "IP mismatch", source: "127.0.0.2", rep: 2},
 		{name: "DNS failure", source: "missing.test", lookupErr: &net.DNSError{Err: "no such host", IsNotFound: true}, rep: 4},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

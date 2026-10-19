@@ -45,7 +45,7 @@ go run ./cmd/server -export -config configs/server.json -public-addr example.com
 
 SOCKS5 同时支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 经现有 TLS/TCP 隧道按长度封装，在服务端还原为 UDP；保留 TCP 控制连接。UDP 使用与 TCP 相同的证书指纹/CA 校验、认证、控制阶段超时、预连接池、连接准入和优雅退出，不额外退回跳过证书验证。普通建连可合并发送 AUTH 与 UDP，备用命中只发送 UDP。进入转发前释放 setup 名额；UDP association 仍占总连接名额。
 
-UDP 来源 IP 必须与 SOCKS TCP 对端相同。ASSOCIATE 声明源域名时，在成功回复前解析一次（最长5秒，计入总setup预算），结果须包含TCP对端IP；不匹配返回REP=2，解析失败返回REP=4。后续仍只接受TCP对端IP，不按每包解析源域名。请求中非零源端口会被约束；否则第一个合法报文绑定端口。空目标域名、控制字符/地址分隔符、目标端口0、畸形报文、其他来源、分片报文与含 SOCKS 头超过 65000 字节的报文均在绑定来源端口前丢弃；ASSOCIATE源端口0及零长度UDP负载保留。客户端 legacy socks_username/socks_password 仍可读取，嵌套 socks_auth 优先；认证禁止免认证降级。
+UDP ASSOCIATE 声明的来源地址和端口用于限制客户端 UDP 数据报来源。全零/空地址表示客户端尚不知道 UDP 端点，此时使用 SOCKS TCP 对端 IP；具体 IP 或域名则只接受该 IP（域名在成功回复前解析一次，最长5秒），不要求它与 TCP 对端相同，以兼容 TCP 与 UDP 走不同 NAT 映射的客户端。域名解析失败返回 REP=4，域名无可用地址返回 REP=2。非零来源端口会被约束；端口为0时，第一个合法数据报固定来源端口，关联期间不允许切换来源。来源校验和 SOCKS 报文校验通过后才绑定端口；空目标域名、控制字符/地址分隔符、目标端口0、畸形报文、未声明来源、分片报文与含 SOCKS 头超过 65000 字节的报文均丢弃；ASSOCIATE 源端口0及零长度UDP负载保留。客户端 legacy socks_username/socks_password 仍可读取，嵌套 socks_auth 优先；认证禁止免认证降级。
 
 出错目标 socket 下次发包重建，空闲 2 分钟后回收（15 秒扫描），每会话最多 256 个目标 worker，退出中的 worker 也占名额。各目标独立解析和发送，慢目标不会阻塞其他目标的分发；域名初始化并发最多 16，数字 IP 不占 DNS 名额。同一目标初始化期间复用待发送队列，保持该目标的发送顺序。目标拨号（包括等待 DNS 名额）与写入各受 5 秒期限约束，断开隧道取消解析、关闭目标 socket 并等待所有 worker。进程取消后，已建立会话继续到 grace 结束或正常断开；不会在进程取消瞬间无条件中断所有 UDP。
 
@@ -199,7 +199,7 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 
 每 30 秒 stats 新增：JSON `pool_hits/pool_misses/pool_fallbacks/pool_hit_rate/pool_target/pool_filling`，文本 `hit/miss/fallbacks/hit_pct/pool_target/filling`。hit/miss 统计启动以来的 Take 调用结果；命中指有效备用连接成功交接，不代表目标拨号成功；命中后传输错误转普通建连时同时增加 fallback。百分比为 100*hit/(hit+miss)，无请求为 0；禁用池时这些计数为 0，不将普通连接计为 miss。计数快照加锁，不改变流量和重试语义。
 
-服务端 ready 与拨号失败日志增加 `dns_duration`（text: dns）及 `target_tcp_duration`（text: target_tcp），原 `target_dial_duration`（dial）继续表示 DNS+TCP 总拨号墙钟耗时。通过标准库 httptrace 的网络事件观察 net.Dialer，不自行解析再顺序拨 IP，保留标准解析器、IPv4/IPv6 并行回退及原 deadline。IP 字面量 dns=0；TCP 从首次地址尝试到拨号返回，包含双栈回退等待，不能把并发尝试分别相加。DNS 时间包含系统解析器处理，不能当作纯公网 DNS RTT；两个子阶段之和与总耗时可有调度开销差异。不引入 DNS 缓存或修改双栈策略。
+服务端 ready 与拨号失败日志增加 `dns_duration`（text: dns）、`target_tcp_duration`（text: target_tcp）及 `dns_retry_count`（text: dns_retry）；`target_dial_duration`（dial）继续表示 DNS+TCP 总拨号墙钟耗时。通过标准库 httptrace 观察 net.Dialer，不自行解析再顺序拨 IP，保留系统解析器、IPv4/IPv6 并行回退和原连接期限。临时 DNS 错误或 DNS 超时最多重试一次，等待100ms，且必须受同一连接 deadline 约束；NXDOMAIN 不重试。DNS 失败日志区分 `dns_not_found`、`dns_timeout`、`dns_temporary` 和其他 `dns`。各次尝试的 DNS/TCP 时间累加；IP 字面量 dns=0。TCP 时间覆盖拨号地址尝试及双栈回退，不把并发尝试分别相加。DNS 时间包括系统解析器处理，不代表纯公网 DNS RTT；分项之和与总时间可能有调度开销差异。不引入 DNS 缓存。
 
 ## 大流量吞吐基准
 

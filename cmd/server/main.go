@@ -323,7 +323,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 	targetDuration := time.Since(targetStarted)
 	cancel()
 	if err != nil {
-		logging.Failure(requestLogger, "dial", err, "dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "setup_duration", time.Since(startedAt)-idleDuration)
+		logging.Failure(requestLogger, "dial", err, "dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "dns_retry_count", dialTimings.DNSRetries, "setup_duration", time.Since(startedAt)-idleDuration)
 		if replyErr := tunnel.SendTargetResult(tunnelConn, err); replyErr != nil {
 			logging.Failure(requestLogger, "reply", replyErr)
 		}
@@ -347,7 +347,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 		"auth_duration", authDuration,
 		"idle_duration", idleDuration,
 		"wait_duration", waitDuration,
-		"dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration,
+		"dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "dns_retry_count", dialTimings.DNSRetries,
 		"reply_duration", time.Since(replyStarted),
 		"connect_duration", time.Since(connectStarted),
 		"setup_duration", time.Since(startedAt)-idleDuration)

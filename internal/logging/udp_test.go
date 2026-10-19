@@ -88,3 +88,21 @@ func TestTypedTargetReasonsPrecedeGenericRejection(t *testing.T) {
 		t.Fatal("new classifications missing")
 	}
 }
+
+func TestDNSFailureReasonsAreActionable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *net.DNSError
+		want string
+	}{
+		{name: "not found", err: &net.DNSError{Err: "no such host", IsNotFound: true}, want: "dns_not_found"},
+		{name: "timeout", err: &net.DNSError{Err: "i/o timeout", IsTimeout: true}, want: "dns_timeout"},
+		{name: "temporary", err: &net.DNSError{Err: "server misbehaving", IsTemporary: true}, want: "dns_temporary"},
+		{name: "other", err: &net.DNSError{Err: "resolver error"}, want: "dns"},
+	}
+	for _, tc := range tests {
+		if got := Reason(tc.err); got != tc.want {
+			t.Errorf("Reason(%s) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

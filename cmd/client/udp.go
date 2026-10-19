@@ -21,28 +21,50 @@ import (
 
 type udpSourceLookup func(context.Context, string) ([]net.IPAddr, error)
 
-// A source domain is a declaration of the UDP sender, not a destination to
-// resolve for every packet. Authorize it once, then keep the TCP peer IP rule.
-func validateUDPAssociateSource(ctx context.Context, source string, peer net.IP, lookup udpSourceLookup) (byte, error) {
+// resolveUDPAssociateSource interprets the UDP ASSOCIATE address as the
+// client's expected UDP source. An unspecified address means the client did
+// not know its UDP endpoint when it created the association, so use the TCP
+// control peer as the fallback. Resolve domains once, before accepting packets.
+func resolveUDPAssociateSource(ctx context.Context, source string, peer net.IP, lookup udpSourceLookup) ([]net.IP, byte, error) {
+	fallback := func() ([]net.IP, byte, error) {
+		if len(peer) == 0 {
+			return nil, 0x01, errors.New("SOCKS5 UDP control peer has no IP address")
+		}
+		return []net.IP{append(net.IP(nil), peer...)}, 0, nil
+	}
 	if source == "" {
-		return 0, nil
+		return fallback()
 	}
 	if ip := net.ParseIP(source); ip != nil {
-		if ip.IsUnspecified() || ip.Equal(peer) {
-			return 0, nil
+		if ip.IsUnspecified() {
+			return fallback()
 		}
-		return 0x02, errors.New("SOCKS5 UDP source does not match TCP peer")
+		return []net.IP{ip}, 0, nil
 	}
 	addresses, err := lookup(ctx, source)
 	if err != nil {
-		return 0x04, fmt.Errorf("resolve SOCKS5 UDP source: %w", err)
+		return nil, 0x04, fmt.Errorf("resolve SOCKS5 UDP source: %w", err)
 	}
+	allowed := make([]net.IP, 0, len(addresses))
 	for _, address := range addresses {
-		if address.IP.Equal(peer) {
-			return 0, nil
+		if len(address.IP) == 0 || address.IP.IsUnspecified() || address.IP.IsMulticast() {
+			continue
+		}
+		duplicate := false
+		for _, existing := range allowed {
+			if existing.Equal(address.IP) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			allowed = append(allowed, append(net.IP(nil), address.IP...))
 		}
 	}
-	return 0x02, errors.New("SOCKS5 UDP source domain does not include TCP peer")
+	if len(allowed) == 0 {
+		return nil, 0x02, errors.New("SOCKS5 UDP source domain resolved to no usable addresses")
+	}
+	return allowed, 0, nil
 }
 
 func handleUDPAssociate(parent context.Context, clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time, releaseSetup func(), pool *preconnect.Pool, limits ...*datagram.Resources) {
@@ -61,7 +83,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	ctx, cancel := context.WithTimeout(parent, remoteSetupTimeout)
 	defer cancel()
 	resolveCtx, resolveCancel := context.WithTimeout(ctx, socks5Timeout)
-	rep, err := validateUDPAssociateSource(resolveCtx, request.Address, tcpPeer.IP, lookup)
+	allowedSources, rep, err := resolveUDPAssociateSource(resolveCtx, request.Address, tcpPeer.IP, lookup)
 	resolveCancel()
 	if err != nil {
 		logging.Failure(logger, "udp_source", err)
@@ -261,8 +283,14 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 			dropped.Add(1)
 			continue
 		}
-		if !source.IP.Equal(tcpPeer.IP) ||
-			(request.Port != 0 && source.Port != int(request.Port)) {
+		allowedSource := false
+		for _, allowed := range allowedSources {
+			if source.IP.Equal(allowed) {
+				allowedSource = true
+				break
+			}
+		}
+		if !allowedSource || (request.Port != 0 && source.Port != int(request.Port)) {
 			dropped.Add(1)
 			continue
 		}

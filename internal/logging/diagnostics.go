@@ -52,6 +52,15 @@ func Reason(err error) string {
 	}
 	var dns *net.DNSError
 	if errors.As(err, &dns) {
+		if dns.IsNotFound {
+			return "dns_not_found"
+		}
+		if dns.IsTimeout {
+			return "dns_timeout"
+		}
+		if dns.IsTemporary {
+			return "dns_temporary"
+		}
 		return "dns"
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
