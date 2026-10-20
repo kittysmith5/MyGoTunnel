@@ -117,7 +117,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 		return
 	}
 	defer udpConn.Close()
-	scratch, err := resources.Borrow(tunnel.MaxDatagramSize + 1)
+	scratch, err := resources.BorrowResident(tunnel.MaxDatagramSize + 1)
 	if err != nil {
 		logging.Failure(logger, "udp_bind", err)
 		_ = socks5.Reply(clientConn, 0x01)

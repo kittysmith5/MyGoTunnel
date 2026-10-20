@@ -151,22 +151,10 @@ func transferWithOptions(socks, target string, size int64, o options) error {
 		if e = negotiate(c, o.Auth); e != nil {
 			return e
 		}
-		host, port, e := net.SplitHostPort(target)
+		req, e := buildConnectRequest(target)
 		if e != nil {
 			return e
 		}
-		if len(host) == 0 || len(host) > 255 {
-			return fmt.Errorf("invalid host")
-		}
-		p, e := net.LookupPort("tcp", port)
-		if e != nil {
-			return e
-		}
-		if p < 1 {
-			return fmt.Errorf("invalid port")
-		}
-		req := append([]byte{5, 1, 0, 3, byte(len(host))}, host...)
-		req = binary.BigEndian.AppendUint16(req, uint16(p))
 		if e = writeAll(c, req); e != nil {
 			return e
 		}

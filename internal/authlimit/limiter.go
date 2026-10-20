@@ -10,6 +10,7 @@ import (
 )
 
 var ErrLimited = errors.New("authentication rate limited")
+var ErrRejected = errors.New("authentication credentials rejected")
 
 type entry struct {
 	start, blockedUntil, last time.Time
@@ -25,7 +26,7 @@ type Limiter struct {
 	now                  func() time.Time
 }
 
-// New creates a bounded sliding-window failure limiter. The map is capped; when
+// New creates a bounded failure-window limiter. The map is capped; when
 // full it evicts expired entries then rejects unknown peers until capacity returns.
 func New(maxEntries, failures int, window, block time.Duration) *Limiter {
 	if maxEntries < 1 {
@@ -59,7 +60,35 @@ func PeerKey(addr net.Addr) string {
 func (l *Limiter) Allow(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.allow(key, l.now())
+}
+
+// Authenticate commits a completed credential comparison atomically with the
+// current limit check. Call only after reading and validating the entire
+// authentication request; incomplete or malformed requests are not failures.
+// A blocked peer cannot use an earlier in-flight request to clear its block,
+// and concurrent mismatches cannot race ahead of the failure threshold.
+func (l *Limiter) Authenticate(key string, matched bool) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	now := l.now()
+	if !l.allow(key, now) {
+		return ErrLimited
+	}
+	if matched {
+		delete(l.entries, key)
+		return nil
+	}
+	// allow and failure share this lock, so another peer cannot consume the
+	// available map entry between the fail-closed check and recording failure.
+	if !l.failure(key, now) {
+		l.limited.Add(1)
+		return ErrLimited
+	}
+	return ErrRejected
+}
+
+func (l *Limiter) allow(key string, now time.Time) bool {
 	e, ok := l.entries[key]
 	if !ok {
 		if len(l.entries) >= l.maxEntries {
@@ -90,7 +119,10 @@ func (l *Limiter) Allow(key string) bool {
 func (l *Limiter) Failure(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := l.now()
+	return l.failure(key, l.now())
+}
+
+func (l *Limiter) failure(key string, now time.Time) bool {
 	e, ok := l.entries[key]
 	if !ok {
 		if len(l.entries) >= l.maxEntries {

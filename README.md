@@ -67,6 +67,10 @@ SOCKS5 同时支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 经现有 TLS/TCP 隧道
 
 客户端出站/入站队列为 256/128 包，服务端收发各 256 包；每队列默认还限制 1 MiB 数据，入队和出队都会丢弃等待满 250 ms 的旧报文，再按容量决定是否接收新包。服务端每目标待发送队列最多 32 包、64 KiB UDP 负载，所有目标待发送队列另共享 1 MiB 负载预算，不能随目标数量无限扩张。目标初始化等待计入队列年龄，转入目标队列不会重置年龄。每批最多刷新 32 个已排队帧，不等待凑批。缓冲写入直接复用 bufio 帧头空间，不再为每个包复制整帧；客户端本地入队、服务端响应入队在容量不足时不复制负载。
 
+服务端共享目标队列预算不足时，会有界清理其他目标队列中的过期包，再尝试入队，避免慢 DNS 目标继续用已过期的包占住健康目标的预算。清理不取消拨号、不重置报文年龄，也不为每包创建定时器。
+
+清理仅在预算不足且到达已知最早过期时间时扫描每会话最多256个目标；`target_queue_expiry_sweeps` 记录此类扫描次数，供检查压力回收开销。
+
 客户端、服务端 JSON 均可独立设置以下本地策略，不进入连接码；缺省或 0 使用默认值。旧配置无需修改：
 
 ```json
@@ -79,11 +83,13 @@ SOCKS5 同时支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 经现有 TLS/TCP 隧道
 }
 ```
 
-`udp_queue_max_bytes` 范围 65000～67108864，同时控制各方向队列与服务端共享目标预算；目标单队列仍受 64 KiB 限制。`udp_queue_max_age_ms` 范围 1～60000，可根据业务容忍度调高。年龄只在应用入队/出队时检查，不是网络 RTT 或送达期限，不能清除 TLS/TCP/内核已接收的积压；慢 DNS 期间超过年龄的待发送包同样会丢弃。队列和 worker 元数据、帧头、读缓冲及在途包不计入负载预算，不能把 1 MiB 当作整个关联的内存上限。
+`udp_queue_max_bytes` 范围 65000～67108864，同时控制各方向队列与服务端共享目标预算；目标单队列仍受 64 KiB 限制。`udp_queue_max_age_ms` 范围 1～60000，可根据业务容忍度调高。年龄在应用队列操作和共享预算压力回收时检查，不是网络 RTT 或送达期限，不能清除 TLS/TCP/内核已接收的积压；慢 DNS 期间超过年龄的待发送包同样会丢弃。队列和 worker 元数据、帧头、读缓冲及在途包不计入负载预算，不能把 1 MiB 当作整个关联的内存上限。
 
 两端每次 UDP 隧道 TLS Write 使用独立的 `udp_write_timeout_ms`，默认 5000ms，非零范围 1～600000；空闲时不计时，不限制读取。它与 250ms 队列年龄分开。超时或写错误会终止整个 UDP association、关闭底层连接并等待 worker 退出；不能跳过部分写出的帧继续复用该 TLS 流，应用需重建 association。它限制本地 Write 阻塞，不保证对端已收到，也不消除 TCP 重传的队头等待。TCP CONNECT 转发的期限和半关闭语义不变。
 
 每个进程共享 `udp_max_sockets`（默认1024，非零1～65536）和 `udp_memory_limit_bytes`（默认64MiB，非零262144～1073741824字节）。socket 预算包括客户端 UDP relay 和服务端初始化/转发/退出中的目标；各进程独立计数。内存预算按512、2048、8192、32768、65536字节分级缓冲的实际容量计费，包含活跃帧、在途帧、目标/客户端接收缓冲及缓存空闲帧；内存不足先驱逐空闲缓存。帧读取器复用长度前缀，包所有权随队列传递，在消费、拒绝、过期和退出时回收；每个尺寸最多缓存16块。上限不是整个进程RSS，TLS/bufio、队列/worker元数据和内核socket缓冲仍在其外。目标仍保留约65KB接收缓冲，但总量受进程预算约束。
+
+两端的常驻接收缓冲另受准入约束：常驻在用容量最多为进程内存预算减128KiB，留出两个65536字节帧缓冲的处理空间。常驻缓冲用满时拒绝新增关联/目标，已有关联仍可申请瞬态报文；256KiB最小配置最多容纳两个常驻65536字节缓冲。释放后的常驻缓冲可转为普通空闲缓存复用，缓存和在途包仍计入原总预算。该余量防止空闲关联/目标占满全部内存，不保证高并发队列负载下永不发生资源丢弃。
 
 客户端 relay 创建时资源不足会拒绝 association；服务端新增目标超限时丢弃相应包。读取隧道帧遇到内存不足会消费并丢弃完整帧，保持后续流对齐；预算释放后可继续处理。上述三个新字段均为本地策略，不进入连接码，0/缺省使用默认值。
 
@@ -94,6 +100,8 @@ SOCKS5 同时支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 经现有 TLS/TCP 隧道
 UDP 结束记录首个根因的 `stage` / `close_reason`，包括 udp_control、udp_read、udp_tunnel_read、udp_tunnel_write。正常 EOF 为 INFO closed，超时/重置/截断为 WARN failed；人为关闭其他 worker 产生的次生错误不会覆盖根因。结束记录 `udp_tunnel_write_calls/errors/timeouts` 及 `udp_tunnel_write_max_duration`（text毫秒、JSON纳秒），后者包含成功或失败的底层写调用；`queue_resource_drops` 为队列复制时的进程内存拒绝。
 
 每30秒 stats 增加 `udp_sockets/udp_max_sockets`、`udp_buffer_bytes/udp_cached_bytes/udp_buffer_peak_bytes/udp_memory_limit_bytes`、`udp_socket_rejected/udp_memory_rejected`、`udp_sessions_closed/udp_session_errors/udp_tunnel_write_failures/udp_write_timeouts`。最后两项只累计以隧道写失败/写超时为根因结束的会话，不计人为打断产生的次生错误；会话内 write errors/timeouts 则统计写调用。拒绝数是资源申请次数，不能直接当应用丢包率。
+
+资源 stats 另含 `udp_resident_bytes`、`udp_resident_limit_bytes`、`udp_transient_reserve_bytes`、`udp_resident_rejected`，分别为常驻在用容量、常驻上限、为瞬态保留的容量及常驻申请拒绝次数；常驻拒绝也是 `udp_memory_rejected` 的子集，不能相加。
 
 `udp_end_eof/timeout/reset/truncated/canceled/closed/error` 按首个根终止原因互斥累计已建立会话，之和为 `udp_sessions_closed`；error归并其他原因。setup阶段拒绝不计入这些结束计数。
 
@@ -234,6 +242,8 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 ./bench -socks 127.0.0.1:1080 -target 127.0.0.1:18081 -mib 32 -streams 4
 ```
 
+`-target` 支持域名、IPv4 和带方括号的 IPv6（如 `[::1]:18081`），分别按 SOCKS 域名、IPv4、IPv6 地址类型编码。IPv6 zone 无法通过 SOCKS 地址字段表达，显式拒绝此类目标。
+
 每流上传指定 MiB 并完整回传，发送与接收并发，使用 64 KiB 数据块，不缓存整份文件；校验字节数及 SHA-256，并验证上传半关闭后下载可排空。每流总期限 5 分钟。JSON 输出 seconds（包含 SOCKS/隧道建连）、payload_mib_per_second（单份有效载荷/总时间）、bidirectional_mib_per_second（上传+回传字节/总时间）、failures。非零失败退出码为 1，失败样本的速率不可用于比较。MiB/s 乘 8.388608 为 Mbps；这是双向回声基准，不是独立的单向下载带宽测量。建议相同机器、流量与时段预热后重复 3 次报告中位数；结合 CPU、内存、GC、丢包判断瓶颈，不能以一次基准承诺优化百分比。测试后停止 echo 进程，不在公网开放无认证回声服务。
 
 2026-10-14 UTC 工作树基准（各一轮，非优化前后对比）：
@@ -270,6 +280,8 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 ```
 
 配置后仅选择 SOCKS5 方法 0x02，执行 RFC 1929 认证；即使应用同时提供免认证方法也不得降级。无此项或为 null 时保留免认证。用户名、密码均必须为 1～255 字节，缺失或超长拒绝启动。认证与 SOCKS 请求沿用现有共用 5 秒期限，失败在读取 CONNECT/取用预连接/拨号远端之前返回；日志不得出现用户名、密码或认证原始报文。启动仅记录 socks_auth=true/false。凭据比较使用固定长度 SHA-256 摘要及常量时间比较，不记录摘要。
+
+存在 `previous_socks_auth` 时必须同时提供有效的当前 `socks_auth` 或兼容旧字段，否则拒绝配置，避免轮换时漏掉主项意外启用免认证。
 
 SOCKS 认证仅属于客户端本地配置，不导出到 mygotunnel 连接码，也不改变服务端 token/指纹/隧道协议。配置文件应为 0600。RFC 1929 不加密用户名密码，应结合现有局域网或虚拟内网及防火墙使用；无需修改监听地址或访问规则。测试必须覆盖分段读取、正确/错误凭据、无认证降级拒绝、畸形/截断报文和配置校验。
 
@@ -331,6 +343,8 @@ SOCKS 认证仅属于客户端本地配置，不导出到 mygotunnel 连接码�
 
 转发正常 EOF 仍发送半关闭并等待反向数据排空；复制失败时跳过该方向 CloseWrite，立即向协调方报告根错误并中断双向读写，再等待两个复制任务退出。保持原错误方向、字节计数及既有 bufio.Reader。正常运行期间没有新增通用空闲超时或半关闭排空超时。
 
+TCP 建连期间，客户端和服务端借用同一个 bufio.Reader 监测入口硬读错误（如 RST），及时取消远端/目标拨号并释放 setup 名额。监测只预读至已有有界缓冲的容量，交接前打断、等待监测退出并恢复读期限；提前到达的负载交给后续转发。FIN/EOF 保留合法上传半关闭，不视为取消；若提前负载填满缓冲则停止监测，剩余错误由正常转发或原建连期限发现。
+
 验证覆盖慢握手期间继续补充、慢 worker 与失败窗口并存时恢复、共享退避、错误路径跳过关闭通知、取消后继续传输与自然排空、期限到达后强制关闭并回收 handler/计数。历史双机性能数据属于此前版本，本轮不得据此宣称吞吐提升。
 
 ### 发布与运维（Linux/systemd）
@@ -367,7 +381,7 @@ systemd 服务，保留配置、凭据与启动参数。升级校验哈希、版
 记录 RSS、FD、TCP 连接数、重启次数、stats 中活跃连接/UDP 资源、建连失败率与建连 P95/P99。
 分位数来自成功 ready 的 setup_duration，含 SOCKS 前端等待，按 1ms 向上取整，超过 60s
 记录为 60001；不是应用 RTT。建连、转发复制、半关闭失败分别记录，按连接 ID 去重；
-`auth_failed` 单列，`failure_rate` 含认证阶段失败，`proxy_failure_rate` 排除认证阶段失败，不代表只包含真实用户流量。预连接后台错误无连接 ID 不计入。活跃连接与完成历史分别保留最多10万项，完成记录不会挤出长连接；活跃表超限会累计 `tracking_gaps`。
+`auth_failed` 单列，`failure_rate` 含认证阶段失败，`proxy_failure_rate` 排除认证阶段失败，不代表只包含真实用户流量。SOCKS RFC1929 失败以 `auth_rejected`、`auth_limited`、`auth_protocol` 明确归类，观察器也识别这些原因；其他 `stage=socks` 的协议协商、请求读取和超时不整体排除。预连接后台错误无连接 ID 不计入。活跃连接与完成历史分别保留最多10万项，完成记录不会挤出长连接；活跃表超限会累计 `tracking_gaps`。
 单次最多读取2万条 journal，达到上限累计 `journal_batches_limited`，采集异常累计 `collection_errors`。任一覆盖缺口都会持续使 `data_complete=false`，后续安静批次不会清除该标记；`finished` 仅表示到达计划时间，`complete` 还要求数据完整。保留基线/峰值/末值辅助判断增长，
 需要完整观察窗口与负载背景才能认定泄漏；低流量时分位数不代表高负载体验。
 
@@ -378,6 +392,7 @@ systemd 服务，保留配置、凭据与启动参数。升级校验哈希、版
 
 客户端和服务端对 RFC 1929 密码或隧道 token 的**实际不匹配**计数；超时、断包和畸形握手分开记录，
 不消耗错误密码额度。每个来源 IP 默认 60 秒内允许 5 次错误，第 5 次后封 60 秒；成功认证清除该来源记录。
+读取完整凭据后，当前封禁/容量判定与成功清除或失败登记在同一把锁下完成，预先打开的慢握手不能继续使用封禁前的许可；SOCKS 和服务端 token 都遵守此规则。
 记录最多 4096 项，到上限时先清理过期项，仍满则暂时拒绝未记录的新来源，避免攻击者用大量源地址耗尽内存。
 这会影响同一公网出口共享 IP 的用户，因此生产应观察 `auth_rate_limited` 和认证失败日志；当前限制按 IP，不能区分同一 NAT 后的用户。
 TLS 握手在 AUTH 前完成，来源限速无法避免所有握手 CPU 消耗，仍由连接/并发上限控制资源。

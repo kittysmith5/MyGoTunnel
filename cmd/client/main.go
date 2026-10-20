@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -22,6 +23,7 @@ import (
 	"mygotunnel/internal/operations"
 	"mygotunnel/internal/preconnect"
 	"mygotunnel/internal/relay"
+	"mygotunnel/internal/setupwatch"
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
 )
@@ -243,13 +245,22 @@ func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn 
 	requestLogger.Debug("connect")
 
 	// Bound the eventual SOCKS5 reply while remote setup runs.
-	if err := clientConn.SetDeadline(time.Now().Add(remoteSetupTimeout + socks5Timeout)); err != nil {
+	setupDeadline := time.Now().Add(remoteSetupTimeout + socks5Timeout)
+	if err := clientConn.SetDeadline(setupDeadline); err != nil {
 		logging.Failure(requestLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
 	socksDuration := time.Since(startedAt)
 	ctx, cancel := context.WithTimeout(parent, remoteSetupTimeout)
+	clientReader := bufio.NewReader(clientConn)
+	watch := setupwatch.Start(clientConn, clientReader, cancel)
 	session, err := openRemote(ctx, cfg, targetAddr, pool)
+	if watchErr := watch.Stop(setupDeadline); watchErr != nil {
+		if session.Conn != nil {
+			closeUnusedRemote(session.Conn)
+		}
+		err = watchErr
+	}
 	cancel()
 	if err != nil {
 		logging.Failure(requestLogger, session.Stage, err, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "pool_ack_duration", session.AckDuration, "tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "setup_duration", time.Since(startedAt))
@@ -288,6 +299,6 @@ func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn 
 		"pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
 		"setup_duration", time.Since(startedAt))
-	result := relay.CopyBidirectional(clientConn, clientConn, remoteConn, remoteReader)
+	result := relay.CopyBidirectional(clientConn, clientReader, remoteConn, remoteReader)
 	logging.LogTunnelResult(requestLogger, result, startedAt)
 }

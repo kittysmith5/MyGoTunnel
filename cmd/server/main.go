@@ -27,6 +27,7 @@ import (
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/operations"
 	"mygotunnel/internal/relay"
+	"mygotunnel/internal/setupwatch"
 	"mygotunnel/internal/tunnel"
 )
 
@@ -317,9 +318,16 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 	}
 
 	ctx, cancel := context.WithDeadline(parent, connectDeadline)
+	watch := setupwatch.Start(tunnelConn, reader, cancel)
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	targetStarted := time.Now()
 	targetConn, dialTimings, err := dialmetrics.Dial(ctx, dialer, "tcp", targetAddr)
+	if watchErr := watch.Stop(connectDeadline); watchErr != nil {
+		if targetConn != nil {
+			_ = targetConn.Close()
+		}
+		err = watchErr
+	}
 	targetDuration := time.Since(targetStarted)
 	cancel()
 	if err != nil {
@@ -395,9 +403,6 @@ func checkAuthTokenProvider(conn net.Conn, reader *bufio.Reader, tokenProvider f
 	if !strings.HasPrefix(line, "AUTH ") {
 		return rejectAuth(conn, errors.New("invalid authentication command"))
 	}
-	if limiter != nil && !limiter.Allow(peerKey) {
-		return rejectAuth(conn, authlimit.ErrLimited)
-	}
 	expectedTokens := tokenProvider()
 
 	clientToken := strings.TrimSpace(strings.TrimPrefix(line, "AUTH "))
@@ -408,14 +413,13 @@ func checkAuthTokenProvider(conn net.Conn, reader *bufio.Reader, tokenProvider f
 		expected := sha256.Sum256([]byte(token))
 		matched |= subtle.ConstantTimeCompare(actual[:], expected[:])
 	}
-	if matched != 1 {
-		if limiter != nil {
-			limiter.Failure(peerKey)
-		}
-		return rejectAuth(conn, errors.New("authentication token mismatch"))
-	}
 	if limiter != nil {
-		limiter.Success(peerKey)
+		if err := limiter.Authenticate(peerKey, matched == 1); errors.Is(err, authlimit.ErrLimited) {
+			return rejectAuth(conn, err)
+		}
+	}
+	if matched != 1 {
+		return rejectAuth(conn, errors.New("authentication token mismatch"))
 	}
 
 	if err := tunnel.SendOK(conn); err != nil {

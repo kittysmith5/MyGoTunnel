@@ -1,0 +1,5 @@
+{"connection_id":"mismatch","msg":"failed","stage":"socks","close_reason":"auth_rejected"}
+{"connection_id":"limited","msg":"failed","stage":"socks","close_reason":"auth_limited"}
+{"connection_id":"auth-protocol","msg":"failed","stage":"socks","close_reason":"auth_protocol"}
+{"connection_id":"auth-method","msg":"failed","stage":"socks","close_reason":"auth_protocol"}
+{"connection_id":"request-protocol","msg":"failed","stage":"socks","close_reason":"error"}

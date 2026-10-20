@@ -54,6 +54,7 @@ SOCKS5 应用
 - `-max-connections` 限制接受连接总数；备用等待时释放 setup permit，CONNECT 前必须重新申请。
 - `-max-setup` 限制正在建连的请求，成功进入转发前释放，失败返回也必须释放；不要让长连接占用建连额度。
 - 保留 `relay.CopyBidirectional` 的半关闭语义：正常 EOF 后等待反向数据排空；复制或半关闭失败时解除另一方向的阻塞，并在两个复制 goroutine 都退出后返回。修改转发退出策略时要考虑一侧 EOF、仍在返回的数据、阻塞 goroutine、字节统计和连接释放。
+- setupwatch 仅在 TCP setup 期间独占同一个 bufio.Reader，预读至其既有容量；非 EOF 硬读错误取消子 context，FIN 保留半关闭。交接前必须 Stop 并等待退出，检查/恢复读期限，提前负载不得丢弃；缓冲满则停止监测，不能无限缓存或承诺覆盖该边界之后的 RST。
 
 ## 配置约定
 
@@ -153,6 +154,7 @@ go build ./cmd/...
 - text 阶段短名为 socks/sfirst/smethod/sauth/sreq/tcp/tls/take/ctl/auth/wait/dial/reply/idle/total，展示毫秒，最多 3 位小数。SOCKS 子阶段分别为首字节、方法协商、RFC 1929、请求读取，均含前端等待；JSON 对应 socks_first_byte_duration、socks_method_duration、socks_auth_duration、socks_request_duration，失败时未进入的握手子阶段为 0，尚未读取请求则无 sreq，不记录凭据。JSON 长字段定义见 README。服务端 total 排除 idle，但仍包含准备阶段 auth；连接生命周期 duration/dur 包含 idle。已预热池命中时 text 可省略零值 tcp/tls，JSON 保留。
 - failed 必须包含 stage 与 close_reason/reason；常见系统错误完整链进入 DEBUG，未知错误在 WARN 保留诊断信息。只有真正正常 EOF 才作为 INFO closed，不能把所有 reset/timeout 静默吞掉。
 - 转发失败 failure_phase（text phase）区分 copy 与 half_close，保留根方向；ENOTCONN 分类 closed 仍为 WARN failed，不吞错或更改正常排空语义。
+- SOCKS RFC1929 错误以 auth_rejected/auth_limited/auth_protocol 分类，观察器据固定原因识别认证，不能把所有 stage=socks 都排除。用户名密码、摘要和原始握手仍不得写日志。
 - 资源状态每 30 秒一条 stats，active 统计 accepted 总数，setup 统计 permit 占用，idle 统计备用，rejected 是准入拒绝累计；计数使用原子操作，Permit Release/TryAcquire 同步更新，监听流程退出时停止并等待定时器。不要用日志计数改变任何连接、认证、超时、重试或半关闭行为。
 - 修改日志需覆盖毫秒与时区、短字段、英文事件、双向字节、ID 关联、根失败方向、分组属性、并发写入、错误详略、资源计数与定时器停止，并同步 README 和本文件。
 - pool_ack_duration（text ack）为协商后命令发送至即时ACK的Duration，JSON纳秒/text毫秒；不含ACK后的目标等待，未协商为0，失败时保留已等待值。它属于control_duration子阶段，不能再与control相加。
@@ -272,6 +274,10 @@ UDP TLS写期限独立于队列年龄，默认每次底层Write最多5秒，空�
 
 UDP池化Packet为单所有者：Push成功转交所有权，失败仍由调用者Release；出队消费后、队列过期/关闭时必须Release，不能保留已释放Data切片。进程预算包含512～65536分级缓冲容量、空闲缓存、在途帧和65KB接收缓冲，缓存每级最多16块，预算紧张先驱逐空闲缓存；不宣称限制RSS或覆盖TLS/内核/元数据。Socket预算覆盖初始化与退出中的目标。帧读取资源拒绝时先丢弃完整帧保持流对齐，后续仍可恢复。queue_resource_drops统计复制入队时的资源拒绝。测试需覆盖并发预算、缓存驱逐、最大65000帧、零热路径读取分配、拒绝后帧对齐、跨关联共享限制和关闭后归还。
 
+常驻接收 scratch 必须用 BorrowResident，活跃常驻容量最多 limit−2×65536，不能绕过进程总预算或把普通缓存永久算常驻。Release 时撤销常驻占用后可进入普通缓存，关闭和复用仍保持单所有者。资源日志补 udp_resident_bytes/resident_limit_bytes/transient_reserve_bytes/resident_rejected；resident_rejected 为 memory_rejected 子集。预留只防止常驻占满，不承诺所有瞬态并发都成功。
+
+服务端 pendingBudget 压力下先有界清理各目标过期队列再尝试入队，不能只清理当前队列使慢 DNS 旧包一直占共享预算；不能每包创建 timer 或无条件全表扫描，保留原年龄、负载预算和 packet 所有权。
+
 进程终止原因计数udp_end_eof/timeout/reset/truncated/canceled/closed/error互斥，之和为udp_sessions_closed，只统计已经进入UDP转发的会话；不得把setup拒绝或次生错误重复计入。
 
 目标错误仅发送ERR白名单TIMEOUT/DNS/NETWORK/HOST/REFUSED/LIMIT/CANCELED/INTERNAL，不能传原始错误文本。新客户端兼容旧ERR，旧客户端非OK处理兼容新ERR；AUTH与PREPARE BUSY保持原响应。目标错误日志优先保留具体分类，SOCKS NETWORK=3，TIMEOUT/DNS/HOST=4，REFUSED=5，其余=1，不能把普通超时映射TTL expired=6。显式错误（含未知码的协议错误）不能触发备用传输回退。修改需覆盖普通/池命中、TCP/UDP的错误解析和SOCKS回复、新旧响应兼容。
@@ -302,6 +308,10 @@ scripts/observe.py 被动采集最多72小时，指标为成功建连耗时分�
 ## 认证限速与发布签名
 
 认证错误按peer IP有界计数；只计真实凭据不匹配，不把超时/截断算密码错误。锁表上限必须明确采用fail-closed策略，日志不可包含凭据。凭据过渡最多保留一个到期时间明确的旧项，constant-time比较，过期后新建会话不得授权；不要改动旧AUTH wire format。发布bundle由Ed25519签名，升级先验证root本地信任公钥、签名、平台和哈希，再停服务；不信任bundle自带公钥。
+
+previous_socks_auth 非空时必须有有效当前 SOCKS 凭据，漏主项配置必须 fail-closed，仍兼容显式无认证和旧字段。两端认证在完整读凭据后，用同一次 authlimit 原子操作完成当前许可判定及成功/失败更新，不能读前快照或让并发 Allow/Failure 分离绕过封禁。
+
+bench CONNECT 根据字面量使用 IPv4/IPv6 ATYP，域名仍为 domain ATYP；IPv6 zone 无法在线上 SOCKS 地址表示，应明确拒绝，不能编码成含冒号的域名。测试应通过实际 SOCKS 请求解析、回声和半关闭验证 IPv6 目标，不能只比对构造字节。
 
 SOCKS 凭据 provider 在方法选择和完整读取凭据后的实际比较前分别取值，过期旧项不能因等待握手被继续接受。DNS 重试的总预算在 Dial 入口固定，父 context、Dialer.Timeout、Dialer.Deadline 取最早期限；退避与所有尝试共享，DNSRetries 只计实际开始的重试。
 

@@ -72,7 +72,7 @@ class Aggregator:
    self.relay_failed+=1; self.relay_reasons[reason]+=1
   else:
    self.setup_failed+=1; self.setup_stages[stage]+=1; self.setup_reasons[reason]+=1
-   if stage=='auth': self.auth_failed+=1
+   if stage=='auth' or (stage=='socks' and reason in ('auth_rejected','auth_limited','auth_protocol')): self.auth_failed+=1
  def snapshot(self):
   attempts=self.ready+self.setup_failed; proxy_attempts=attempts-self.auth_failed
   return dict(ready=self.ready,setup_failed=self.setup_failed,auth_failed=self.auth_failed,relay_failed=self.relay_failed,shutdown_failed=self.shutdown_failed,

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"mygotunnel/internal/datagram"
+	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
 	"net"
 	"sync"
@@ -45,6 +46,14 @@ func fmtID(n uint64) string {
 func Reason(err error) string {
 	if err == nil {
 		return "eof"
+	}
+	switch {
+	case errors.Is(err, socks5.ErrAuthRejected):
+		return "auth_rejected"
+	case errors.Is(err, socks5.ErrAuthLimited):
+		return "auth_limited"
+	case errors.Is(err, socks5.ErrAuthProtocol):
+		return "auth_protocol"
 	}
 	var target *tunnel.TargetError
 	if errors.As(err, &target) {

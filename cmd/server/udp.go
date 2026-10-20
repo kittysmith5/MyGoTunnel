@@ -88,6 +88,30 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 	var targetFull, targetExpired, targetPeakBytes uint64
 	var expiredTargets uint64
 	peakTargets := 0
+	var nextPendingExpiry time.Time
+	var pendingExpirySweeps uint64
+	pushPending := func(target *udpTarget, packet datagram.Packet) bool {
+		now := time.Now()
+		if !pendingBudget.CanFit(len(packet.Data)) && !nextPendingExpiry.IsZero() && !now.Before(nextPendingExpiry) {
+			// Only scan under shared-budget pressure after a known queue expiry.
+			// Fresh full queues therefore do not cause a full scan per packet.
+			nextPendingExpiry = time.Time{}
+			pendingExpirySweeps++
+			for _, other := range targets {
+				if next := other.pending.Expire(now); !next.IsZero() && (nextPendingExpiry.IsZero() || next.Before(nextPendingExpiry)) {
+					nextPendingExpiry = next
+				}
+			}
+		}
+		if !target.pending.Push(packet) {
+			return false
+		}
+		expires := packet.At.Add(maxAge)
+		if nextPendingExpiry.IsZero() || expires.Before(nextPendingExpiry) {
+			nextPendingExpiry = expires
+		}
+		return true
+	}
 	retire := func(target *udpTarget) {
 		target.cancel()
 		target.pending.Close()
@@ -128,6 +152,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 			"queue_resource_drops", in.ResourceDrops+out.ResourceDrops,
 			"request_queue_peak_bytes", in.PeakBytes, "response_queue_peak_bytes", out.PeakBytes,
 			"target_queue_peak_bytes", targetPeakBytes,
+			"target_queue_expiry_sweeps", pendingExpirySweeps,
 			"expired_targets", expiredTargets, "peak_targets", peakTargets,
 			"duration", time.Since(startedAt))
 	}()
@@ -234,7 +259,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 					destination: destination, cancel: targetCancel,
 					pending: datagram.NewQueue(udpTargetQueueSize, min(udpTargetQueueBytes, maxBytes), maxAge, pendingBudget, resources),
 				}
-				if !target.pending.Push(frame) {
+				if !pushPending(target, frame) {
 					frame.Release()
 					retire(target)
 					<-targetSlots
@@ -253,7 +278,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 				}(targetCtx, target, address)
 				continue
 			}
-			if !target.pending.Push(frame) {
+			if !pushPending(target, frame) {
 				frame.Release()
 				droppedRequests.Add(1)
 			}
@@ -343,7 +368,7 @@ func readUDPResponses(target *udpTarget, responses *datagram.Queue, done <-chan 
 	// Leave one extra byte to detect oversized/truncated payloads, including
 	// their SOCKS header. Build the invariant header only once per target.
 	resources := responses.Resources()
-	scratch, err := resources.Borrow(tunnel.MaxDatagramSize + 1)
+	scratch, err := resources.BorrowResident(tunnel.MaxDatagramSize + 1)
 	if err != nil {
 		dropped.Add(1)
 		logger.Debug("UDP response buffer limit", "error", err)

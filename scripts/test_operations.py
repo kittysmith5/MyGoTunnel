@@ -162,4 +162,23 @@ class ObservationCoverageTest(unittest.TestCase):
   self.assertEqual(row['auth_failed'],1);self.assertEqual(row['setup_failed'],2);self.assertEqual(row['relay_failed'],1)
   self.assertEqual(row['proxy_failure_rate'],0.5)
 
+ def test_real_socks_auth_log_contract_separates_auth_and_request_failures(self):
+  # The Go client test validates these exact fields against real handshakes.
+  m=load('observe');a=m.Aggregator()
+  fixture=pathlib.Path(__file__).resolve().parent.parent/'internal/logging/testdata/socks_auth_events.jsonl'
+  for event in fixture.read_text().splitlines():a.consume(event)
+  a.consume('2026-10-20 00:00:00.000 INFO C ready id=healthy total=10ms')
+  row=a.snapshot()
+  self.assertEqual(row['auth_failed'],4)
+  self.assertEqual(row['setup_failed'],5)
+  self.assertEqual(row['failure_rate'],5/6)
+  self.assertEqual(row['proxy_failure_rate'],0.5)
+  self.assertEqual(row['setup_failures_by_reason'],{'auth_rejected':1,'auth_limited':1,'auth_protocol':2,'error':1})
+  # Compact logs must use the same classification and retain generic SOCKS errors.
+  b=m.Aggregator()
+  for index,reason in enumerate(('auth_rejected','auth_limited','auth_protocol','timeout','error')):
+   b.consume('2026-10-20 00:00:00.000 WARN C failed id=sample'+str(index)+' stage=socks reason='+reason)
+  self.assertEqual(b.snapshot()['auth_failed'],3)
+  self.assertEqual(b.snapshot()['setup_failed'],5)
+
 if __name__=='__main__': unittest.main()

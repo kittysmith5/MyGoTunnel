@@ -9,6 +9,10 @@ const (
 	DefaultMaxSockets  = 1024
 	DefaultMemoryLimit = 64 << 20
 	cachePerClass      = 16
+	// Resident buffers must leave room for one maximum-sized incoming frame and
+	// one response copy. This is process-wide progress headroom, not a per-session
+	// reservation or a promise that every concurrent packet can be admitted.
+	TransientReserveBytes = 2 * 65536
 )
 
 var ErrResourceLimit = errors.New("UDP process resource limit")
@@ -20,9 +24,10 @@ var DefaultResources = NewResources(DefaultMaxSockets, DefaultMemoryLimit)
 var bufferSizes = [...]int{512, 2048, 8192, 32768, 65536}
 
 type buffer struct {
-	data  []byte
-	owner *Resources
-	class int
+	data     []byte
+	owner    *Resources
+	class    int
+	resident bool
 }
 
 // Resources bounds UDP socket reservations and managed buffer capacities,
@@ -31,9 +36,11 @@ type Resources struct {
 	mu                                                  sync.Mutex
 	maxSockets, limit                                   int
 	sockets, bytes, cached, peak                        int
+	resident, residentLimit                             int
 	free                                                [len(bufferSizes)][]*buffer
 	closed                                              bool
 	socketRejected, memoryRejected                      uint64
+	residentRejected                                    uint64
 	sessions, sessionErrors, writeErrors, writeTimeouts uint64
 	ends                                                TerminationStats
 }
@@ -42,7 +49,9 @@ type TerminationStats struct{ EOF, Timeout, Reset, Truncated, Canceled, Closed, 
 
 type ResourceStats struct {
 	Sockets, MaxSockets, BufferBytes, CachedBytes, PeakBytes, MemoryLimit int
+	ResidentBytes, ResidentLimit, TransientReserve                        int
 	SocketRejected, MemoryRejected                                        uint64
+	ResidentRejected                                                      uint64
 	Sessions, SessionErrors, WriteErrors, WriteTimeouts                   uint64
 	Terminations                                                          TerminationStats
 }
@@ -51,7 +60,7 @@ func NewResources(sockets, bytes int) *Resources {
 	if sockets <= 0 || bytes <= 0 {
 		panic("invalid UDP process limits")
 	}
-	r := &Resources{maxSockets: sockets, limit: bytes}
+	r := &Resources{maxSockets: sockets, limit: bytes, residentLimit: max(0, bytes-TransientReserveBytes)}
 	for i := range r.free {
 		r.free[i] = make([]*buffer, 0, cachePerClass)
 	}
@@ -85,6 +94,17 @@ func (r *Resources) ReleaseSocket() {
 // Borrow returns a single-owner packet. Release it on rejection, expiration,
 // consumption or shutdown; a successful queue Push transfers that obligation.
 func (r *Resources) Borrow(n int) (Packet, error) {
+	return r.borrow(n, false)
+}
+
+// BorrowResident admits a long-lived receive scratch buffer without allowing
+// idle sockets to consume the transient frame headroom. Released resident
+// buffers join the same bounded cache and may be reused for either purpose.
+func (r *Resources) BorrowResident(n int) (Packet, error) {
+	return r.borrow(n, true)
+}
+
+func (r *Resources) borrow(n int, resident bool) (Packet, error) {
 	class := 0
 	for class < len(bufferSizes) && n > bufferSizes[class] {
 		class++
@@ -93,8 +113,12 @@ func (r *Resources) Borrow(n int) (Packet, error) {
 		return Packet{}, ErrResourceLimit
 	}
 	r.mu.Lock()
-	if r.closed {
+	size := bufferSizes[class]
+	if r.closed || (resident && size > r.residentLimit-r.resident) {
 		r.memoryRejected++
+		if resident {
+			r.residentRejected++
+		}
 		r.mu.Unlock()
 		return Packet{}, ErrResourceLimit
 	}
@@ -104,28 +128,41 @@ func (r *Resources) Borrow(n int) (Packet, error) {
 		free[len(free)-1] = nil
 		r.free[class] = free[:len(free)-1]
 		r.cached -= len(b.data)
+		b.resident = resident
+		if resident {
+			r.resident += size
+		}
 		r.mu.Unlock()
 		return Packet{Data: b.data[:n], buffer: b}, nil
 	}
-	size := bufferSizes[class]
 	if size > r.limit-r.bytes {
 		r.evictLocked()
 	}
 	if size > r.limit-r.bytes {
 		r.memoryRejected++
+		if resident {
+			r.residentRejected++
+		}
 		r.mu.Unlock()
 		return Packet{}, ErrResourceLimit
 	}
 	r.bytes += size
+	if resident {
+		r.resident += size
+	}
 	r.peak = max(r.peak, r.bytes)
 	r.mu.Unlock()
-	b := &buffer{data: make([]byte, size), owner: r, class: class}
+	b := &buffer{data: make([]byte, size), owner: r, class: class, resident: resident}
 	return Packet{Data: b.data[:n], buffer: b}, nil
 }
 
 func (r *Resources) release(b *buffer) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if b.resident {
+		r.resident -= len(b.data)
+		b.resident = false
+	}
 	if !r.closed && len(r.free[b.class]) < cachePerClass {
 		r.free[b.class] = append(r.free[b.class], b)
 		r.cached += len(b.data)
@@ -188,5 +225,6 @@ func (r *Resources) Stats() ResourceStats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return ResourceStats{Sockets: r.sockets, MaxSockets: r.maxSockets, BufferBytes: r.bytes, CachedBytes: r.cached, PeakBytes: r.peak, MemoryLimit: r.limit,
+		ResidentBytes: r.resident, ResidentLimit: r.residentLimit, TransientReserve: min(r.limit, TransientReserveBytes), ResidentRejected: r.residentRejected,
 		SocketRejected: r.socketRejected, MemoryRejected: r.memoryRejected, Sessions: r.sessions, SessionErrors: r.sessionErrors, WriteErrors: r.writeErrors, WriteTimeouts: r.writeTimeouts, Terminations: r.ends}
 }

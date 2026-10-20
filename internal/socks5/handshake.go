@@ -15,6 +15,7 @@ type Credentials struct{ Username, Password string }
 
 var ErrAuthRejected = errors.New("SOCKS5 authentication rejected")
 var ErrAuthLimited = errors.New("SOCKS5 authentication rate limited")
+var ErrAuthProtocol = errors.New("invalid SOCKS5 authentication protocol")
 
 func Handshake(conn net.Conn) error { return HandshakeWithAuth(conn, nil) }
 
@@ -115,25 +116,27 @@ func HandshakeWithCredentialProvider(conn net.Conn, provider func() []*Credentia
 	if _, err := conn.Write([]byte{0x05, 0xff}); err != nil {
 		return timings, err
 	}
+	if authEnabled {
+		return timings, ErrAuthProtocol
+	}
 	return timings, errors.New("no supported SOCKS5 authentication method")
 }
 
 // RFC 1929 authentication is bounded by the caller's SOCKS setup deadline.
 func authenticate(conn net.Conn, provider func() []*Credentials, limiter *authlimit.Limiter) error {
 	peer := authlimit.PeerKey(conn.RemoteAddr())
-	allowed := limiter == nil || limiter.Allow(peer)
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(conn, header); err != nil {
 		return err
 	}
-	reject := func() error {
+	reject := func(reason error) error {
 		if _, err := conn.Write([]byte{1, 1}); err != nil {
-			return err
+			return errors.Join(reason, err)
 		}
-		return ErrAuthRejected
+		return reason
 	}
 	if header[0] != 1 || header[1] == 0 {
-		return reject()
+		return reject(ErrAuthProtocol)
 	}
 	username := make([]byte, int(header[1]))
 	if _, err := io.ReadFull(conn, username); err != nil {
@@ -143,15 +146,11 @@ func authenticate(conn net.Conn, provider func() []*Credentials, limiter *authli
 		return err
 	}
 	if header[0] == 0 {
-		return reject()
+		return reject(ErrAuthProtocol)
 	}
 	password := make([]byte, int(header[0]))
 	if _, err := io.ReadFull(conn, password); err != nil {
 		return err
-	}
-	if !allowed {
-		_, _ = conn.Write([]byte{1, 1})
-		return ErrAuthLimited
 	}
 	// Fixed-size digests avoid length-dependent credential comparisons.
 	actualUser, actualPass := sha256.Sum256(username), sha256.Sum256(password)
@@ -163,14 +162,13 @@ func authenticate(conn net.Conn, provider func() []*Credentials, limiter *authli
 		expectedUser, expectedPass := sha256.Sum256([]byte(auth.Username)), sha256.Sum256([]byte(auth.Password))
 		matched |= subtle.ConstantTimeCompare(actualUser[:], expectedUser[:]) & subtle.ConstantTimeCompare(actualPass[:], expectedPass[:])
 	}
-	if matched != 1 {
-		if limiter != nil {
-			limiter.Failure(peer)
-		}
-		return reject()
-	}
 	if limiter != nil {
-		limiter.Success(peer)
+		if err := limiter.Authenticate(peer, matched == 1); errors.Is(err, authlimit.ErrLimited) {
+			return reject(ErrAuthLimited)
+		}
+	}
+	if matched != 1 {
+		return reject(ErrAuthRejected)
 	}
 	_, err := conn.Write([]byte{1, 0})
 	return err

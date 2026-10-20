@@ -62,6 +62,9 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	if len(cfg.PreviousSOCKSAuth) > 1 {
 		return nil, fmt.Errorf("at most one previous SOCKS credential is supported")
 	}
+	if len(cfg.PreviousSOCKSAuth) != 0 && cfg.SOCKSAuth == nil {
+		return nil, fmt.Errorf("previous_socks_auth requires current SOCKS credentials")
+	}
 	if cfg.SOCKSAuth != nil {
 		if len(cfg.SOCKSAuth.Username) < 1 || len(cfg.SOCKSAuth.Username) > 255 || len(cfg.SOCKSAuth.Password) < 1 || len(cfg.SOCKSAuth.Password) > 255 {
 			return nil, fmt.Errorf("socks_auth username and password must each be 1..255 bytes")

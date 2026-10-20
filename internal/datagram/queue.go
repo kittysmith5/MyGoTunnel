@@ -43,6 +43,12 @@ type Budget struct {
 
 func NewBudget(limit int) *Budget { return &Budget{limit: int64(limit)} }
 
+// CanFit is an advisory snapshot. Admission still acquires the budget atomically.
+// It lets the single target dispatcher reclaim expired queues only under pressure.
+func (b *Budget) CanFit(n int) bool {
+	return n >= 0 && (b == nil || int64(n) <= b.limit-b.used.Load())
+}
+
 func (b *Budget) acquire(n int) bool {
 	if b == nil {
 		return true
@@ -179,6 +185,19 @@ func (q *Queue) expire(now time.Time) {
 		p.Release()
 		q.stats.ExpiredDrops++
 	}
+}
+
+// Expire releases packets whose queue lifetime has ended and returns the next
+// queued expiry, or zero when empty. A shared-budget owner can reclaim a blocked
+// consumer's stale packets without waking or canceling its network operation.
+func (q *Queue) Expire(now time.Time) time.Time {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.expire(now)
+	if q.size == 0 {
+		return time.Time{}
+	}
+	return q.ring[q.head].At.Add(q.age)
 }
 
 func (q *Queue) TryPop() (Packet, bool) {

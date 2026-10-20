@@ -10,6 +10,8 @@ func UDPResourceAttrs(resources *datagram.Resources) []any {
 	s := resources.Stats()
 	return []any{"udp_sockets", s.Sockets, "udp_max_sockets", s.MaxSockets,
 		"udp_buffer_bytes", s.BufferBytes, "udp_cached_bytes", s.CachedBytes, "udp_buffer_peak_bytes", s.PeakBytes,
+		"udp_resident_bytes", s.ResidentBytes, "udp_resident_limit_bytes", s.ResidentLimit,
+		"udp_transient_reserve_bytes", s.TransientReserve, "udp_resident_rejected", s.ResidentRejected,
 		"udp_memory_limit_bytes", s.MemoryLimit, "udp_socket_rejected", s.SocketRejected, "udp_memory_rejected", s.MemoryRejected,
 		"udp_sessions_closed", s.Sessions, "udp_session_errors", s.SessionErrors, "udp_tunnel_write_failures", s.WriteErrors, "udp_write_timeouts", s.WriteTimeouts,
 		"udp_end_eof", s.Terminations.EOF, "udp_end_timeout", s.Terminations.Timeout, "udp_end_reset", s.Terminations.Reset,
