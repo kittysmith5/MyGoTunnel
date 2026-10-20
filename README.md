@@ -45,7 +45,21 @@ go run ./cmd/server -export -config configs/server.json -public-addr example.com
 
 SOCKS5 同时支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 经现有 TLS/TCP 隧道按长度封装，在服务端还原为 UDP；保留 TCP 控制连接。UDP 使用与 TCP 相同的证书指纹/CA 校验、认证、控制阶段超时、预连接池、连接准入和优雅退出，不额外退回跳过证书验证。普通建连可合并发送 AUTH 与 UDP，备用命中只发送 UDP。进入转发前释放 setup 名额；UDP association 仍占总连接名额。
 
-UDP ASSOCIATE 声明的来源地址和端口用于限制客户端 UDP 数据报来源。全零/空地址表示客户端尚不知道 UDP 端点，此时使用 SOCKS TCP 对端 IP；具体 IP 或域名则只接受该 IP（域名在成功回复前解析一次，最长5秒），不要求它与 TCP 对端相同，以兼容 TCP 与 UDP 走不同 NAT 映射的客户端。域名解析失败返回 REP=4，域名无可用地址返回 REP=2。非零来源端口会被约束；端口为0时，第一个合法数据报固定来源端口，关联期间不允许切换来源。来源校验和 SOCKS 报文校验通过后才绑定端口；空目标域名、控制字符/地址分隔符、目标端口0、畸形报文、未声明来源、分片报文与含 SOCKS 头超过 65000 字节的报文均丢弃；ASSOCIATE 源端口0及零长度UDP负载保留。客户端 legacy socks_username/socks_password 仍可读取，嵌套 socks_auth 优先；认证禁止免认证降级。
+默认 `udp_source_policy="strict"`：UDP ASSOCIATE 声明的来源地址和端口用于限制客户端 UDP 数据报来源。全零/空地址表示客户端尚不知道 UDP 端点，此时使用 SOCKS TCP 对端 IP；具体 IP 或域名则只接受该 IP（域名在成功回复前解析一次，最长5秒），不要求它与 TCP 对端相同。域名解析失败返回 REP=4，域名无可用地址返回 REP=2。非零来源端口会被约束；端口为0时，第一个合法数据报固定来源端口，关联期间不允许切换来源。来源校验和 SOCKS 报文校验通过后才绑定端口；空目标域名、控制字符/地址分隔符、目标端口0、畸形报文、未声明来源、分片报文与含 SOCKS 头超过 65000 字节的报文均丢弃；ASSOCIATE 源端口0及零长度UDP负载保留。客户端 legacy socks_username/socks_password 仍可读取，嵌套 socks_auth 优先；认证禁止免认证降级。
+
+应用声明内网地址或端口、实际报文经过 NAT 映射时，可在客户端显式启用 `udp_source_policy="nat"`。此模式仅允许 SOCKS TCP 对端 IP，忽略声明的来源地址/端口且不解析该来源域名；收到首个合法 SOCKS UDP 数据报后固定实际来源端口。不同 IP 的报文不能绑定，绑定后也不能换端口或 IPv6 接口范围。它适用于 TCP/UDP 共用出口 IP 的 NAT；两者出口 IP 不同仍需使用 strict 并正确声明来源。
+
+客户端可选以下本地策略，不进入连接码：
+
+```json
+{
+  "udp_source_policy": "nat",
+  "udp_relay_port_min": 20000,
+  "udp_relay_port_max": 20031
+}
+```
+
+中继端口范围两端均为0/缺省时由系统分配；指定时必须同设，端口范围为1～65535，最多1024个端口。每个 association 占一个端口；范围耗尽则拒绝新 association。服务会在范围内选择空闲端口，不修改防火墙或路由器规则，需要按部署拓扑放行对应 UDP 端口。
 
 出错目标 socket 下次发包重建，空闲 2 分钟后回收（15 秒扫描），每会话最多 256 个目标 worker，退出中的 worker 也占名额。各目标独立解析和发送，慢目标不会阻塞其他目标的分发；域名初始化并发最多 16，数字 IP 不占 DNS 名额。同一目标初始化期间复用待发送队列，保持该目标的发送顺序。目标拨号（包括等待 DNS 名额）与写入各受 5 秒期限约束，断开隧道取消解析、关闭目标 socket 并等待所有 worker。进程取消后，已建立会话继续到 grace 结束或正常断开；不会在进程取消瞬间无条件中断所有 UDP。
 
@@ -74,6 +88,8 @@ UDP ASSOCIATE 声明的来源地址和端口用于限制客户端 UDP 数据报�
 客户端 relay 创建时资源不足会拒绝 association；服务端新增目标超限时丢弃相应包。读取隧道帧遇到内存不足会消费并丢弃完整帧，保持后续流对齐；预算释放后可继续处理。上述三个新字段均为本地策略，不进入连接码，0/缺省使用默认值。
 
 会话日志保留 connection_id、transport=udp、资源与建连信息。client upload_datagrams 表示入隧道队列，download_datagrams 表示成功写入本地 UDP，udp_write_errors 记录写入失败，dropped_datagrams 包括来源、报文、队列和写入失败。server download_datagrams 为进入响应队列数量，upload_datagrams 为成功向目标写入数量。新增 queue_full_drops、queue_expired_drops 分别记录容量拒绝与年龄丢弃；request_queue_peak_bytes、response_queue_peak_bytes 记录收发队列数据峰值，server target_queue_peak_bytes 为单目标待发送队列负载峰值。client dropped_datagrams 包含年龄丢弃；server dropped_requests/dropped_responses 记录相应路径上的直接拒绝；queue_* 是队列维度统计，可与这些计数重叠，不能直接相加。统计在会话结束后输出。UDP write 成功不保证应用收到；TCP 丢包重传仍会延迟后续数据报，不宣称原生 UDP 延迟特性。
+
+客户端结束日志细分 `received_datagrams`、`source_ip_drops`、`source_port_drops`、`source_binding_drops`、`invalid_datagrams`、`oversized_datagrams`；`first_datagram_seen` 与 `first_datagram_duration` 表示 ready 后是否收到首包及等待时间，首包可能被拒绝。ready 同时记录 `udp_source_policy`、`udp_relay_port`。服务端增加 `target_dial_failures`、`target_dns_failures`、`target_write_failures`、`target_read_failures`，其中 DNS 失败是拨号失败的子集，主动取消或清理关闭不重复计为目标故障。两端有效 UDP 头校验使用借用视图，现有目标查找不再逐包构造主机字符串；只有新增服务端目标才生成地址和持有的键。
 
 UDP 结束记录首个根因的 `stage` / `close_reason`，包括 udp_control、udp_read、udp_tunnel_read、udp_tunnel_write。正常 EOF 为 INFO closed，超时/重置/截断为 WARN failed；人为关闭其他 worker 产生的次生错误不会覆盖根因。结束记录 `udp_tunnel_write_calls/errors/timeouts` 及 `udp_tunnel_write_max_duration`（text毫秒、JSON纳秒），后者包含成功或失败的底层写调用；`queue_resource_drops` 为队列复制时的进程内存拒绝。
 
@@ -135,6 +151,8 @@ SOCKS 子阶段均包含对端/网络等待，不能当作纯计算耗时；与�
 ### 错误与资源状态
 
 失败记录 `stage` 和 `reason`。阶段包括 socks、tcp、tls、auth、prepare、connect、dial、reply、control、up/down 等。`up` / `down` 指实际首先失败的转发方向，不能用被故意打断的另一方向覆盖。常见原因是 eof、reset、timeout、refused、pipe、closed、truncated、rejected、limit、error。识别到的系统错误只在 DEBUG 中保留完整 error 链；未知错误在 WARN 也保留 error，避免丢失诊断信息。正常双向 EOF 为 INFO closed；连接重置和超时仍是 WARN，不自动认定为正常结束。
+
+转发失败增加 JSON `failure_phase`（text `phase`）：`copy` 为数据复制失败，`half_close` 为 EOF 后发送半关闭失败。ENOTCONN 归类为 `closed`，仍输出 WARN failed，并保留首个失败方向；正常半关闭仍等待反向数据排空。
 
 每 30 秒输出一条 stats：`active` 是已接入但尚未退出的连接总数（包含建连、备用和转发），`setup` 是正在占用建连名额的数量，`idle` 是客户端备用池 / 服务端已认证备用数量，斜线后是配置上限。`rejected` 是本次服务进程启动后的准入超限累计数。快照是实时近似值；客户端后台备用连接另由 pool-size 限制，不计入本地 accepted active。超限不逐条刷日志，汇总数用于发现限额问题。stats 定时器在监听流程退出时停止。
 
@@ -199,7 +217,7 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 
 每 30 秒 stats 新增：JSON `pool_hits/pool_misses/pool_fallbacks/pool_hit_rate/pool_target/pool_filling`，文本 `hit/miss/fallbacks/hit_pct/pool_target/filling`。hit/miss 统计启动以来的 Take 调用结果；命中指有效备用连接成功交接，不代表目标拨号成功；命中后传输错误转普通建连时同时增加 fallback。百分比为 100*hit/(hit+miss)，无请求为 0；禁用池时这些计数为 0，不将普通连接计为 miss。计数快照加锁，不改变流量和重试语义。
 
-服务端 ready 与拨号失败日志增加 `dns_duration`（text: dns）、`target_tcp_duration`（text: target_tcp）及 `dns_retry_count`（text: dns_retry）；`target_dial_duration`（dial）继续表示 DNS+TCP 总拨号墙钟耗时。通过标准库 httptrace 观察 net.Dialer，不自行解析再顺序拨 IP，保留系统解析器、IPv4/IPv6 并行回退和原连接期限。临时 DNS 错误或 DNS 超时最多重试一次，等待100ms，且必须受同一连接 deadline 约束；NXDOMAIN 不重试。DNS 失败日志区分 `dns_not_found`、`dns_timeout`、`dns_temporary` 和其他 `dns`。各次尝试的 DNS/TCP 时间累加；IP 字面量 dns=0。TCP 时间覆盖拨号地址尝试及双栈回退，不把并发尝试分别相加。DNS 时间包括系统解析器处理，不代表纯公网 DNS RTT；分项之和与总时间可能有调度开销差异。不引入 DNS 缓存。
+服务端 ready 与拨号失败日志增加 `dns_duration`（text: dns）、`target_tcp_duration`（text: target_tcp）及 `dns_retry_count`（text: dns_retry）；`target_dial_duration`（dial）继续表示 DNS+TCP 总拨号墙钟耗时。通过标准库 httptrace 观察 net.Dialer，不自行解析再顺序拨 IP，保留系统解析器、IPv4/IPv6 并行回退和原连接期限。临时 DNS 错误或 DNS 超时最多重试一次，等待100ms；所有尝试和退避共享进入拨号时确定的总期限，取父 context、Dialer.Timeout 与 Dialer.Deadline 的最早值，不为重试重新起算10秒。`dns_retry_count` 只计实际开始的重试，期限耗尽而未启动的不计；NXDOMAIN 不重试。DNS 失败日志区分 `dns_not_found`、`dns_timeout`、`dns_temporary` 和其他 `dns`。各次尝试的 DNS/TCP 时间累加；IP 字面量 dns=0。TCP 时间覆盖拨号地址尝试及双栈回退，不把并发尝试分别相加。DNS 时间包括系统解析器处理，不代表纯公网 DNS RTT；分项之和与总时间可能有调度开销差异。不引入 DNS 缓存。
 
 ## 大流量吞吐基准
 
@@ -340,16 +358,17 @@ systemd 服务，保留配置、凭据与启动参数。升级校验哈希、版
 重启后检查健康、实际运行文件哈希；失败自动恢复上一二进制并重启。
 回滚同样检查健康，成功后可再次 rollback 撤销本次回滚。
 备份保存在 root 私有的 `/var/lib/mygotunnel/releases`，保留供人工审计清理，不自动删除。
-仅安装可信本地 bundle；manifest 哈希验证传输完整性，不提供发行者签名验证。
+仅安装可信本地 bundle；升级器以 root 管理的信任公钥验证 manifest 的 Ed25519 签名，再验证文件哈希，信任公钥安装方式见下文。
 
 `scripts/observe.py --role client --output /var/lib/mygotunnel/observation/UNIQUE --hours 72`
 每 30 秒被动读取 journal、systemd 和 /proc，输出私有 samples.jsonl / summary.json；
 建议通过独立 systemd 服务运行。最多 72 小时，不生成业务探测流量，不保存目标地址或凭据。
+默认观察 `mygotunnel-<role>.service`；其他实例显式加 `--unit mygotunnel-client-61080.service`，统计、进程资源与 journal 均使用该 unit。
 记录 RSS、FD、TCP 连接数、重启次数、stats 中活跃连接/UDP 资源、建连失败率与建连 P95/P99。
 分位数来自成功 ready 的 setup_duration，含 SOCKS 前端等待，按 1ms 向上取整，超过 60s
-记录为 60001；不是应用 RTT。失败率以首次 ready/failed 的连接 ID 去重，转发中错误单列；
-预连接后台错误无连接 ID 不计入。去重表限制 10 万项，超长连接被逐出后可能重复分类。
-单次最多读取 2 万条 journal，达到上限会标记数据可能不完整。保留基线/峰值/末值辅助判断增长，
+记录为 60001；不是应用 RTT。建连、转发复制、半关闭失败分别记录，按连接 ID 去重；
+`auth_failed` 单列，`failure_rate` 含认证阶段失败，`proxy_failure_rate` 排除认证阶段失败，不代表只包含真实用户流量。预连接后台错误无连接 ID 不计入。活跃连接与完成历史分别保留最多10万项，完成记录不会挤出长连接；活跃表超限会累计 `tracking_gaps`。
+单次最多读取2万条 journal，达到上限累计 `journal_batches_limited`，采集异常累计 `collection_errors`。任一覆盖缺口都会持续使 `data_complete=false`，后续安静批次不会清除该标记；`finished` 仅表示到达计划时间，`complete` 还要求数据完整。保留基线/峰值/末值辅助判断增长，
 需要完整观察窗口与负载背景才能认定泄漏；低流量时分位数不代表高负载体验。
 
 回滚到尚无运维标志的历史版本时，版本显示为 legacy/unknown，健康门禁降为服务状态、
@@ -370,6 +389,8 @@ TLS 握手在 AUTH 前完成，来源限速无法避免所有握手 CPU 消耗�
 ```
 
 时间必须是 RFC3339；过期项自动停止授权。新客户端 SOCKS 凭据在 `socks_auth`，可把一个带 `expires_at` 的旧账号放进 `previous_socks_auth`，方便应用逐步切换。旧格式 `socks_username` / `socks_password` 仍可用。
-两端当前通过受控 systemd 重启加载配置；服务端配置先接受新旧 token，重启客户端切换后再撤旧 token。SOCKS 旧凭据只在过渡期有效。配置权限设为 0600，凭据不写日志。
+两端当前通过受控 systemd 重启加载配置；服务端配置先接受新旧 token，重启客户端切换后再撤旧 token。SOCKS 旧凭据在读取用户名密码完成、实际比较前重新判断到期，等待握手不会延长过渡期。配置权限设为 0600，凭据不写日志。
 
 版本包清单由 Ed25519 私钥签名，升级器从 `/etc/mygotunnel/release-keys/<key-id>.pub.pem` 的 root 管理信任目录选择公钥，并在停服务前验证签名、平台二进制哈希、构建版本和提交。发布私钥用 `scripts/generate-release-key.sh` 生成，离线保存；`scripts/release.sh VERSION OUTPUT PRIVATE_KEY.pem` 要求私钥 mode 0600，生成已签名 bundle。公钥需经可信渠道预装到两台机器的 root 信任目录；不能从待验证 bundle 自动建立信任。加入新公钥后先用新钥发布并验证，再移除旧公钥。签名只验证发布者和文件完整性，不替代 root 权限保护、配置权限或回滚备份保护。
+
+升级和回滚的候选二进制先复制到 root 管理目录中的0700临时目录；拒绝符号链接、特殊文件及超过256MiB的候选文件。升级只执行、检查和安装完成哈希验证的私有副本，避免校验后原 bundle 文件被替换；回滚也对备份副本校验后执行。该暂存目录在操作完成后清理。

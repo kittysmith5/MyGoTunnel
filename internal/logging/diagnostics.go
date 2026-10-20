@@ -89,7 +89,7 @@ func Reason(err error) string {
 		return "refused"
 	case errors.Is(err, syscall.EPIPE):
 		return "pipe"
-	case errors.Is(err, net.ErrClosed):
+	case errors.Is(err, net.ErrClosed), errors.Is(err, syscall.ENOTCONN):
 		return "closed"
 	case errors.Is(err, io.EOF):
 		return "eof"

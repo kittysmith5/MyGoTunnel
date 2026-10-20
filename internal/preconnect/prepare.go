@@ -69,6 +69,11 @@ func prepare(ctx context.Context, cfg *config.ClientConfig, ack bool) (entry *En
 	defer stop()
 	defer func() {
 		if err != nil {
+			// Cancellation closes the socket to interrupt any setup I/O. That
+			// close can surface before the next protocol read checks ctx.Err.
+			if contextErr := ctx.Err(); contextErr != nil {
+				err = contextErr
+			}
 			_ = conn.Close()
 		}
 	}()

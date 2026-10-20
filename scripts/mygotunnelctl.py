@@ -1,14 +1,47 @@
 #!/usr/bin/env python3
-"""Local root-only atomic upgrades. Bundles must come from a trusted source.
-Hashes detect transfer corruption; they do not authenticate the publisher.
-"""
-import argparse,base64,fcntl,hashlib,json,os,pathlib,platform,shutil,socket,subprocess,tempfile,time
+"""Local root-only upgrades using signed, private snapshots of release files."""
+import argparse,base64,fcntl,hashlib,json,os,pathlib,platform,shutil,socket,stat,subprocess,tempfile,time
 
 TRUSTED_KEYS=pathlib.Path("/etc/mygotunnel/release-keys")
 ROOT=pathlib.Path('/var/lib/mygotunnel/releases')
+MAX_BINARY_BYTES=256*1024*1024
 def run(*args):
  return subprocess.check_output(args,text=True,stderr=subprocess.DEVNULL,timeout=45).strip()
 def digest(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+def snapshot_regular(source,destination):
+ # Never execute the bundle path. Snapshot through one fd, reject symlinks and
+ # special files, then authenticate these exact private bytes before execution.
+ fd=os.open(source,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ try:
+  info=os.fstat(fd)
+  if not stat.S_ISREG(info.st_mode) or info.st_size>MAX_BINARY_BYTES: raise RuntimeError('invalid candidate file')
+  with os.fdopen(fd,'rb',closefd=False) as src,open(destination,'xb') as dst:
+   total=0
+   while True:
+    data=src.read(1024*1024)
+    if not data: break
+    total+=len(data)
+    if total>MAX_BINARY_BYTES: raise RuntimeError('candidate file too large')
+    dst.write(data)
+   dst.flush();os.fsync(dst.fileno())
+  os.chmod(destination,0o700)
+ finally: os.close(fd)
+
+def stage_verified(source,stage,expected):
+ candidate=stage/'candidate'
+ snapshot_regular(source,candidate)
+ if digest(candidate)!=expected: raise RuntimeError('candidate checksum mismatch')
+ return candidate
+
+def prepare_upgrade(bundle,role,arch,stage):
+ manifest=json.loads((bundle/'manifest.json').read_text())
+ signed=verify_manifest(manifest)
+ name=role+'-linux-'+arch
+ if digest(bundle/'release-ed25519.pub.pem')!=signed['files']['release-ed25519.pub.pem']: raise RuntimeError('bundle public key checksum mismatch')
+ candidate=stage_verified(bundle/name,stage,signed['files'][name])
+ info=json.loads(run(str(candidate),'-version'))
+ if info['commit']!=signed['commit'] or info['version']!=signed['version']: raise RuntimeError('build identity mismatch')
+ return candidate
 def atomic(src,dst):
  fd,tmp=tempfile.mkstemp(prefix='.mygotunnel-',dir=dst.parent)
  try:
@@ -64,23 +97,21 @@ def main():
   return 0
  if os.geteuid()!=0: p.error('upgrade/rollback requires root')
  ROOT.mkdir(parents=True,exist_ok=True,mode=0o700)
- with open(ROOT/(a.role+'.lock'),'w') as lock:
+ root_info=ROOT.lstat()
+ if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid!=0 or root_info.st_mode&0o022: raise RuntimeError('release directory is not root-owned and private')
+ with open(ROOT/(a.role+'.lock'),'w') as lock,tempfile.TemporaryDirectory(prefix='.'+a.role+'-stage-',dir=ROOT) as stage_path:
   fcntl.flock(lock,fcntl.LOCK_EX)
+  stage=pathlib.Path(stage_path)
   state=ROOT/(a.role+'.json')
   if a.action=='upgrade':
    if not a.bundle: p.error('--bundle is required for upgrade')
-   bundle=a.bundle.resolve(); manifest=json.loads((bundle/'manifest.json').read_text())
-   signed=verify_manifest(manifest)
+   bundle=a.bundle.resolve()
    arch={'aarch64':'arm64','x86_64':'amd64'}.get(platform.machine())
    if arch is None: p.error('unsupported architecture')
-   name=a.role+'-linux-'+arch; candidate=bundle/name
-   if digest(bundle/'release-ed25519.pub.pem')!=signed['files']['release-ed25519.pub.pem']: raise RuntimeError('bundle public key checksum mismatch')
-   if digest(candidate)!=signed['files'][name]: raise RuntimeError('bundle checksum mismatch')
-   candidate_info=json.loads(run(str(candidate),'-version'))
-   if candidate_info['commit']!=signed['commit'] or candidate_info['version']!=signed['version']: raise RuntimeError('build identity mismatch')
+   candidate=prepare_upgrade(bundle,a.role,arch,stage)
   else:
-   old=json.loads(state.read_text()); candidate=pathlib.Path(old['previous'])
-   if digest(candidate)!=old['sha256']: raise RuntimeError('rollback checksum mismatch')
+   old=json.loads(state.read_text())
+   candidate=stage_verified(pathlib.Path(old['previous']),stage,old['sha256'])
   # Validate before replacement, without printing config or credentials.
   check(candidate,config)
   before=digest(pathlib.Path(config)); unit_before=run('systemctl','cat',unit)

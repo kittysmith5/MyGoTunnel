@@ -16,6 +16,7 @@ var ErrHalfCloseUnsupported = errors.New("connection does not support CloseWrite
 type DirectionResult struct {
 	Bytes int64
 	Err   error
+	Phase string
 }
 
 // Result contains transfer statistics for both directions and the error that
@@ -26,6 +27,7 @@ type Result struct {
 	BToA             DirectionResult
 	Err              error
 	FailureDirection string
+	FailurePhase     string
 }
 
 type closeWriter interface {
@@ -71,9 +73,11 @@ func CopyBidirectional(a net.Conn, aReader io.Reader, b net.Conn, bReader io.Rea
 		// The second direction was deliberately interrupted. Its detailed error
 		// remains in Result, but the first failure is the relay's root cause.
 		result.FailureDirection = directionName(first.direction)
+		result.FailurePhase = first.result.Phase
 		result.Err = errors.Join(directionError(first), interruptErr)
 	case second.result.Err != nil:
 		result.FailureDirection = directionName(second.direction)
+		result.FailurePhase = second.result.Phase
 		result.Err = directionError(second)
 	}
 
@@ -86,11 +90,18 @@ func copyDirection(resultCh chan<- copyResult, direction direction, dst net.Conn
 	if copyErr == nil {
 		shutdownErr = closeWrite(dst)
 	}
+	var phase string
+	if copyErr != nil {
+		phase = "copy"
+	} else if shutdownErr != nil {
+		phase = "half_close"
+	}
 
 	resultCh <- copyResult{
 		direction: direction,
 		result: DirectionResult{
 			Bytes: written,
+			Phase: phase,
 			Err: errors.Join(
 				wrapError("copy stream", copyErr),
 				wrapError("close write side", shutdownErr),

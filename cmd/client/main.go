@@ -201,13 +201,16 @@ func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn 
 		logging.Failure(connectionLogger, "socks", err, "socks_duration", time.Since(startedAt), "setup_duration", time.Since(startedAt))
 		return
 	}
-	var socksCredentials []*socks5.Credentials
-	if credentials, enabled := cfg.SOCKSCredentialSet(time.Now()); enabled {
-		for _, c := range credentials {
-			socksCredentials = append(socksCredentials, &socks5.Credentials{Username: c.Username, Password: c.Password})
+	credentialProvider := func() []*socks5.Credentials {
+		var socksCredentials []*socks5.Credentials
+		if credentials, enabled := cfg.SOCKSCredentialSet(time.Now()); enabled {
+			for _, c := range credentials {
+				socksCredentials = append(socksCredentials, &socks5.Credentials{Username: c.Username, Password: c.Password})
+			}
 		}
+		return socksCredentials
 	}
-	handshakeTimings, err := socks5.HandshakeWithCredentialSet(clientConn, socksCredentials, authLimiter)
+	handshakeTimings, err := socks5.HandshakeWithCredentialProvider(clientConn, credentialProvider, authLimiter)
 	connectionLogger = connectionLogger.With(
 		"socks_first_byte_duration", handshakeTimings.FirstByte,
 		"socks_method_duration", handshakeTimings.Method,

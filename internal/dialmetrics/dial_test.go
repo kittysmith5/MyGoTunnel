@@ -87,7 +87,28 @@ func TestDialDNSRetryHonorsContextDeadline(t *testing.T) {
 		calls++
 		return nil, &net.DNSError{Err: "temporary resolver failure", IsTemporary: true}
 	}, "tcp", "target.invalid:443")
-	if !errors.Is(err, context.DeadlineExceeded) || calls != 1 || timings.DNSRetries != 1 {
+	if !errors.Is(err, context.DeadlineExceeded) || calls != 1 || timings.DNSRetries != 0 {
 		t.Fatalf("calls=%d timings=%+v error=%v, retry did not honor context", calls, timings, err)
+	}
+}
+
+func TestDialRetriesShareDialerBudget(t *testing.T) {
+	for _, useDeadline := range []bool{false, true} {
+		resolver := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}}
+		dialer := &net.Dialer{Resolver: resolver, Timeout: 50 * time.Millisecond}
+		if useDeadline {
+			dialer.Timeout = time.Second
+			dialer.Deadline = time.Now().Add(50 * time.Millisecond)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		started := time.Now()
+		_, timings, err := Dial(ctx, dialer, "tcp", "budget.invalid:443")
+		cancel()
+		if err == nil || timings.DNSRetries != 0 || time.Since(started) >= 140*time.Millisecond {
+			t.Fatalf("deadline=%v elapsed=%v retries=%d error=%v", useDeadline, time.Since(started), timings.DNSRetries, err)
+		}
 	}
 }

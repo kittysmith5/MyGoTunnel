@@ -19,6 +19,20 @@ type Timings struct {
 }
 
 func Dial(ctx context.Context, dialer *net.Dialer, network, address string) (net.Conn, Timings, error) {
+	// Dialer.Timeout is otherwise restarted by each DialContext call. Keep the
+	// original timeout/deadline as one budget for DNS, backoff and both attempts.
+	deadline := dialer.Deadline
+	if dialer.Timeout != 0 {
+		timeout := time.Now().Add(dialer.Timeout)
+		if deadline.IsZero() || timeout.Before(deadline) {
+			deadline = timeout
+		}
+	}
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
 	return dialWith(ctx, dialer.DialContext, network, address)
 }
 
@@ -26,7 +40,13 @@ type dialFunc func(context.Context, string, string) (net.Conn, error)
 
 func dialWith(ctx context.Context, dial dialFunc, network, address string) (net.Conn, Timings, error) {
 	var total Timings
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, total, err
+		}
+		if attempt > 0 {
+			total.DNSRetries++
+		}
 		conn, timings, err := dialOnce(ctx, dial, network, address)
 		total.DNS += timings.DNS
 		total.TCP += timings.TCP
@@ -36,7 +56,6 @@ func dialWith(ctx context.Context, dial dialFunc, network, address string) (net.
 		if attempt != 0 || !retryableDNS(err) || ctx.Err() != nil {
 			return nil, total, err
 		}
-		total.DNSRetries++
 		timer := time.NewTimer(dnsRetryDelay)
 		select {
 		case <-ctx.Done():
@@ -50,7 +69,6 @@ func dialWith(ctx context.Context, dial dialFunc, network, address string) (net.
 		case <-timer.C:
 		}
 	}
-	return nil, total, errors.New("unreachable dial retry state")
 }
 
 func retryableDNS(err error) bool {

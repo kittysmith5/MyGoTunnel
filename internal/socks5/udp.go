@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 )
 
 type UDPDatagram struct {
@@ -12,48 +13,78 @@ type UDPDatagram struct {
 	Port uint16
 }
 
+// UDPHeader borrows Domain from its packet. It must not outlive that packet.
+// IP and Port are values; parsing a valid header allocates no memory.
+type UDPHeader struct {
+	IP     netip.Addr
+	Domain []byte
+	Port   uint16
+	Size   int
+}
+
+func (h UDPHeader) Host() string {
+	if h.IP.IsValid() {
+		return h.IP.String()
+	}
+	return string(h.Domain)
+}
+
+func ValidateUDPDatagram(packet []byte) error {
+	_, _, err := ParseUDPHeader(packet)
+	return err
+}
+
 func ParseUDPDatagram(packet []byte) (UDPDatagram, []byte, error) {
+	header, payload, err := ParseUDPHeader(packet)
+	if err != nil {
+		return UDPDatagram{}, nil, err
+	}
+	return UDPDatagram{Host: header.Host(), Port: header.Port}, payload, nil
+}
+
+func ParseUDPHeader(packet []byte) (UDPHeader, []byte, error) {
 	if len(packet) < 4 || packet[0] != 0 || packet[1] != 0 || packet[2] != 0 {
-		return UDPDatagram{}, nil, errors.New("invalid SOCKS5 UDP header or fragmented packet")
+		return UDPHeader{}, nil, errors.New("invalid SOCKS5 UDP header or fragmented packet")
 	}
 	pos := 4
-	var host string
+	var header UDPHeader
 	switch packet[3] {
 	case 0x01:
 		if len(packet) < pos+4+2 {
-			return UDPDatagram{}, nil, io.ErrUnexpectedEOF
+			return UDPHeader{}, nil, io.ErrUnexpectedEOF
 		}
-		host = net.IP(packet[pos : pos+4]).String()
+		header.IP = netip.AddrFrom4([4]byte(packet[pos : pos+4]))
 		pos += 4
 	case 0x03:
 		if len(packet) < pos+1 {
-			return UDPDatagram{}, nil, io.ErrUnexpectedEOF
+			return UDPHeader{}, nil, io.ErrUnexpectedEOF
 		}
 		n := int(packet[pos])
 		pos++
 		if len(packet) < pos+n+2 {
-			return UDPDatagram{}, nil, io.ErrUnexpectedEOF
+			return UDPHeader{}, nil, io.ErrUnexpectedEOF
 		}
-		host = string(packet[pos : pos+n])
-		if err := validateDomain(host); err != nil {
-			return UDPDatagram{}, nil, err
+		header.Domain = packet[pos : pos+n]
+		if err := validateDomainBytes(header.Domain); err != nil {
+			return UDPHeader{}, nil, err
 		}
 		pos += n
 	case 0x04:
 		if len(packet) < pos+16+2 {
-			return UDPDatagram{}, nil, io.ErrUnexpectedEOF
+			return UDPHeader{}, nil, io.ErrUnexpectedEOF
 		}
-		host = net.IP(packet[pos : pos+16]).String()
+		header.IP = netip.AddrFrom16([16]byte(packet[pos : pos+16])).Unmap()
 		pos += 16
 	default:
-		return UDPDatagram{}, nil, errors.New("unsupported SOCKS5 UDP address type")
+		return UDPHeader{}, nil, errors.New("unsupported SOCKS5 UDP address type")
 	}
 	port := binary.BigEndian.Uint16(packet[pos : pos+2])
 	if port == 0 {
-		return UDPDatagram{}, nil, requestError(0x01, "invalid SOCKS5 target port")
+		return UDPHeader{}, nil, requestError(0x01, "invalid SOCKS5 target port")
 	}
 	pos += 2
-	return UDPDatagram{Host: host, Port: port}, packet[pos:], nil
+	header.Port, header.Size = port, pos
+	return header, packet[pos:], nil
 }
 
 func BuildUDPDatagram(destination UDPDatagram, payload []byte) []byte {

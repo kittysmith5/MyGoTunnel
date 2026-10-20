@@ -17,6 +17,11 @@ func LogTunnelResult(logger *slog.Logger, result relay.Result, startedAt time.Ti
 	}
 
 	if result.Err != nil {
+		phase := result.FailurePhase
+		if phase == "" {
+			phase = "copy"
+		}
+		attributes = append(attributes, "failure_phase", phase)
 		Failure(logger, result.FailureDirection, result.Err, attributes...)
 		return
 	}

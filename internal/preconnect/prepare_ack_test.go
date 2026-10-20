@@ -324,6 +324,40 @@ func TestPrepareACKRefusalAndMalformedResponseDoNotRetry(t *testing.T) {
 	}
 }
 
+func TestPrepareCancellationWhileWaitingForAuthentication(t *testing.T) {
+	commandRead := make(chan struct{})
+	server, cfg := newPrepareACKServer(t, func(_ int, _ string, conn net.Conn, _ *bufio.Reader) error {
+		close(commandRead)
+		_, _ = io.Copy(io.Discard, conn) // withhold AUTH OK until canceled
+		return nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		entry, err := NewPreparer(cfg)(ctx)
+		if entry != nil {
+			entry.Conn.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-commandRead:
+	case <-time.After(3 * time.Second):
+		t.Fatal("preparation did not reach authentication")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("authentication wait cancellation = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("preparation did not stop after cancellation")
+	}
+	server.checkCommands(t, "PREPARE ACK")
+}
+
 func TestPrepareACKTimeoutAndCancellationDoNotRetry(t *testing.T) {
 	for _, canceled := range []bool{false, true} {
 		name := "timeout"

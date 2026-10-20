@@ -47,7 +47,7 @@ SOCKS5 应用
 - 从控制协议切换到转发时，继续使用既有的 `bufio.Reader`。其中可能已经预读了应用数据，改回直接读取底层连接会丢数据。
 - 服务端认证比较使用常量时间比较；不要记录、回显或以普通字符串比较替代认证令牌。
 - 认证读取的 deadline 必须在结束后清除，避免影响后续连接阶段。
-- SOCKS5 支持版本 5、可选 RFC 1929 用户名密码认证、TCP `CONNECT` 和 UDP `ASSOCIATE`，地址支持 IPv4、域名及 IPv6。UDP 来源使用 ASSOCIATE 声明的具体地址/端口约束；全零地址回退到 TCP 对端 IP，先校验报文再绑定来源端口。
+- SOCKS5 支持版本 5、可选 RFC 1929 用户名密码认证、TCP `CONNECT` 和 UDP `ASSOCIATE`，地址支持 IPv4、域名及 IPv6。UDP 默认 strict 来源使用 ASSOCIATE 声明的具体地址/端口约束，全零地址回退到 TCP 对端 IP；显式 nat 模式仅允许 TCP 对端 IP，忽略声明并从合法首包学习映射端口。两种模式均先校验来源与报文再绑定，绑定后不可切换端点。
 - uTLS 客户端使用固定 `HelloChrome_133` 基线并适配 ALPN，客户端与服务端均协商 `http/1.1` ALPN。相关值属于连接兼容性的一部分。
 - 有导入指纹时，`InsecureSkipVerify` 仅用于替代公共 CA 验证，必须同时通过 `VerifyPeerCertificate` 校验固定证书指纹；没有指纹时使用系统 CA 和主机名验证。修改时同步说明证书信任、SNI 和部署迁移。
 - 旧预连接协议为AUTH → OK → PREPARE → READY → CONNECT（或UDP）→ OK；新连接可协商PREPARE ACK / READY ACK，命令后先ACK再原OK/ERR。只有本连接成功协商才启用ACK，旧流程不发送额外ACK。原有普通流程继续兼容。备用连接有独立数量/闲置限制，取用后不得回池；后台读取必须在交接前停止。
@@ -67,6 +67,7 @@ SOCKS5 应用
 - `certificate_fingerprint`：可选，服务端叶证书 DER 的 SHA-256 十六进制指纹；存在时使用固定指纹验证，否则使用系统 CA 和主机名验证。
 - 客户端和服务端均支持 `udp_queue_max_bytes`、`udp_queue_max_age_ms`；0/缺省为 1 MiB、250ms，非零范围分别 65000～67108864、1～60000。属于本地策略，不进入连接码。
 - 两端还支持 `udp_write_timeout_ms`（默认5000，非零1～600000）、`udp_max_sockets`（默认1024，非零1～65536）、`udp_memory_limit_bytes`（默认64MiB，非零262144～1073741824）；0/缺省取默认值，均不进入连接码。生产每个run创建一个共享Resources，不能给每个关联独立创建而绕过进程预算。
+- 客户端独有 `udp_source_policy`（缺省 strict，可选 nat）及 `udp_relay_port_min/max`（同为0用系统端口，否则1～65535闭区间，最多1024端口）；不进入连接码，不自动修改防火墙。NAT 模式仅支持 TCP/UDP 共用出口 IP，不能开放任意来源。
 
 服务端实际读取的字段只有：
 
@@ -151,6 +152,7 @@ go build ./cmd/...
 - 上传/下载统一以 SOCKS5 应用为参照：↑/upload_bytes 向目标，↓/download_bytes 回到应用；保留 relay 的根失败方向 up/down，不被故意中断的反向超时覆盖。
 - text 阶段短名为 socks/sfirst/smethod/sauth/sreq/tcp/tls/take/ctl/auth/wait/dial/reply/idle/total，展示毫秒，最多 3 位小数。SOCKS 子阶段分别为首字节、方法协商、RFC 1929、请求读取，均含前端等待；JSON 对应 socks_first_byte_duration、socks_method_duration、socks_auth_duration、socks_request_duration，失败时未进入的握手子阶段为 0，尚未读取请求则无 sreq，不记录凭据。JSON 长字段定义见 README。服务端 total 排除 idle，但仍包含准备阶段 auth；连接生命周期 duration/dur 包含 idle。已预热池命中时 text 可省略零值 tcp/tls，JSON 保留。
 - failed 必须包含 stage 与 close_reason/reason；常见系统错误完整链进入 DEBUG，未知错误在 WARN 保留诊断信息。只有真正正常 EOF 才作为 INFO closed，不能把所有 reset/timeout 静默吞掉。
+- 转发失败 failure_phase（text phase）区分 copy 与 half_close，保留根方向；ENOTCONN 分类 closed 仍为 WARN failed，不吞错或更改正常排空语义。
 - 资源状态每 30 秒一条 stats，active 统计 accepted 总数，setup 统计 permit 占用，idle 统计备用，rejected 是准入拒绝累计；计数使用原子操作，Permit Release/TryAcquire 同步更新，监听流程退出时停止并等待定时器。不要用日志计数改变任何连接、认证、超时、重试或半关闭行为。
 - 修改日志需覆盖毫秒与时区、短字段、英文事件、双向字节、ID 关联、根失败方向、分组属性、并发写入、错误详略、资源计数与定时器停止，并同步 README 和本文件。
 - pool_ack_duration（text ack）为协商后命令发送至即时ACK的Duration，JSON纳秒/text毫秒；不含ACK后的目标等待，未协商为0，失败时保留已等待值。它属于control_duration子阶段，不能再与control相加。
@@ -276,9 +278,13 @@ UDP池化Packet为单所有者：Push成功转交所有权，失败仍由调用�
 
 满256项目标表时先回收其他failed/idle项再拒绝新目标；targetSlots仍覆盖退出中的worker，不能因删除map就提前释放slot。长度头完整后的body读取/丢弃EOF均为ErrUnexpectedEOF，只有帧边界EOF正常；同时覆盖池化与旧ReadDatagram及实际日志统计。
 
-ASSOCIATE源域名在成功前有界解析一次（5秒，计入setup总预算），结果须包含TCPpeerIP；每包仍只匹配TCPpeer IP与约定源端口。源不匹配REP2，解析失败REP4；拒绝先于socket/远端拨号。TCP/UDP共享域名语义校验；UDP目标空域名、控制/空白字符、分隔符、port0在绑定源端口前拒绝，ASSOCIATE源port0及零UDP负载保持。
+strict 模式 ASSOCIATE 源域名在成功前有界解析一次（5秒，计入setup总预算），允许解析结果 IP，不要求包含 TCP peer；具体 IP 按声明，全零回退 TCP peer。非零声明端口须匹配，零端口由合法首包绑定。nat 模式不解析来源域名，忽略声明，只允许 TCP peer IP 并从合法首包学习实际端口；固定端点包含 IPv6 zone。域名无可用 IP 返回 REP2，解析失败 REP4；拒绝先于 socket/远端拨号。TCP/UDP 共享域名语义校验；UDP 目标空域名、控制/空白字符、分隔符、port0 在绑定源端口前拒绝，ASSOCIATE 源 port0 及零 UDP 负载保持。
+
+UDPHeader 借用报文中的域名切片，不能跨 Packet.Release 保存；有效头解析和已存在目标查找不分配。服务端仅新建目标时构造 Host/拨号地址并复制目标键，排队负载继续持有 Packet。客户端使用 AddrPort I/O，来源过滤先比较 IP/声明端口，再验证报文并绑定。结束日志记录 received_datagrams、source_ip/port/binding_drops、invalid/oversized_datagrams、first_datagram_seen/duration；服务端记录 target_dial/dns/write/read_failures，DNS 是拨号失败子集，主动取消/清理不重复算故障。
 
 NewPreparer按pool探测ACK，仅AUTH OK后的纯EOF/ERR可在新连接重试一次legacy，成功旧READY才缓存5分钟；AUTH/BUSY/timeout/cancel/畸形/截断响应不降级。ACK命令发送+读取共2秒，ACK后独立等待目标20秒+1秒回复，夹parent期限；ACK前OK或未知/过长/控制字符响应均协议失败不可回退。父deadline已到即使ctx.Err尚未发布也不可重试。前台总setup38秒，本地SOCKS回复另留5秒；UDP解析共享此总预算。旧未协商连接不施加ACK期限。
+
+预连接 setup 任意阶段被 context 取消而关闭 socket 时，返回 context 根错误，不能把关闭产生的 net.ErrClosed 误归为普通传输错误或协商降级。
 
 目标OK/ERR（含重取setup拒绝、UDP成功）用SendTargetResult独立1秒写期限，不能继承已耗尽控制/旧idle写期限，发送失败要记录；成功进入转发前清除全部期限。客户端AUTH OK/ACK后重新起算目标等待，给回复留余量。ACK发送后服务端不等待客户端确认，认证、指纹、预读Reader、半关闭与转发不变量保留。
 
@@ -290,8 +296,13 @@ NewPreparer按pool探测ACK，仅AUTH OK后的纯EOF/ERR可在新连接重试一
 运维升级仅使用可信本地 bundle，校验 manifest、版本与运行文件，保留原配置和 unit；失败自动回滚。
 scripts/observe.py 被动采集最多72小时，指标为成功建连耗时分位数而非应用RTT；
 采集上限/异常须显式标记，不得把监测启动当作72小时稳定验证已完成。
+观察支持 --unit 对应具体 systemd 实例，所有采集使用相同 unit；活跃/完成表分开有界保留。setup/relay/half_close 与 auth 分别统计，proxy_failure_rate 只排除 auth，不等同真实用户失败率。journal_batches_limited、collection_errors、tracking_gaps 任一累计后 data_complete 永久为 false；finished 只表示计划时间结束，complete 还须覆盖完整。
 
 
 ## 认证限速与发布签名
 
 认证错误按peer IP有界计数；只计真实凭据不匹配，不把超时/截断算密码错误。锁表上限必须明确采用fail-closed策略，日志不可包含凭据。凭据过渡最多保留一个到期时间明确的旧项，constant-time比较，过期后新建会话不得授权；不要改动旧AUTH wire format。发布bundle由Ed25519签名，升级先验证root本地信任公钥、签名、平台和哈希，再停服务；不信任bundle自带公钥。
+
+SOCKS 凭据 provider 在方法选择和完整读取凭据后的实际比较前分别取值，过期旧项不能因等待握手被继续接受。DNS 重试的总预算在 Dial 入口固定，父 context、Dialer.Timeout、Dialer.Deadline 取最早期限；退避与所有尝试共享，DNSRetries 只计实际开始的重试。
+
+升级和回滚须先将普通候选文件复制到 root 管理目录中的0700暂存目录，再验证副本哈希、执行和安装同一副本；拒绝 symlink/特殊文件及大于256MiB的文件，不能验证后执行原 bundle 路径。操作结束清理暂存；禁止更改配置、unit、信任公钥保护或实际运行哈希检查。

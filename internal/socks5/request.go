@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // RequestError carries the SOCKS5 reply appropriate for a rejected request.
@@ -31,6 +32,21 @@ func validateDomain(host string) error {
 		if unicode.IsControl(character) || unicode.IsSpace(character) {
 			return requestError(0x08, "invalid SOCKS5 domain")
 		}
+	}
+	return nil
+}
+
+// Validate byte views without materializing a per-datagram host string.
+func validateDomainBytes(host []byte) error {
+	if len(host) == 0 {
+		return requestError(0x08, "invalid SOCKS5 domain")
+	}
+	for len(host) > 0 {
+		character, n := utf8.DecodeRune(host)
+		if character == ':' || character == '/' || character == '\\' || character == '[' || character == ']' || unicode.IsControl(character) || unicode.IsSpace(character) {
+			return requestError(0x08, "invalid SOCKS5 domain")
+		}
+		host = host[n:]
 	}
 	return nil
 }

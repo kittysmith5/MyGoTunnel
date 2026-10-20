@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -129,8 +130,25 @@ func TestCopyBidirectionalInterruptsOtherDirectionAfterError(t *testing.T) {
 	if result.FailureDirection != "up" {
 		t.Fatal("root upload error direction lost")
 	}
+	if result.FailurePhase != "copy" {
+		t.Fatal("copy failure phase lost")
+	}
 	if result.BToA.Err == nil {
 		t.Error("B-to-A error = nil, want interruption error")
+	}
+}
+
+type halfCloseErrorConn struct{ net.Conn }
+
+func (halfCloseErrorConn) CloseWrite() error { return syscall.ENOTCONN }
+
+func TestHalfCloseFailureKeepsItsOwnPhaseAndInterruptsReverse(t *testing.T) {
+	aRelay, aPeer := newTCPPair(t)
+	bRelay, bPeer := newTCPPair(t)
+	setTestDeadlines(t, aRelay, aPeer, bRelay, bPeer)
+	result := waitForResult(t, startRelay(aRelay, strings.NewReader(""), halfCloseErrorConn{bRelay}, bRelay))
+	if result.FailurePhase != "half_close" || result.FailureDirection != "up" || !errors.Is(result.Err, syscall.ENOTCONN) {
+		t.Fatalf("lost half-close root cause: %+v", result)
 	}
 }
 

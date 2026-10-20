@@ -47,6 +47,16 @@ func HandshakeWithCredentialSet(conn net.Conn, credentials []*Credentials, limit
 }
 
 func handshakeWithCredentials(conn net.Conn, credentials []*Credentials, limiter *authlimit.Limiter) (timings HandshakeTimings, err error) {
+	return HandshakeWithCredentialProvider(conn, func() []*Credentials { return credentials }, limiter)
+}
+
+// HandshakeWithCredentialProvider reevaluates credential expiry after reading
+// RFC 1929 credentials. Waiting for the frontend must not extend their lifetime.
+func HandshakeWithCredentialProvider(conn net.Conn, provider func() []*Credentials, limiter *authlimit.Limiter) (timings HandshakeTimings, err error) {
+	if provider == nil {
+		return timings, errors.New("missing SOCKS5 credential provider")
+	}
+	credentials := provider()
 	authEnabled := len(credentials) > 0
 	for _, auth := range credentials {
 		if auth == nil || len(auth.Username) < 1 || len(auth.Username) > 255 || len(auth.Password) < 1 || len(auth.Password) > 255 {
@@ -95,7 +105,7 @@ func handshakeWithCredentials(conn net.Conn, credentials []*Credentials, limiter
 			timings.Method = time.Since(methodStarted)
 			if authEnabled {
 				authStarted := time.Now()
-				err := authenticate(conn, credentials, limiter)
+				err := authenticate(conn, provider, limiter)
 				timings.Auth = time.Since(authStarted)
 				return timings, err
 			}
@@ -109,7 +119,7 @@ func handshakeWithCredentials(conn net.Conn, credentials []*Credentials, limiter
 }
 
 // RFC 1929 authentication is bounded by the caller's SOCKS setup deadline.
-func authenticate(conn net.Conn, credentials []*Credentials, limiter *authlimit.Limiter) error {
+func authenticate(conn net.Conn, provider func() []*Credentials, limiter *authlimit.Limiter) error {
 	peer := authlimit.PeerKey(conn.RemoteAddr())
 	allowed := limiter == nil || limiter.Allow(peer)
 	header := make([]byte, 2)
@@ -146,7 +156,10 @@ func authenticate(conn net.Conn, credentials []*Credentials, limiter *authlimit.
 	// Fixed-size digests avoid length-dependent credential comparisons.
 	actualUser, actualPass := sha256.Sum256(username), sha256.Sum256(password)
 	matched := 0
-	for _, auth := range credentials {
+	for _, auth := range provider() {
+		if auth == nil {
+			continue
+		}
 		expectedUser, expectedPass := sha256.Sum256([]byte(auth.Username)), sha256.Sum256([]byte(auth.Password))
 		matched |= subtle.ConstantTimeCompare(actualUser[:], expectedUser[:]) & subtle.ConstantTimeCompare(actualPass[:], expectedPass[:])
 	}

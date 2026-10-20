@@ -28,6 +28,9 @@ type ClientConfig struct {
 	AuthToken              string              `json:"auth_token"`
 	SNI                    string              `json:"sni"`
 	CertificateFingerprint string              `json:"certificate_fingerprint,omitempty"`
+	UDPSourcePolicy        string              `json:"udp_source_policy,omitempty"`
+	UDPRelayPortMin        int                 `json:"udp_relay_port_min,omitempty"`
+	UDPRelayPortMax        int                 `json:"udp_relay_port_max,omitempty"`
 }
 
 func LoadClientConfig(path string) (*ClientConfig, error) {
@@ -75,7 +78,31 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	if err := cfg.UDPQueueConfig.validate(); err != nil {
 		return nil, err
 	}
+	if err := cfg.validateUDPRelay(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+func (cfg *ClientConfig) UDPSourceMode() string {
+	if cfg.UDPSourcePolicy == "" {
+		return "strict"
+	}
+	return cfg.UDPSourcePolicy
+}
+
+func (cfg *ClientConfig) validateUDPRelay() error {
+	if mode := cfg.UDPSourceMode(); mode != "strict" && mode != "nat" {
+		return fmt.Errorf("udp_source_policy must be strict or nat")
+	}
+	lo, hi := cfg.UDPRelayPortMin, cfg.UDPRelayPortMax
+	if lo == 0 && hi == 0 {
+		return nil
+	}
+	if lo < 1 || hi < lo || hi > 65535 || hi-lo >= 1024 {
+		return fmt.Errorf("UDP relay port range must contain 1..1024 ports within 1..65535")
+	}
+	return nil
 }
 
 func (cfg *ClientConfig) SOCKSCredentials() (string, string, bool) {

@@ -39,6 +39,10 @@ type udpTarget struct {
 
 type udpDialFunc func(context.Context, string, string) (net.Conn, error)
 
+type udpTargetFailures struct {
+	dial, dns, write, read atomic.Uint64
+}
+
 func handleUDPTunnel(tunnelConn net.Conn, reader *bufio.Reader, logger *slog.Logger, startedAt time.Time, idleDuration time.Duration, releaseSetup func(), queueConfig config.UDPQueueConfig, limits ...*datagram.Resources) {
 	dialer := &net.Dialer{}
 	handleUDPTunnelWithDial(tunnelConn, reader, logger, startedAt, idleDuration, releaseSetup, queueConfig, dialer.DialContext, limits...)
@@ -80,6 +84,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 	targetSlots := make(chan struct{}, udpTargetLimit)
 	targets := make(map[string]*udpTarget)
 	var downloaded, droppedResponses, uploaded, droppedRequests atomic.Uint64
+	var targetFailures udpTargetFailures
 	var targetFull, targetExpired, targetPeakBytes uint64
 	var expiredTargets uint64
 	peakTargets := 0
@@ -114,6 +119,8 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 		responses.Close()
 		in, out := requests.Stats(), responses.Stats()
 		logging.LogUDPResult(logger, resources, closeStage, closeErr, tunnelWriter.Stats(),
+			"target_dial_failures", targetFailures.dial.Load(), "target_dns_failures", targetFailures.dns.Load(),
+			"target_write_failures", targetFailures.write.Load(), "target_read_failures", targetFailures.read.Load(),
 			"upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(),
 			"dropped_requests", droppedRequests.Load(), "dropped_responses", droppedResponses.Load(),
 			"queue_full_drops", in.FullDrops+out.FullDrops+targetFull,
@@ -175,21 +182,23 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 			if !ok {
 				continue
 			}
-			destination, payload, err := socks5.ParseUDPDatagram(frame.Data)
+			header, payload, err := socks5.ParseUDPHeader(frame.Data)
 			if err != nil {
 				frame.Release()
 				droppedRequests.Add(1)
 				logger.Debug("drop invalid tunneled UDP packet", "error", err)
 				continue
 			}
-			address := net.JoinHostPort(destination.Host, strconv.Itoa(int(destination.Port)))
+			// A lookup-only []byte-to-string conversion does not allocate. Copy the
+			// header key and format the dial address only when creating a target.
+			key := frame.Data[3:header.Size]
 			// Pending target queues own the parsed payload slice and retain its
 			// original age; target workers need no second header parse/allocation.
 			frame.Data = payload
-			target := targets[address]
+			target := targets[string(key)]
 			if target != nil && target.failed.Load() {
 				retire(target)
-				delete(targets, address)
+				delete(targets, string(key))
 				target = nil
 			}
 			if target == nil {
@@ -219,6 +228,8 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 					continue
 				}
 				targetCtx, targetCancel := context.WithCancel(ctx)
+				destination := socks5.UDPDatagram{Host: header.Host(), Port: header.Port}
+				address := net.JoinHostPort(destination.Host, strconv.Itoa(int(destination.Port)))
 				target = &udpTarget{
 					destination: destination, cancel: targetCancel,
 					pending: datagram.NewQueue(udpTargetQueueSize, min(udpTargetQueueBytes, maxBytes), maxAge, pendingBudget, resources),
@@ -232,13 +243,13 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 					continue
 				}
 				target.lastActivity.Store(time.Now().UnixNano())
-				targets[address] = target
+				targets[string(key)] = target
 				peakTargets = max(peakTargets, len(targets))
 				workers.Add(1)
 				go func(targetCtx context.Context, target *udpTarget, address string) {
 					defer workers.Done()
 					defer func() { <-targetSlots; resources.ReleaseSocket() }()
-					runUDPTarget(targetCtx, target, address, dial, dnsSlots, responses, &uploaded, &downloaded, &droppedResponses, logger)
+					runUDPTarget(targetCtx, target, address, dial, dnsSlots, responses, &uploaded, &downloaded, &droppedResponses, logger, &targetFailures)
 				}(targetCtx, target, address)
 				continue
 			}
@@ -254,7 +265,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 
 // A bounded worker owns each target's dial and writes. Slow DNS or socket writes
 // never run in the association dispatcher. Numeric targets bypass DNS slots.
-func runUDPTarget(ctx context.Context, target *udpTarget, address string, dial udpDialFunc, dnsSlots chan struct{}, responses *datagram.Queue, uploaded, downloaded, dropped *atomic.Uint64, logger *slog.Logger) {
+func runUDPTarget(ctx context.Context, target *udpTarget, address string, dial udpDialFunc, dnsSlots chan struct{}, responses *datagram.Queue, uploaded, downloaded, dropped *atomic.Uint64, logger *slog.Logger, failures *udpTargetFailures) {
 	defer func() {
 		target.failed.Store(true)
 		target.cancel()
@@ -276,6 +287,13 @@ func runUDPTarget(ctx context.Context, target *udpTarget, address string, dial u
 	}
 	cancel()
 	if err != nil {
+		if ctx.Err() == nil {
+			failures.dial.Add(1)
+			var dns *net.DNSError
+			if errors.As(err, &dns) {
+				failures.dns.Add(1)
+			}
+		}
 		logger.Debug("UDP target dial failed", "error", err)
 		return
 	}
@@ -287,7 +305,7 @@ func runUDPTarget(ctx context.Context, target *udpTarget, address string, dial u
 	go func() {
 		defer close(readerDone)
 		defer target.cancel()
-		readUDPResponses(target, responses, ctx.Done(), downloaded, dropped, logger)
+		readUDPResponses(target, responses, ctx.Done(), downloaded, dropped, logger, failures)
 	}()
 	defer func() { target.cancel(); _ = conn.Close(); <-readerDone }()
 	for ctx.Err() == nil {
@@ -296,12 +314,18 @@ func runUDPTarget(ctx context.Context, target *udpTarget, address string, dial u
 			return
 		}
 		if err := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			if ctx.Err() == nil {
+				failures.write.Add(1)
+			}
 			packet.Release()
 			return
 		}
 		_, err := conn.Write(packet.Data)
 		packet.Release()
 		if err != nil {
+			if ctx.Err() == nil {
+				failures.write.Add(1)
+			}
 			logger.Debug("write target UDP failed", "error", err)
 			return
 		}
@@ -310,7 +334,7 @@ func runUDPTarget(ctx context.Context, target *udpTarget, address string, dial u
 	}
 }
 
-func readUDPResponses(target *udpTarget, responses *datagram.Queue, done <-chan struct{}, downloaded, dropped *atomic.Uint64, logger *slog.Logger) {
+func readUDPResponses(target *udpTarget, responses *datagram.Queue, done <-chan struct{}, downloaded, dropped *atomic.Uint64, logger *slog.Logger, failures ...*udpTargetFailures) {
 	defer func() {
 		target.failed.Store(true)
 		_ = target.conn.Close()
@@ -331,6 +355,13 @@ func readUDPResponses(target *udpTarget, responses *datagram.Queue, done <-chan 
 	for {
 		n, err := target.conn.Read(buffer[len(header):])
 		if err != nil {
+			select {
+			case <-done:
+			default:
+				if len(failures) > 0 && !errors.Is(err, net.ErrClosed) {
+					failures[0].read.Add(1)
+				}
+			}
 			target.failed.Store(true)
 			logger.Debug("read target UDP failed", "error", err)
 			return

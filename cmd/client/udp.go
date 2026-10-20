@@ -14,6 +14,7 @@ import (
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -82,14 +83,23 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	}
 	ctx, cancel := context.WithTimeout(parent, remoteSetupTimeout)
 	defer cancel()
-	resolveCtx, resolveCancel := context.WithTimeout(ctx, socks5Timeout)
-	allowedSources, rep, err := resolveUDPAssociateSource(resolveCtx, request.Address, tcpPeer.IP, lookup)
-	resolveCancel()
+	allowedSources, rep, err := []net.IP{tcpPeer.IP}, byte(0), error(nil)
+	port := request.Port
+	if cfg.UDPSourceMode() == "nat" {
+		// The declaration can describe the endpoint before NAT. The authenticated
+		// TCP peer remains the IP boundary; learn only its mapped UDP port.
+		port = 0
+	} else {
+		resolveCtx, resolveCancel := context.WithTimeout(ctx, socks5Timeout)
+		allowedSources, rep, err = resolveUDPAssociateSource(resolveCtx, request.Address, tcpPeer.IP, lookup)
+		resolveCancel()
+	}
 	if err != nil {
 		logging.Failure(logger, "udp_source", err)
 		_ = socks5.Reply(clientConn, rep)
 		return
 	}
+	filter := newUDPSourceFilter(allowedSources, port)
 	if !resources.AcquireSocket() {
 		logging.Failure(logger, "udp_bind", datagram.ErrResourceLimit)
 		_ = socks5.Reply(clientConn, 0x01)
@@ -100,7 +110,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	if tcpLocal, ok := clientConn.LocalAddr().(*net.TCPAddr); ok && tcpLocal.IP.To4() == nil {
 		bindIP = net.IPv6unspecified
 	}
-	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: bindIP})
+	udpConn, err := listenUDPRelay(bindIP, cfg)
 	if err != nil {
 		logger.Warn("bind SOCKS5 UDP relay failed", "error", err)
 		_ = socks5.Reply(clientConn, 0x01)
@@ -147,6 +157,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	}
 	releaseSetup()
 	logger.Info("ready", "transport", "udp", "remote_addr", cfg.RemoteAddr,
+		"udp_source_policy", cfg.UDPSourceMode(), "udp_relay_port", bound.Port,
 		"socks_duration", socksDuration, "pool_hit", session.PoolHit,
 		"pool_fallback", session.PoolFallback, "pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
@@ -170,7 +181,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	}
 	var workers sync.WaitGroup
 
-	var clientUDP *net.UDPAddr
+	var clientUDP netip.AddrPort
 	var clientUDPmu sync.Mutex
 	maxBytes, maxAge := cfg.QueueLimits()
 	responses := datagram.NewQueue(128, maxBytes, maxAge, nil, resources)
@@ -180,13 +191,23 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	var downloaded atomic.Uint64
 	var dropped atomic.Uint64
 	var writeErrors atomic.Uint64
+	var received, sourceIPDrops, sourcePortDrops, bindingDrops, invalidDrops, oversizedDrops uint64
+	var firstDatagramAt time.Time
+	readyAt := time.Now()
 	defer func() {
 		stopSession("udp_session", nil)
 		workers.Wait()
 		requests.Close()
 		responses.Close()
 		in, out := requests.Stats(), responses.Stats()
+		var firstDuration time.Duration
+		if !firstDatagramAt.IsZero() {
+			firstDuration = firstDatagramAt.Sub(readyAt)
+		}
 		logging.LogUDPResult(logger, resources, closeStage, closeErr, tunnelWriter.Stats(), "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(),
+			"received_datagrams", received, "source_ip_drops", sourceIPDrops, "source_port_drops", sourcePortDrops,
+			"source_binding_drops", bindingDrops, "invalid_datagrams", invalidDrops, "oversized_datagrams", oversizedDrops,
+			"first_datagram_seen", !firstDatagramAt.IsZero(), "first_datagram_duration", firstDuration,
 			"dropped_datagrams", dropped.Load()+in.ExpiredDrops+out.ExpiredDrops,
 			"queue_full_drops", in.FullDrops+out.FullDrops, "queue_expired_drops", in.ExpiredDrops+out.ExpiredDrops,
 			"queue_resource_drops", in.ResourceDrops+out.ResourceDrops,
@@ -252,14 +273,14 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 				clientUDPmu.Lock()
 				peer := clientUDP
 				clientUDPmu.Unlock()
-				if peer != nil {
+				if peer.IsValid() {
 					if err := udpConn.SetWriteDeadline(time.Now().Add(maxAge)); err != nil {
 						writeErrors.Add(1)
 						dropped.Add(1)
 						response.Release()
 						continue
 					}
-					if _, err := udpConn.WriteToUDP(response.Data, peer); err != nil {
+					if _, err := udpConn.WriteToUDPAddrPort(response.Data, peer); err != nil {
 						writeErrors.Add(1)
 						dropped.Add(1)
 					} else {
@@ -274,41 +295,45 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	}()
 	packet := scratch.Data
 	for {
-		n, source, err := udpConn.ReadFromUDP(packet)
+		n, source, err := udpConn.ReadFromUDPAddrPort(packet)
 		if err != nil {
 			stopSession("udp_read", err)
 			return
 		}
+		received++
+		if firstDatagramAt.IsZero() {
+			firstDatagramAt = time.Now()
+		}
+		source = netip.AddrPortFrom(source.Addr().Unmap(), source.Port())
 		if n > tunnel.MaxDatagramSize {
+			oversizedDrops++
 			dropped.Add(1)
 			continue
 		}
-		allowedSource := false
-		for _, allowed := range allowedSources {
-			if source.IP.Equal(allowed) {
-				allowedSource = true
-				break
+		if reason := filter.rejection(source); reason != "" {
+			switch reason {
+			case "ip":
+				sourceIPDrops++
+			case "port":
+				sourcePortDrops++
+			case "binding":
+				bindingDrops++
 			}
-		}
-		if !allowedSource || (request.Port != 0 && source.Port != int(request.Port)) {
 			dropped.Add(1)
 			continue
 		}
-		if _, _, err := socks5.ParseUDPDatagram(packet[:n]); err != nil {
+		if err := socks5.ValidateUDPDatagram(packet[:n]); err != nil {
+			invalidDrops++
 			dropped.Add(1)
 			logger.Debug("drop malformed SOCKS5 UDP datagram", "error", err)
 			continue
 		}
 		clientUDPmu.Lock()
-		if clientUDP == nil {
+		if !clientUDP.IsValid() {
 			clientUDP = source
+			filter.bound = source
 		}
-		matchesPeer := source.IP.Equal(clientUDP.IP) && source.Port == clientUDP.Port && source.Zone == clientUDP.Zone
 		clientUDPmu.Unlock()
-		if !matchesPeer {
-			dropped.Add(1)
-			continue
-		}
 		select {
 		case <-stop:
 			return

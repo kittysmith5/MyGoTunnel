@@ -26,6 +26,7 @@ type udpAssociationTest struct {
 	remote  net.Conn
 	relay   *net.UDPAddr
 	done    <-chan struct{}
+	logs    *bytes.Buffer
 }
 
 // Exercise the real uTLS connection and TCP peer addresses without using an
@@ -36,6 +37,10 @@ func newUDPAssociationTest(t *testing.T, request socks5.Request, limits ...*data
 }
 
 func newUDPAssociationTestReply(t *testing.T, request socks5.Request, wantRep byte, lookup udpSourceLookup, limits ...*datagram.Resources) udpAssociationTest {
+	return newUDPAssociationTestConfig(t, request, wantRep, lookup, nil, limits...)
+}
+
+func newUDPAssociationTestConfig(t *testing.T, request socks5.Request, wantRep byte, lookup udpSourceLookup, options *config.ClientConfig, limits ...*datagram.Resources) udpAssociationTest {
 	t.Helper()
 	certSource := httptest.NewTLSServer(nil)
 	cert := certSource.TLS.Certificates[0]
@@ -101,13 +106,17 @@ func newUDPAssociationTestReply(t *testing.T, request socks5.Request, wantRep by
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
+	logs := new(bytes.Buffer)
+	cfg := new(config.ClientConfig)
+	if options != nil {
+		*cfg = *options
+	}
+	pin := sha256.Sum256(cert.Certificate[0])
+	cfg.RemoteAddr, cfg.AuthToken, cfg.CertificateFingerprint = listener.Addr().String(), "test-token", hex.EncodeToString(pin[:])
 	go func() {
 		defer close(done)
 		defer clientConn.Close()
-		pin := sha256.Sum256(cert.Certificate[0])
-		handleUDPAssociateWithResolver(context.Background(), clientConn, request, &config.ClientConfig{
-			RemoteAddr: listener.Addr().String(), AuthToken: "test-token", CertificateFingerprint: hex.EncodeToString(pin[:]),
-		}, slog.New(slog.NewTextHandler(io.Discard, nil)), time.Now(), func() {}, nil, lookup, limits...)
+		handleUDPAssociateWithResolver(context.Background(), clientConn, request, cfg, slog.New(slog.NewTextHandler(logs, nil)), time.Now(), func() {}, nil, lookup, limits...)
 	}()
 	t.Cleanup(func() {
 		_ = control.Close()
@@ -136,10 +145,10 @@ func newUDPAssociationTestReply(t *testing.T, request socks5.Request, wantRep by
 			t.Fatal("rejected UDP source opened remote connection")
 		default:
 		}
-		return udpAssociationTest{control: control, done: done}
+		return udpAssociationTest{control: control, done: done, logs: logs}
 	}
 	return udpAssociationTest{
-		control: control, remote: <-remoteConn, done: done,
+		control: control, remote: <-remoteConn, done: done, logs: logs,
 		relay: &net.UDPAddr{IP: net.IP(reply[4:8]), Port: int(binary.BigEndian.Uint16(reply[8:]))},
 	}
 }
