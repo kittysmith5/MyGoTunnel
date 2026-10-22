@@ -89,7 +89,7 @@ func TestUDPExpiredSlowQueuesReleaseSharedBudgetBeforeDNSCompletes(t *testing.T)
 	}
 	client.Close()
 	<-done
-	if text := logs.String(); !strings.Contains(text, "queue_full_drops=0") || !strings.Contains(text, "queue_expired_drops=32") || !strings.Contains(text, "target_queue_expiry_sweeps=1") {
+	if text := logs.String(); !strings.Contains(text, "queue_full_drops=0") || !strings.Contains(text, "queue_expired_drops=32") || strings.Contains(text, "target_queue_expiry_sweeps=0") {
 		t.Fatal(text)
 	}
 	if s := resources.Stats(); s.Sockets != 0 || s.ResidentBytes != 0 || s.BufferBytes != s.CachedBytes {

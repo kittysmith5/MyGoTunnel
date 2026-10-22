@@ -36,6 +36,9 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":9001"
 	}
+	if err := validateListenAddress(cfg.ListenAddr); err != nil {
+		return nil, fmt.Errorf("invalid listen_addr: %w", err)
+	}
 
 	if !validToken(cfg.AuthToken) {
 		return nil, fmt.Errorf("auth_token is invalid")

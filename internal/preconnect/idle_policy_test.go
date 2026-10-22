@@ -67,12 +67,12 @@ func TestIdlePolicySkipsSurplusRenewalAndRestoresOnDemand(t *testing.T) {
 	idle(t, p, 4)
 	forceIdleFloor(p)
 	p.mu.Lock()
-	for _, entry := range p.idle {
+	for _, entry := range p.idle[:len(p.idle)-1] {
 		entry.refreshAt = time.Now().Add(-time.Second)
 	}
 	p.mu.Unlock()
 	p.signal()
-	// A manager tick must not create useless replacements for excess entries.
+	// A fresh keeper already exists; do not renew the aging surplus as well.
 	time.Sleep(150 * time.Millisecond)
 	if f.calls.Load() != 4 {
 		t.Fatal("renewed surplus connections while shrinking", f.calls.Load())

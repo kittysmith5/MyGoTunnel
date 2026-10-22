@@ -51,7 +51,9 @@ func WriteDatagram(w io.Writer, packet []byte) error {
 
 // WriteDatagramQueue drops expired packets at dequeue and flushes at most 32
 // fresh packets without waiting to fill a batch.
-func WriteDatagramQueue(w *bufio.Writer, queue *datagram.Queue) error {
+func WriteDatagramQueue(w *bufio.Writer, queue interface {
+	TryPop() (datagram.Packet, bool)
+}) error {
 	for i := 0; i < 32; i++ {
 		packet, ok := queue.TryPop()
 		if !ok {

@@ -177,7 +177,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleClientWithResourcesAndAuthLimiter(ctx, conn, cfg, logger, permit.Release, pool, resources, authLimiter)
+		handleClientWithResourcesAndAuthLimiter(ctx, conn, cfg, logger, permit.Release, pool, resources, authLimiter, permit.AbortContext())
 	}, nil, metrics)
 }
 
@@ -197,7 +197,7 @@ func handleClientWithResources(parent context.Context, clientConn net.Conn, cfg 
 	handleClientWithResourcesAndAuthLimiter(parent, clientConn, cfg, logger, releaseSetup, pool, resources, nil)
 }
 
-func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pool *preconnect.Pool, resources *datagram.Resources, authLimiter *authlimit.Limiter) {
+func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pool *preconnect.Pool, resources *datagram.Resources, authLimiter *authlimit.Limiter, abortContexts ...context.Context) {
 	defer clientConn.Close()
 
 	clientAddr := clientConn.RemoteAddr().String()
@@ -308,6 +308,10 @@ func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn 
 		"pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
 		"setup_duration", time.Since(startedAt))
-	result := relay.CopyBidirectional(clientConn, clientReader, remoteConn, remoteReader)
+	abortContext := context.Background()
+	if len(abortContexts) > 0 && abortContexts[0] != nil {
+		abortContext = abortContexts[0]
+	}
+	result := relay.CopyBidirectionalContext(abortContext, clientConn, clientReader, remoteConn, remoteReader)
 	logging.LogTunnelResult(requestLogger, result, startedAt, "application", "tunnel")
 }

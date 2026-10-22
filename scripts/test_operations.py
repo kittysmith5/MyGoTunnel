@@ -204,4 +204,285 @@ class ObservationCoverageTest(unittest.TestCase):
   self.assertEqual(b.snapshot()['auth_failed'],3)
   self.assertEqual(b.snapshot()['setup_failed'],5)
 
+class UpgradeTransactionFixture:
+ def __init__(self,test,with_state=True):
+  import contextlib,hashlib,os
+  from unittest import mock
+  self.test=test;self.directory=tempfile.TemporaryDirectory();test.addCleanup(self.directory.cleanup)
+  self.base=pathlib.Path(self.directory.name);self.root=self.base/'releases';self.root.mkdir(mode=0o700)
+  self.binary=self.base/'live';self.binary.write_bytes(b'version-one');self.binary.chmod(0o755)
+  self.candidate=self.base/'new';self.candidate.write_bytes(b'version-two');self.candidate.chmod(0o700)
+  self.config=self.base/'config.json';self.config.write_bytes(b'{"test":true}\n');self.config.chmod(0o600)
+  self.running=self.base/'runtime';self.running.write_bytes(self.binary.read_bytes())
+  self.state=self.root/'client.json';self.unit='mygotunnel-client.service';self.unit_text='unchanged unit'
+  if with_state:
+   prior=self.root/'client-older';prior.write_bytes(b'version-zero')
+   self.state.write_text(__import__('json').dumps({'previous':str(prior),'sha256':hashlib.sha256(prior.read_bytes()).hexdigest()}))
+  self.before_state=self.state.read_bytes() if with_state else None
+  self.module=load('mygotunnelctl');self.module.ROOT=self.root
+  self.stack=contextlib.ExitStack();test.addCleanup(self.stack.close)
+  self.restart_calls=[];self.checks=[];self.real_digest=self.module.digest;self.active=True
+  self.stack.enter_context(mock.patch.object(self.module,'run',side_effect=self.run))
+  self.stack.enter_context(mock.patch.object(self.module,'check',side_effect=self.check))
+  self.stack.enter_context(mock.patch.object(self.module,'digest',side_effect=self.digest))
+  self.stack.enter_context(mock.patch.object(self.module.time,'sleep'))
+ def digest(self,path):
+  if str(path)=='/proc/123/exe':path=self.running
+  return self.real_digest(path)
+ def run(self,*args):
+  if args[:2]==('systemctl','cat'):return self.unit_text
+  if args[:2]==('systemctl','restart'):
+   self.restart_calls.append(args[2]);self.running.write_bytes(self.binary.read_bytes());self.active=True;return ''
+  if args[:2]==('systemctl','is-active'):
+   if not self.active:raise __import__('subprocess').CalledProcessError(3,args)
+   return 'active'
+  if args[:2]==('systemctl','show'):return '123'
+  raise AssertionError('unexpected administrative command')
+ def check(self,binary,config,health=False):self.checks.append((pathlib.Path(binary).read_bytes(),health))
+ def change(self):return self.module.change_release('client',self.binary,self.config,self.unit,self.state,self.candidate)
+ def begin(self):return self.module.begin_transaction('client',self.binary,self.config,self.unit,self.candidate,self.state)
+ def recover(self):return self.module.recover_transaction('client',self.binary,self.config,self.unit,self.state)
+ def assert_old_restored(self):
+  self.test.assertEqual(self.binary.read_bytes(),b'version-one');self.test.assertEqual(self.running.read_bytes(),b'version-one')
+  self.test.assertEqual(self.state.read_bytes() if self.state.exists() else None,self.before_state)
+  self.test.assertFalse(self.module.intent_path('client').exists())
+
+class UpgradeTransactionTest(unittest.TestCase):
+ def test_success_publishes_intent_before_replace_and_commits_rollback_state(self):
+  import json,hashlib
+  from unittest import mock
+  f=UpgradeTransactionFixture(self);m=f.module;atomic=m.atomic
+  def replace(source,destination):
+   record=m.read_record(m.intent_path('client'))
+   self.assertEqual(record['phase'],'prepared');self.assertEqual(f.binary.read_bytes(),b'version-one')
+   self.assertTrue(pathlib.Path(record['recovery_binary']).exists())
+   self.assertTrue(pathlib.Path(record['state_before_copy']).exists())
+   return atomic(source,destination)
+  with mock.patch.object(m,'atomic',side_effect=replace),mock.patch.object(m,'fsync_directory',wraps=m.fsync_directory) as sync:
+   self.assertFalse(f.change())
+  self.assertEqual(f.binary.read_bytes(),b'version-two');self.assertEqual(f.running.read_bytes(),b'version-two')
+  state=json.loads(f.state.read_text());self.assertEqual(pathlib.Path(state['previous']).read_bytes(),b'version-one')
+  self.assertEqual(state['sha256'],hashlib.sha256(b'version-one').hexdigest())
+  self.assertFalse(m.intent_path('client').exists())
+  self.assertFalse(list(f.base.glob('.mygotunnel-recovery-*')));self.assertFalse(list(f.root.glob('.client-state-before-*')))
+  self.assertIn(mock.call(f.binary.parent),sync.call_args_list);self.assertIn(mock.call(f.root),sync.call_args_list)
+  self.assertEqual(f.config.read_bytes(),b'{"test":true}\n');self.assertEqual(f.unit_text,'unchanged unit')
+
+ def test_state_enospc_restores_previous_bytes_using_preallocated_files(self):
+  import errno
+  from unittest import mock
+  f=UpgradeTransactionFixture(self);m=f.module;write=m.write_json
+  def full(path,value):
+   if path==f.state:raise OSError(errno.ENOSPC,'injected state filesystem full')
+   return write(path,value)
+  with mock.patch.object(m,'write_json',side_effect=full),mock.patch.object(m,'atomic',wraps=m.atomic) as copy:
+   with self.assertRaises(OSError):f.change()
+  self.assertEqual(copy.call_count,1) # Rollback uses a reserved rename, not a second allocation.
+  f.assert_old_restored()
+
+ def test_state_fsync_failure_after_rename_restores_exact_old_state(self):
+  import errno
+  from unittest import mock
+  for with_state in (False,True):
+   with self.subTest(with_state=with_state):
+    f=UpgradeTransactionFixture(self,with_state);m=f.module;write=m.write_json
+    def failed_sync(path,value):
+     write(path,value)
+     if path==f.state:raise OSError(errno.EIO,'injected state directory fsync failure')
+    with mock.patch.object(m,'write_json',side_effect=failed_sync):
+     with self.assertRaises(OSError):f.change()
+    f.assert_old_restored()
+
+ def test_commit_record_enospc_still_rolls_back_with_existing_prepared_intent(self):
+  import errno
+  from unittest import mock
+  f=UpgradeTransactionFixture(self);m=f.module;write=m.write_json
+  def full(path,value):
+   if path==m.intent_path('client') and value['phase']=='committed':raise OSError(errno.ENOSPC,'injected commit marker full')
+   return write(path,value)
+  with mock.patch.object(m,'write_json',side_effect=full):
+   with self.assertRaises(OSError):f.change()
+  f.assert_old_restored()
+
+ def test_failure_publishing_intent_never_replaces_or_restarts(self):
+  import errno
+  from unittest import mock
+  f=UpgradeTransactionFixture(self);m=f.module
+  with mock.patch.object(m,'write_json',side_effect=OSError(errno.ENOSPC,'injected intent full')):
+   with self.assertRaises(OSError):f.change()
+  f.assert_old_restored();self.assertEqual(f.restart_calls,[])
+  self.assertFalse(list(f.base.glob('.mygotunnel-recovery-*')))
+
+ def test_preflight_rejects_before_any_transaction_or_restart(self):
+  from unittest import mock
+  f=UpgradeTransactionFixture(self)
+  with mock.patch.object(f.module,'check',side_effect=RuntimeError('configuration invalid')):
+   with self.assertRaises(RuntimeError):f.change()
+  f.assert_old_restored();self.assertEqual(f.restart_calls,[])
+
+ def test_interrupted_after_replace_before_restart_is_recovered(self):
+  import multiprocessing,os
+  if 'fork' not in multiprocessing.get_all_start_methods():self.skipTest('Linux fork failure injection')
+  f=UpgradeTransactionFixture(self);m=f.module
+  def killed_controller():
+   run=m.run
+   def stop(*args):
+    if args[:2]==('systemctl','restart'):os._exit(91)
+    return run(*args)
+   m.run=stop;f.change()
+  child=multiprocessing.get_context('fork').Process(target=killed_controller)
+  child.start();child.join(5)
+  if child.is_alive():child.kill();child.join();self.fail('controller did not stop')
+  self.assertEqual(child.exitcode,91);self.assertEqual(f.binary.read_bytes(),b'version-two')
+  self.assertTrue(m.intent_path('client').exists());self.assertEqual(f.running.read_bytes(),b'version-one')
+  self.assertEqual(f.recover(),'rolled_back');f.assert_old_restored()
+  self.assertEqual(f.restart_calls,[]) # The old process never stopped; recovery avoids another outage.
+
+ def test_interrupted_after_restart_before_state_commit_is_recovered(self):
+  import multiprocessing,os
+  if 'fork' not in multiprocessing.get_all_start_methods():self.skipTest('Linux fork failure injection')
+  f=UpgradeTransactionFixture(self);m=f.module
+  def killed_controller():
+   write=m.write_json
+   def stop(path,value):
+    if path==f.state:os._exit(92)
+    return write(path,value)
+   m.write_json=stop;f.change()
+  child=multiprocessing.get_context('fork').Process(target=killed_controller)
+  child.start();child.join(5)
+  if child.is_alive():child.kill();child.join();self.fail('controller did not stop')
+  self.assertEqual(child.exitcode,92);self.assertEqual(f.running.read_bytes(),b'version-two')
+  self.assertEqual(f.recover(),'rolled_back');f.assert_old_restored()
+  self.assertEqual(f.restart_calls,[f.unit])
+
+ def test_interrupted_after_commit_only_cleans_up_without_rolling_back(self):
+  import multiprocessing,os
+  if 'fork' not in multiprocessing.get_all_start_methods():self.skipTest('Linux fork failure injection')
+  f=UpgradeTransactionFixture(self);m=f.module
+  def killed_controller():
+   m.cleanup_transaction=lambda record:os._exit(93)
+   f.change()
+  child=multiprocessing.get_context('fork').Process(target=killed_controller)
+  child.start();child.join(5)
+  if child.is_alive():child.kill();child.join();self.fail('controller did not stop')
+  self.assertEqual(child.exitcode,93);self.assertEqual(m.read_record(m.intent_path('client'))['phase'],'committed')
+  self.assertEqual(f.recover(),'committed');self.assertEqual(f.binary.read_bytes(),b'version-two')
+  self.assertEqual(f.running.read_bytes(),b'version-two');self.assertEqual(f.restart_calls,[])
+  self.assertFalse(m.intent_path('client').exists())
+
+ def test_committed_recovery_restarts_the_committed_version_if_needed(self):
+  from unittest import mock
+  for process_state in ('stopped','stale-old-process'):
+   with self.subTest(process_state=process_state):
+    f=UpgradeTransactionFixture(self);m=f.module
+    with mock.patch.object(m,'cleanup_transaction',side_effect=OSError('injected interrupted cleanup')):
+     self.assertTrue(f.change())
+    f.restart_calls.clear()
+    if process_state=='stopped':f.active=False
+    else:f.running.write_bytes(b'version-one')
+    self.assertEqual(f.recover(),'committed')
+    self.assertEqual(f.binary.read_bytes(),b'version-two');self.assertEqual(f.running.read_bytes(),b'version-two')
+    self.assertEqual(f.restart_calls,[f.unit]);self.assertTrue(f.active)
+    self.assertFalse(m.intent_path('client').exists())
+
+ def test_committed_recovery_refuses_external_protected_file_changes(self):
+  from unittest import mock
+  for changed in ('config','unit'):
+   with self.subTest(changed=changed):
+    f=UpgradeTransactionFixture(self);m=f.module
+    with mock.patch.object(m,'cleanup_transaction',side_effect=OSError('injected interrupted cleanup')):
+     self.assertTrue(f.change())
+    f.restart_calls.clear()
+    if changed=='config':f.config.write_bytes(b'{"external_change":true}')
+    else:f.unit_text='externally changed unit'
+    f.active=False
+    with self.assertRaises(m.RecoveryRequired):f.recover()
+    self.assertEqual(f.restart_calls,[]);self.assertEqual(f.binary.read_bytes(),b'version-two')
+    self.assertTrue(m.intent_path('client').exists())
+
+ def test_committed_health_failure_remains_pending_without_downgrading(self):
+  from unittest import mock
+  f=UpgradeTransactionFixture(self);m=f.module
+  with mock.patch.object(m,'cleanup_transaction',side_effect=OSError('injected interrupted cleanup')):
+   self.assertTrue(f.change())
+  f.restart_calls.clear()
+  def unhealthy(binary,config,health=False):
+   if health:raise RuntimeError('injected committed health failure')
+  with mock.patch.object(m,'check',side_effect=unhealthy):
+   with self.assertRaises(m.RecoveryRequired):f.recover()
+  self.assertEqual(f.binary.read_bytes(),b'version-two');self.assertEqual(f.running.read_bytes(),b'version-two')
+  self.assertEqual(m.read_record(m.intent_path('client'))['phase'],'committed')
+  self.assertEqual(f.restart_calls,[f.unit])
+
+ def test_unprivileged_status_does_not_claim_no_pending_recovery(self):
+  from unittest import mock
+  f=UpgradeTransactionFixture(self);m=f.module
+  self.assertFalse(m.recovery_pending('client'))
+  f.begin();self.assertTrue(m.recovery_pending('client'))
+  with mock.patch.object(pathlib.Path,'lstat',side_effect=PermissionError('private release directory')):
+   self.assertIsNone(m.recovery_pending('client'))
+
+ def test_recovery_does_not_allocate_stage_or_continue_a_second_mutation(self):
+  import io,json,sys,types
+  from unittest import mock
+  for action in ('recover','upgrade','rollback'):
+   with self.subTest(action=action):
+    f=UpgradeTransactionFixture(self);m=f.module;f.begin();m.atomic(f.candidate,f.binary)
+    real_path=pathlib.Path
+    def mapped_path(value):
+     return {'/usr/local/bin/mygotunnel-client':f.binary,'/etc/mygotunnel/client.json':f.config}.get(str(value),real_path(value))
+    output=io.StringIO()
+    with mock.patch.object(m,'pathlib',types.SimpleNamespace(Path=mapped_path)),mock.patch.object(m.os,'geteuid',return_value=0),mock.patch.object(m,'ensure_release_directory'),mock.patch.object(m,'identity',return_value={'version':'test'}),mock.patch.object(m.tempfile,'TemporaryDirectory',side_effect=OSError('injected no free space for a new stage')),mock.patch.object(m,'prepare_upgrade') as prepare,mock.patch.object(sys,'argv',['ctl',action,'--role','client']),mock.patch.object(sys,'stdout',output):
+     self.assertEqual(m.main(),0)
+    result=json.loads(output.getvalue());self.assertEqual(result['action'],'recover');self.assertTrue(result['recovery_only'])
+    self.assertEqual(result['recovered'],'rolled_back');self.assertEqual(result['requested_action'],action)
+    self.assertFalse(prepare.called);f.assert_old_restored()
+
+ def test_failed_rollback_keeps_intent_and_can_be_retried(self):
+  from unittest import mock
+  f=UpgradeTransactionFixture(self);m=f.module
+  def unhealthy(binary,config,health=False):
+   if health:raise RuntimeError('injected health failure')
+  with mock.patch.object(m,'check',side_effect=unhealthy):
+   with self.assertRaises(m.RecoveryRequired):f.change()
+  self.assertTrue(m.intent_path('client').exists())
+  self.assertEqual(f.recover(),'rolled_back');f.assert_old_restored()
+
+ def test_recovery_preserves_external_config_changes_and_rejects_bad_paths(self):
+  f=UpgradeTransactionFixture(self);m=f.module;record=f.begin();m.atomic(f.candidate,f.binary)
+  f.config.write_bytes(b'{"external_change":true}')
+  with self.assertRaises(m.RecoveryRequired):f.recover()
+  self.assertEqual(f.config.read_bytes(),b'{"external_change":true}');self.assertEqual(f.binary.read_bytes(),b'version-two')
+  f.config.write_bytes(b'{"test":true}\n');record['previous']=str(f.base/'outside-release-directory')
+  m.write_json(m.intent_path('client'),record)
+  with self.assertRaises(m.RecoveryRequired):f.recover()
+  self.assertEqual(f.binary.read_bytes(),b'version-two');self.assertTrue(m.intent_path('client').exists())
+
+ def test_setid_is_rejected_before_replacement(self):
+  import stat
+  from unittest import mock
+  f=UpgradeTransactionFixture(self);m=f.module;f.binary.chmod(0o755|stat.S_ISUID)
+  with mock.patch.object(m,'atomic') as replace:
+   with self.assertRaises(m.FilePrivilegesUnsupported):f.change()
+  self.assertFalse(replace.called)
+  f.binary.chmod(0o755);f.assert_old_restored();self.assertEqual(f.restart_calls,[])
+
+ def test_file_capability_preflight_is_covered_without_privilege(self):
+  from unittest import mock
+  f=UpgradeTransactionFixture(self);m=f.module
+  with mock.patch.object(m.os,'getxattr',return_value=b'nonempty-capability',create=True),mock.patch.object(m,'atomic') as replace:
+   with self.assertRaises(m.FilePrivilegesUnsupported):f.change()
+  self.assertFalse(replace.called);f.assert_old_restored();self.assertEqual(f.restart_calls,[])
+
+ def test_real_file_capabilities_survive_safe_refusal(self):
+  import os,shutil,subprocess
+  f=UpgradeTransactionFixture(self);m=f.module
+  if not hasattr(os,'getxattr') or shutil.which('setcap') is None:self.skipTest('file capabilities unavailable')
+  result=subprocess.run(['setcap','cap_net_bind_service=ep',str(f.binary)],capture_output=True)
+  if result.returncode:self.skipTest('filesystem or user cannot set file capabilities')
+  before=os.getxattr(f.binary,'security.capability')
+  with self.assertRaises(m.FilePrivilegesUnsupported):f.change()
+  self.assertEqual(os.getxattr(f.binary,'security.capability'),before)
+  f.assert_old_restored();self.assertEqual(f.restart_calls,[])
+
 if __name__=='__main__': unittest.main()

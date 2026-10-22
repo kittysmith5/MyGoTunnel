@@ -65,7 +65,7 @@ func prepare(ctx context.Context, cfg *config.ClientConfig, ack bool) (entry *En
 	if err != nil {
 		return nil, err
 	}
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := context.AfterFunc(ctx, func() { closeUnused(conn) })
 	defer stop()
 	defer func() {
 		if err != nil {
@@ -74,7 +74,7 @@ func prepare(ctx context.Context, cfg *config.ClientConfig, ack bool) (entry *En
 			if contextErr := ctx.Err(); contextErr != nil {
 				err = contextErr
 			}
-			_ = conn.Close()
+			closeUnused(conn)
 		}
 	}()
 	deadline := time.Now().Add(tunnel.ControlTimeout + tunnel.ControlReplyTimeout)
@@ -132,4 +132,16 @@ func prepare(ctx context.Context, cfg *config.ClientConfig, ack bool) (entry *En
 		return nil, err
 	}
 	return &Entry{Conn: conn, Reader: reader, DialTimings: timings, CommandACK: commandACK}, nil
+}
+
+// Prepared connections have not carried application payload. Close the raw
+// transport so TLS close_notify cannot delay cancellation, retirement or Take.
+func closeUnused(conn net.Conn) {
+	if conn == nil {
+		return
+	}
+	if wrapped, ok := conn.(interface{ NetConn() net.Conn }); ok {
+		conn = wrapped.NetConn()
+	}
+	_ = conn.Close()
 }

@@ -14,10 +14,20 @@ import (
 // Permit supports temporarily releasing setup capacity while an authenticated
 // connection waits in the idle pool, then reacquiring before target dial.
 type Permit struct {
-	mu      sync.Mutex
-	slots   chan struct{}
-	held    bool
-	metrics *Counters
+	mu       sync.Mutex
+	slots    chan struct{}
+	held     bool
+	metrics  *Counters
+	abortCtx context.Context
+}
+
+// AbortContext is canceled only when the connection's shutdown grace expires.
+// Process cancellation initially stops setup/acceptance and allows relay drain.
+func (p *Permit) AbortContext() context.Context {
+	if p.abortCtx != nil {
+		return p.abortCtx
+	}
+	return context.Background()
 }
 
 func (p *Permit) Release() {
@@ -76,6 +86,8 @@ func ServeContext(ctx context.Context, grace time.Duration, listener net.Listene
 	if grace < 0 {
 		return fmt.Errorf("shutdown timeout must not be negative")
 	}
+	abortCtx, abort := context.WithCancel(context.Background())
+	defer abort()
 	var handlers sync.WaitGroup
 	var mu sync.Mutex
 	active := make(map[net.Conn]struct{})
@@ -91,6 +103,7 @@ func ServeContext(ctx context.Context, grace time.Duration, listener net.Listene
 			return
 		case <-timer.C:
 		}
+		abort() // Interrupt both relay endpoints, including an already half-closed flow.
 		mu.Lock()
 		remaining := make([]net.Conn, 0, len(active))
 		for c := range active {
@@ -164,7 +177,7 @@ func ServeContext(ctx context.Context, grace time.Duration, listener net.Listene
 		}
 		select {
 		case slots <- struct{}{}:
-			permit := &Permit{slots: slots, held: true, metrics: metrics}
+			permit := &Permit{slots: slots, held: true, metrics: metrics, abortCtx: abortCtx}
 			if metrics != nil {
 				metrics.Open.Add(1)
 				metrics.Setup.Add(1)

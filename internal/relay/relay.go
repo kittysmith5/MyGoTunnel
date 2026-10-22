@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -52,21 +53,43 @@ type copyResult struct {
 // drain. A copy or half-close error interrupts both endpoints so the other
 // goroutine can exit before this function returns.
 func CopyBidirectional(a net.Conn, aReader io.Reader, b net.Conn, bReader io.Reader) Result {
+	return CopyBidirectionalContext(context.Background(), a, aReader, b, bReader)
+}
+
+// CopyBidirectionalContext preserves normal half-close/drain behavior until ctx
+// is canceled. Cancellation force-closes BOTH transports and waits for workers;
+// callers should supply a grace-expiry context rather than process cancellation.
+func CopyBidirectionalContext(ctx context.Context, a net.Conn, aReader io.Reader, b net.Conn, bReader io.Reader) Result {
 	resultCh := make(chan copyResult, 2)
 
 	go copyDirection(resultCh, directionAToB, b, aReader)
 	go copyDirection(resultCh, directionBToA, a, bReader)
 
-	first := <-resultCh
+	aborted := false
+	var abortErr error
+	waitResult := func() copyResult {
+		if aborted {
+			return <-resultCh
+		}
+		select {
+		case copied := <-resultCh:
+			return copied
+		case <-ctx.Done():
+			aborted = true
+			abortErr = abortTransports(a, b)
+			return <-resultCh
+		}
+	}
+	first := waitResult()
 	result := Result{}
 	setDirectionResult(&result, first)
 
 	var interruptErr error
-	if first.result.Err != nil {
+	if first.result.Err != nil && !aborted {
 		interruptErr = interrupt(a, b)
 	}
 
-	second := <-resultCh
+	second := waitResult()
 	setDirectionResult(&result, second)
 
 	switch {
@@ -83,7 +106,24 @@ func CopyBidirectional(a net.Conn, aReader io.Reader, b net.Conn, bReader io.Rea
 		result.Fault = describeFault(second.result.Err, second.result.Phase, second.direction, a, b)
 		result.Err = directionError(second)
 	}
+	result.Err = errors.Join(result.Err, abortErr)
 
+	return result
+}
+
+func abortTransports(conns ...net.Conn) error {
+	var result error
+	for _, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		if wrapped, ok := conn.(interface{ NetConn() net.Conn }); ok {
+			conn = wrapped.NetConn()
+		}
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			result = errors.Join(result, fmt.Errorf("abort %T: %w", conn, err))
+		}
+	}
 	return result
 }
 

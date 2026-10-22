@@ -71,8 +71,8 @@ func (b *Budget) release(n int) {
 }
 
 type Stats struct {
-	Packets, Bytes, PeakBytes              int
-	FullDrops, ExpiredDrops, ResourceDrops uint64
+	Packets, Bytes, PeakBytes, Flows, PeakFlows          int
+	FullDrops, ExpiredDrops, ResourceDrops, EvictedDrops uint64
 }
 
 // Queue supports concurrent producers and one consumer. Payload ownership is

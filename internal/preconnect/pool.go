@@ -105,11 +105,9 @@ func (p *Pool) manage() {
 			// At most one proactive replacement per batch. Keep the old entry until
 			// success when spare capacity exists. At the hard cap retire at most one,
 			// and never proactively remove the last ready connection.
-			if len(jobs) == 0 && p.filling == 0 && len(p.idle) <= p.target {
-				for i, e := range p.idle {
-					if now.Before(e.refreshAt) {
-						continue
-					}
+			if len(jobs) == 0 && p.filling == 0 {
+				if i := p.renewalIndexLocked(now); i >= 0 {
+					e := p.idle[i]
 					if len(p.idle) < p.opts.MaxSize {
 						jobs = append(jobs, e)
 					} else if len(p.idle) > 1 {
@@ -117,7 +115,6 @@ func (p *Pool) manage() {
 						retired = e
 						jobs = append(jobs, e)
 					}
-					break
 				}
 			}
 			if len(jobs) > 0 {
@@ -130,7 +127,7 @@ func (p *Pool) manage() {
 		}
 		p.mu.Unlock()
 		if retired != nil {
-			_ = retired.Conn.Close()
+			closeUnused(retired.Conn)
 		}
 		// At the hard cap close the retired socket before opening its successor.
 		for _, old := range jobs {
@@ -196,7 +193,7 @@ func (p *Pool) fill(old *Entry) {
 	if p.closed || p.ctx.Err() != nil {
 		p.mu.Unlock()
 		if entry != nil && entry.Conn != nil {
-			_ = entry.Conn.Close()
+			closeUnused(entry.Conn)
 		}
 		return
 	}
@@ -208,7 +205,7 @@ func (p *Pool) fill(old *Entry) {
 		}
 		p.mu.Unlock()
 		if entry != nil && entry.Conn != nil {
-			_ = entry.Conn.Close()
+			closeUnused(entry.Conn)
 		}
 		if p.logger != nil {
 			p.logger.Debug("pool fill failed", "error", err)
@@ -231,11 +228,12 @@ func (p *Pool) fill(old *Entry) {
 	}
 	// Demand may have consumed the old entry, or the target may have shrunk.
 	// Never close a handed-off connection or retain surplus replacements.
-	if len(p.idle) >= p.target {
+	keepIdleKeeper := old != nil && p.keeperNeedsRenewalLocked(time.Now())
+	if len(p.idle) >= p.opts.MaxSize || (len(p.idle) >= p.target && !keepIdleKeeper) {
 		p.mu.Unlock()
-		_ = entry.Conn.Close()
+		closeUnused(entry.Conn)
 		if retired != nil {
-			_ = retired.Conn.Close()
+			closeUnused(retired.Conn)
 		}
 		p.signal()
 		return
@@ -249,7 +247,7 @@ func (p *Pool) fill(old *Entry) {
 	go p.guard(entry)
 	p.mu.Unlock()
 	if retired != nil {
-		_ = retired.Conn.Close()
+		closeUnused(retired.Conn)
 	}
 	p.signal()
 }
@@ -268,7 +266,7 @@ func (p *Pool) guard(entry *Entry) {
 	}
 	p.mu.Unlock()
 	if owned {
-		entry.Conn.Close()
+		closeUnused(entry.Conn)
 		p.signal()
 	}
 }
@@ -310,31 +308,35 @@ func (p *Pool) Take(ctx context.Context) *Entry {
 			p.mu.Unlock()
 			return nil
 		}
-		entry := p.idle[0]
-		p.idle = p.idle[1:]
+		// Entries are appended after successful preparation. Prefer the newest
+		// ready channel; older ones remain guarded and expire/renew normally.
+		last := len(p.idle) - 1
+		entry := p.idle[last]
+		p.idle[last] = nil
+		p.idle = p.idle[:last]
 		p.mu.Unlock()
 		p.signal()
 		if !time.Now().Before(entry.expires) {
-			entry.Conn.Close()
+			closeUnused(entry.Conn)
 			continue
 		}
 		if err := entry.Conn.SetReadDeadline(time.Now()); err != nil {
-			entry.Conn.Close()
+			closeUnused(entry.Conn)
 			continue
 		}
 		select {
 		case <-entry.done:
 		case <-ctx.Done():
-			entry.Conn.Close()
+			closeUnused(entry.Conn)
 			return nil
 		}
 		var netErr net.Error
 		if !errors.As(entry.guardErr, &netErr) || !netErr.Timeout() {
-			entry.Conn.Close()
+			closeUnused(entry.Conn)
 			continue
 		}
 		if err := entry.Conn.SetReadDeadline(time.Time{}); err != nil {
-			entry.Conn.Close()
+			closeUnused(entry.Conn)
 			continue
 		}
 		hit = true
@@ -347,7 +349,7 @@ func (p *Pool) closeIdle() {
 	p.idle = nil
 	p.mu.Unlock()
 	for _, entry := range idle {
-		entry.Conn.Close()
+		closeUnused(entry.Conn)
 	}
 }
 func (p *Pool) Close() {
@@ -382,6 +384,39 @@ func (p *Pool) Stats() Stats {
 	return s
 }
 func (p *Pool) RecordFallback() { p.mu.Lock(); p.fallbacks++; p.mu.Unlock() }
+
+// During idle shrink, one fresh keeper prevents a cluster of surplus expiries
+// from exhausting ready capacity before a healthy renewal can finish. Renewal
+// remains best effort when preparation exceeds the keeper's remaining lifetime.
+func (p *Pool) keeperNeedsRenewalLocked(now time.Time) bool {
+	for _, entry := range p.idle {
+		if now.Before(entry.refreshAt) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *Pool) renewalIndexLocked(now time.Time) int {
+	if len(p.idle) > p.target {
+		if !p.keeperNeedsRenewalLocked(now) {
+			return -1
+		}
+		oldest := 0
+		for i, entry := range p.idle {
+			if entry.expires.Before(p.idle[oldest].expires) {
+				oldest = i
+			}
+		}
+		return oldest
+	}
+	for i, entry := range p.idle {
+		if !now.Before(entry.refreshAt) {
+			return i
+		}
+	}
+	return -1
+}
 
 func (p *Pool) shrinkLocked(now time.Time) {
 	floor := p.opts.Size

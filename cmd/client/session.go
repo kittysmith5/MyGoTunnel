@@ -97,10 +97,10 @@ func openRemoteCommand(ctx context.Context, cfg *config.ClientConfig, target str
 	}
 	defer func() {
 		if err != nil {
-			conn.Close()
+			closeUnusedRemote(conn)
 		}
 	}()
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	stop := context.AfterFunc(ctx, func() { closeUnusedRemote(conn) })
 	defer stop()
 	session.Stage = "control"
 	if err = conn.SetDeadline(controlDeadline(ctx)); err != nil {

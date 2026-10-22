@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/tunnel"
 )
 
@@ -49,6 +50,10 @@ type setupClientFixture struct {
 }
 
 func newSetupClientFixture(t *testing.T, remote func(net.Conn, *bufio.Reader)) *setupClientFixture {
+	return newSetupClientFixtureWithAbort(t, remote, nil)
+}
+
+func newSetupClientFixtureWithAbort(t *testing.T, remote func(net.Conn, *bufio.Reader), abortContext context.Context) *setupClientFixture {
 	t.Helper()
 	certSource := httptest.NewTLSServer(nil)
 	cert := certSource.TLS.Certificates[0]
@@ -104,8 +109,8 @@ func newSetupClientFixture(t *testing.T, remote func(net.Conn, *bufio.Reader)) *
 	go func() {
 		defer close(f.done)
 		defer f.released.Store(true) // same final release as admission.Permit
-		handleClientContext(ctx, &setupIngressConn{Conn: front, readEnd: f.readEnd}, cfg,
-			slog.New(slog.NewJSONHandler(&f.logs, nil)), func() { f.released.Store(true) })
+		handleClientWithResourcesAndAuthLimiter(ctx, &setupIngressConn{Conn: front, readEnd: f.readEnd}, cfg,
+			slog.New(slog.NewJSONHandler(&f.logs, nil)), func() { f.released.Store(true) }, nil, datagram.DefaultResources, nil, abortContext)
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -141,6 +146,44 @@ func newSetupClientFixture(t *testing.T, remote func(net.Conn, *bufio.Reader)) *
 		t.Fatal("remote setup did not start")
 	}
 	return f
+}
+
+func TestHandleClientForceAbortAfterUploadFIN(t *testing.T) {
+	forceContext, abort := context.WithCancel(context.Background())
+	defer abort()
+	uploadDone := make(chan struct{})
+	f := newSetupClientFixtureWithAbort(t, func(conn net.Conn, reader *bufio.Reader) {
+		if err := tunnel.SendOK(conn); err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, reader)
+		close(uploadDone)
+		// Keep the return direction open after observing application FIN.
+		_, _ = io.Copy(io.Discard, conn.(*tls.Conn).NetConn())
+	}, forceContext)
+	var reply [10]byte
+	if _, err := io.ReadFull(f.app, reply[:]); err != nil || reply[1] != 0 {
+		t.Fatalf("SOCKS reply %v, %v", reply, err)
+	}
+	if err := f.app.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-uploadDone:
+	case <-time.After(time.Second):
+		t.Fatal("remote did not receive upload FIN")
+	}
+	select {
+	case <-f.done:
+		t.Fatal("upload FIN interrupted reverse drain")
+	case <-time.After(20 * time.Millisecond):
+	}
+	abort()
+	select {
+	case <-f.done:
+	case <-time.After(time.Second):
+		t.Fatal("force abort did not unblock remote read after upload FIN")
+	}
 }
 
 func TestHandleClientRSTCancelsRemoteSetup(t *testing.T) {

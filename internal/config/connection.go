@@ -36,26 +36,6 @@ type connectionCode struct {
 	Fingerprint string `json:"certificate_fingerprint"`
 }
 
-func validateAddress(addr string) error {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil || host == "" {
-		return fmt.Errorf("address must be host:port")
-	}
-	n, err := strconv.Atoi(port)
-	if err != nil || n < 1 || n > 65535 {
-		return fmt.Errorf("invalid address port")
-	}
-	if strings.ContainsAny(host, "/\\[]") {
-		return fmt.Errorf("invalid address host")
-	}
-	for _, c := range host {
-		if unicode.IsSpace(c) || unicode.IsControl(c) {
-			return fmt.Errorf("invalid address host")
-		}
-	}
-	return nil
-}
-
 func validateClient(cfg *ClientConfig) error {
 	if err := validateAddress(cfg.RemoteAddr); err != nil {
 		return err
@@ -184,6 +164,9 @@ func ExportServer(path, publicAddr string) (string, error) {
 func InitializeServer(path, publicAddr, listenAddr string) (string, error) {
 	if err := validateAddress(publicAddr); err != nil {
 		return "", err
+	}
+	if err := validateListenAddress(listenAddr); err != nil {
+		return "", fmt.Errorf("invalid listen address: %w", err)
 	}
 	// Empty listen host is allowed; the public endpoint must always be explicit.
 	_, port, err := net.SplitHostPort(listenAddr)

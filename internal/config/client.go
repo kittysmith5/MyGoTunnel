@@ -47,6 +47,9 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 	if cfg.LocalAddr == "" {
 		cfg.LocalAddr = "127.0.0.1:1080"
 	}
+	if err := validateListenAddress(cfg.LocalAddr); err != nil {
+		return nil, fmt.Errorf("invalid local_addr: %w", err)
+	}
 
 	if cfg.RemoteAddr == "" {
 		return nil, fmt.Errorf("remote_addr is empty")

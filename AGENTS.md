@@ -54,6 +54,7 @@ SOCKS5 应用
 - `-max-connections` 限制接受连接总数；备用等待时释放 setup permit，CONNECT 前必须重新申请。
 - `-max-setup` 限制正在建连的请求，成功进入转发前释放，失败返回也必须释放；不要让长连接占用建连额度。
 - 保留 `relay.CopyBidirectional` 的半关闭语义：正常 EOF 后等待反向数据排空；复制或半关闭失败时解除另一方向的阻塞，并在两个复制 goroutine 都退出后返回。修改转发退出策略时要考虑一侧 EOF、仍在返回的数据、阻塞 goroutine、字节统计和连接释放。
+- 生产 relay 使用 `CopyBidirectionalContext` 与 `Permit.AbortContext()`：该独立 context 只在 shutdown grace 耗尽时取消，同时关闭两端底层传输并 join；不能直接传进程 context 而破坏宽限期排空。UDP 的 TCP 控制监测从来源解析开始，FIN/硬错误均取消 UDP setup，建立后继续由同一 reader 监测并 join，不能误套 TCP CONNECT 的 FIN 保留规则。
 - setupwatch 仅在 TCP setup 期间独占同一个 bufio.Reader，预读至其既有容量；非 EOF 硬读错误取消子 context，FIN 保留半关闭。交接前必须 Stop 并等待退出，检查/恢复读期限，提前负载不得丢弃；缓冲满则停止监测，不能无限缓存或承诺覆盖该边界之后的 RST。
 
 ## 配置约定
@@ -171,7 +172,7 @@ go build ./cmd/...
 
 ## 自适应预连接与拨号测量
 
-可选-pool-idle-size（默认0关闭，启用为1..pool-size）与-pool-idle-after（默认2分钟）允许长期无需求后每30秒向更低空闲容量缩减；默认保持原floor。启动记录pool_idle_size；取用立即恢复正常size，交接连接不归池、不因收缩关闭；超出目标的备用自然到期且不主动续期。测试覆盖默认/非法配置、空闲门槛与节奏、首个就绪连接、恢复与交接所有权、受控续期工作量对照；不以实验次数变化承诺线上P95提升。
+可选-pool-idle-size（默认0关闭，启用为1..pool-size）与-pool-idle-after（默认2分钟）允许长期无需求后每30秒向更低空闲容量缩减；默认保持原floor。启动记录pool_idle_size；取用立即恢复正常size，交接连接不归池、不因收缩关闭；超出目标的备用自然到期。默认自适应及显式idle收缩都须保护一条fresh keeper：所有就绪都进入续期窗口时允许串行准备一条，完成时即使仍有surplus也可保留新连接；已有fresh keeper则不续建其他surplus，仍受hard max/共享退避约束。Take优先最近入池连接，旧连接继续guard/TTL，失效仍有ACK与fallback兜底；未使用TLS关闭走NetConn避免close_notify阻塞。测试覆盖默认/非法配置、空闲门槛与节奏、首个就绪连接、恢复与交接所有权、受控续期工作量对照；不以实验次数变化承诺线上P95提升。
 
 客户端 `-pool-size 4 -pool-max 16`：size 是备用容量下限，max 是自适应上限（均不含已经转发的连接）。当请求取用时就绪数不超过 1，目标容量增加 1，最多达到 max；取用、失效立即触发补充。连续 30 秒无取用后，每 30 秒目标容量减 1，最低回到 size。已有多余空闲连接自然到期释放，不中断正在使用的连接。此为需求耗尽驱动的保守自适应，不是基于 QPS/补充时长的预测算法。后台补充与 ready 总量受目标限制；收缩后已经启动的补充可能短暂超过新目标，但不超过 max。`-pool-max 0` 或等于 size 使用固定容量；`-pool-size 0` 禁用池。非零 max 必须不小于 size，最大 32；例如 size=32 时须同时指定 max=32。服务端 `-max-idle` 为所有客户端共享，扩容仍可能被 BUSY 拒绝，沿用有界退避。
 
@@ -262,7 +263,7 @@ SOCKS 认证仅属于客户端本地配置，不导出到 mygotunnel 连接码�
 
 ## 独立补充、错误清理与优雅退出
 
-客户端与服务端处理 SIGINT/SIGTERM：关闭监听，客户端停止并等待备用池补充；已进入转发的连接继续排空。`-shutdown-timeout 15s` 控制连接排空期限，0 表示立即关闭，负值拒绝启动；到期关闭剩余连接并等待 handler 退出。TLS 连接强制关闭底层 TCP，避免逐条等待关闭通知。上游 systemd 的 TimeoutStopSec 应大于排空期限及清理余量。未完成的拨号使用进程 context 取消，认证/控制读取仍有原有期限，并由到期强制关闭兜底；不承诺无限保留长连接。运行时诊断在正常退出时停止并写最终快照。
+客户端与服务端处理 SIGINT/SIGTERM：关闭监听，客户端停止并等待备用池补充；已进入转发的连接继续排空。`-shutdown-timeout 15s` 控制连接排空期限，0 表示立即关闭，负值拒绝启动；到期通过独立 AbortContext 同时关闭每条 TCP relay 两端底层传输并等待 handler/复制任务退出，覆盖一侧已 FIN 的情况。TLS 及未使用备用连接直接关闭底层 TCP，避免逐条等待关闭通知。上游 systemd 的 TimeoutStopSec 应大于排空期限及清理余量。未完成的拨号使用进程 context 取消，认证/控制读取仍有原有期限，并由到期强制关闭兜底；不承诺无限保留长连接。运行时诊断在正常退出时停止并写最终快照。
 
 转发正常 EOF 仍发送半关闭并等待反向数据排空；复制失败时跳过该方向 CloseWrite，立即向协调方报告根错误并中断双向读写，再等待两个复制任务退出。保持原错误方向、字节计数及既有 bufio.Reader。正常运行期间没有新增通用空闲超时或半关闭排空超时。
 
@@ -272,13 +273,13 @@ SOCKS 认证仅属于客户端本地配置，不导出到 mygotunnel 连接码�
 
 UDP 普通流程为一次写入 AUTH 与 UDP 两条命令，并依次读取两个 OK；预连接只发 UDP 并读取一个 OK。协议控制行继续遵守 4096 字节上限和控制阶段期限，保留预读 Reader。UDP 也必须验证服务端证书、消耗总连接名额，成功转发前释放 setup permit；预连接先释放 idle 并重取 setup。进程取消后已建立 UDP 会话在 grace 内可继续转发，到期由 admission 关闭 TCP 隧道并等待全部 UDP worker 退出。目标 DNS/拨号取消与会话退出联动，每次 UDP 目标拨号和写入最长 5 秒。
 
-每 UDP 帧包含 SOCKS 头且最多 65000 字节，读写上限一致；每次最多刷新 32 个已排队报文，不等待凑批，bufio 路径复用缓冲而非整帧临时拷贝。客户端出队列 256、回包队列 128，服务端各 256；另有配置的字节及年龄上限，入队/出队淘汰过期报文，满时拒绝。每会话最多 256 个目标 worker（退出中也占名额），独立拨号和发送，DNS 初始化并发最多 16，IP 绕过 DNS 名额；同目标初始化去重，待发送最多 32 包/64 KiB 负载，各目标共享配置的负载字节预算。分发时保留年龄，慢 DNS 等待也计入；元数据、读缓冲、帧头、在途包不计入负载预算。空闲 2 分钟回收，15 秒扫描，失效目标下次发包重建。已建立会话终止时取消阻塞并等待所有 worker，再输出统计。client upload 为入队数，download 为成功 UDP 写入数，udp_write_errors 为写入失败；server upload 为成功目标写入，download 为响应入队。queue_full_drops/queue_expired_drops 分别为容量/年龄丢弃，request_queue_peak_bytes/response_queue_peak_bytes 为收发队列峰值，target_queue_peak_bytes 为单目标负载队列峰值；full 与直接拒绝计数有重叠，不能相加。UDP write 成功不承诺应用收到。年龄只限制应用排队，不承诺传输 RTT 或清除内核积压。协议不消除 TCP 队头阻塞，不能称为原生 UDP。
+每 UDP 帧包含 SOCKS 头且最多 65000 字节，读写上限一致；每次最多刷新 32 个已排队报文，不等待凑批，bufio 路径复用缓冲而非整帧临时拷贝。客户端出队列 256、回包队列 128，服务端各 256；另有配置的字节及年龄上限，入队/出队淘汰过期报文，普通队列满时拒绝。服务端响应使用共享256节点的FairQueue按目标轮转，低积压目标可淘汰最大积压目标报文争取准入；不降低单流原容量，flow环/heap仅保留非空流且总数不超过节点数，inflight批次不可抢占。每会话最多 256 个目标 worker（退出中也占名额），独立拨号和发送，DNS 初始化并发最多 16，IP 绕过 DNS 名额；同目标初始化去重，待发送最多 32 包/64 KiB 负载，各目标共享配置的负载字节预算。分发时保留年龄，慢 DNS 等待也计入；元数据、读缓冲、帧头、在途包不计入负载预算。空闲 2 分钟回收，15 秒扫描；失效目标下次发包在100/200/400/800/1000ms有界短退避后重建，期间丢弃且不拨号，成功回包清历史。失败记录最多256个、保留1分钟，取消/资源错误不记失败。每worker递增generation，成功/失败更新在表锁内确认ctx和代次；旧worker不能清除/覆盖新失败，同代failureRecorded优先于并发首响应。每关联单个最早到期timer主动清理pending及响应队列，不依赖新帧或负载预算耗尽；保留原年龄，清理不取消慢DNS。已建立会话终止时取消阻塞并等待所有 worker，再输出统计。client upload 为入队数，download 为成功 UDP 写入数，udp_write_errors 为写入失败；server upload 为成功目标写入，download 为响应入队。queue_full_drops/queue_expired_drops 分别为容量/年龄丢弃，request_queue_peak_bytes/response_queue_peak_bytes 为收发队列峰值，target_queue_peak_bytes 为单目标负载队列峰值；full 与直接拒绝计数有重叠，不能相加。UDP write 成功不承诺应用收到。年龄只限制应用排队，不承诺传输 RTT 或清除内核积压。协议不消除 TCP 队头阻塞，不能称为原生 UDP。
 
 旧 socks_username/socks_password 字段保留读取，嵌套 socks_auth 优先，认证仍使用功能分支的固定 SHA-256 摘要常量时间比较；真实 SOCKS 凭据不进入连接码。测试需覆盖池命中/回退/显式拒绝、证书指纹、UDP 来源和失败恢复、setup/idle 名额释放及 grace 到期清理。
 
 UDP TLS写期限独立于队列年龄，默认每次底层Write最多5秒，空闲不超时且不设置读期限。写错误/超时必须终止整个关联并关闭底层连接，不能在部分帧后继续写；等待全部worker退出后输出首个终止stage/reason，正常EOF为closed，其他为failed。不得覆盖TCP CONNECT的半关闭语义。日志补udp_tunnel_write_calls/errors/timeouts/max_duration；max_duration为Duration（JSON纳秒，text毫秒）。进程stats补udp_sockets/max_sockets、buffer_bytes/cached_bytes/buffer_peak_bytes/memory_limit_bytes、socket_rejected/memory_rejected、sessions_closed/session_errors/tunnel_write_failures/write_timeouts（均以udp_为前缀）。进程写失败/超时只累计根终止会话，会话写调用统计可包含次生错误。
 
-UDP池化Packet为单所有者：Push成功转交所有权，失败仍由调用者Release；出队消费后、队列过期/关闭时必须Release，不能保留已释放Data切片。进程预算包含512～65536分级缓冲容量、空闲缓存、在途帧和65KB接收缓冲，缓存每级最多16块，预算紧张先驱逐空闲缓存；不宣称限制RSS或覆盖TLS/内核/元数据。Socket预算覆盖初始化与退出中的目标。帧读取资源拒绝时先丢弃完整帧保持流对齐，后续仍可恢复。queue_resource_drops统计复制入队时的资源拒绝。测试需覆盖并发预算、缓存驱逐、最大65000帧、零热路径读取分配、拒绝后帧对齐、跨关联共享限制和关闭后归还。
+UDP池化Packet为单所有者：Push成功转交所有权，失败仍由调用者Release；出队消费后、队列过期/关闭时必须Release，不能保留已释放Data切片。进程预算包含512～65536分级缓冲容量、空闲缓存、在途帧和65KB接收缓冲，缓存每级最多64块，预算紧张先驱逐空闲缓存；不宣称限制RSS或覆盖TLS/内核/元数据。Socket预算覆盖初始化与退出中的目标。帧读取资源拒绝时先丢弃完整帧保持流对齐，后续仍可恢复。queue_resource_drops统计最终未能复制入队的资源拒绝；资源级memory_rejected可能包含公平队列回收后重试成功的Borrow拒绝尝试。response_fair_evictions也计入queue_full_drops/dropped_responses，response_peak_flows为非空flow峰值；target_backoff_drops/entries为短退避拒绝/剩余记录，target_queue_expiry_sweeps为主动到期清理次数，不能混同真实DNS请求次数。测试需覆盖并发预算、缓存驱逐、最大65000帧、零热路径读取分配、拒绝后帧对齐、跨关联共享限制和关闭后归还。
 
 常驻接收 scratch 必须用 BorrowResident，活跃常驻容量最多 limit−2×65536，不能绕过进程总预算或把普通缓存永久算常驻。Release 时撤销常驻占用后可进入普通缓存，关闭和复用仍保持单所有者。资源日志补 udp_resident_bytes/resident_limit_bytes/transient_reserve_bytes/resident_rejected；resident_rejected 为 memory_rejected 子集。预留只防止常驻占满，不承诺所有瞬态并发都成功。
 
@@ -312,6 +313,8 @@ scripts/observe.py 被动采集最多72小时，指标为成功建连耗时分�
 
 
 ## 认证限速与发布签名
+
+监听与远端地址统一离线校验host:port及纯数字端口，监听允许通配host/port0，remote仍1..65535；不做DNS或bind探测。升级/回滚替换前须持久prepared intent，旧binary恢复副本预留在binary同一文件系统、旧state快照保留；state提交必须在事务回滚保护内，文件和目录均fsync。ENOSPC恢复优先rename预留文件，不得先建stage阻止无分配recover。committed只清理并验证/重启同一已提交版本，不得退版；prepared恢复旧binary/state并验证running hash/health。外部config/unit变化或校验失败保留intent且fail-safe。recover或upgrade/rollback的恢复阶段返回recovery_only，不继续第二次变更；status显示recovery_pending。set-id/filecap binary在停服务前拒绝，不悄悄丢元数据。测试覆盖写盘/目录fsync失败、各阶段子进程强制退出、恢复幂等和预检，保留签名/私有快照不变量。
 
 认证错误按peer IP有界计数；只计真实凭据不匹配，不把超时/截断算密码错误。锁表上限必须明确采用fail-closed策略，日志不可包含凭据。凭据过渡最多保留一个到期时间明确的旧项，constant-time比较，过期后新建会话不得授权；不要改动旧AUTH wire format。发布bundle由Ed25519签名，升级先验证root本地信任公钥、签名、平台和哈希，再停服务；不信任bundle自带公钥。
 

@@ -84,6 +84,9 @@ func TestUDPTunnelRecoversAfterTargetReadError(t *testing.T) {
 			_, _ = echo.WriteToUDP(data[:n], peer)
 		}
 	}()
+	// The failed endpoint has a bounded retry cooldown; recovery must work as
+	// soon as the initial cooldown ends, without recreating the association.
+	time.Sleep(udpRetryInitial + 10*time.Millisecond)
 	if err := tunnel.WriteDatagram(client, packet); err != nil {
 		t.Fatal(err)
 	}

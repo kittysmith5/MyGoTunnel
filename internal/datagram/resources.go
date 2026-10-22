@@ -8,7 +8,7 @@ import (
 const (
 	DefaultMaxSockets  = 1024
 	DefaultMemoryLimit = 64 << 20
-	cachePerClass      = 16
+	cachePerClass      = 64
 	// Resident buffers must leave room for one maximum-sized incoming frame and
 	// one response copy. This is process-wide progress headroom, not a per-session
 	// reservation or a promise that every concurrent packet can be admitted.

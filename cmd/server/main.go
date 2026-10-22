@@ -165,13 +165,14 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleTunnelContextWithLimiter(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire}, authLimiter, resources)
+		handleTunnelContextWithLimiter(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire, abortContext: permit.AbortContext()}, authLimiter, resources)
 	}, nil, metrics)
 }
 
 type serverPoolOptions struct {
-	idleSlots   chan struct{}
-	resumeSetup func() bool
+	idleSlots    chan struct{}
+	resumeSetup  func() bool
+	abortContext context.Context
 }
 
 func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, releaseSetup func()) {
@@ -359,7 +360,11 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 		"reply_duration", time.Since(replyStarted),
 		"connect_duration", time.Since(connectStarted),
 		"setup_duration", time.Since(startedAt)-idleDuration)
-	result := relay.CopyBidirectional(tunnelConn, reader, targetConn, targetConn)
+	abortContext := context.Background()
+	if poolOptions != nil && poolOptions.abortContext != nil {
+		abortContext = poolOptions.abortContext
+	}
+	result := relay.CopyBidirectionalContext(abortContext, tunnelConn, reader, targetConn, targetConn)
 	logging.LogTunnelResult(requestLogger, result, startedAt, "tunnel", "target")
 }
 

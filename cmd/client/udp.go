@@ -85,6 +85,25 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	}
 	ctx, cancel := context.WithTimeout(parent, remoteSetupTimeout)
 	defer cancel()
+	// The TCP control connection owns the association even while source DNS or
+	// the remote TLS/control exchange is pending. Keep one reader for its whole
+	// lifetime so a disconnect cancels setup and cannot be lost at handoff.
+	controlDone := make(chan struct{})
+	var controlErr error
+	go func() {
+		_, controlErr = io.Copy(io.Discard, clientConn)
+		cancel()
+		close(controlDone)
+	}()
+	interruptControl := func() {
+		if err := clientConn.SetReadDeadline(time.Now()); err != nil {
+			_ = clientConn.Close()
+		}
+	}
+	defer func() {
+		interruptControl()
+		<-controlDone
+	}()
 	allowedSources, rep, err := []net.IP{tcpPeer.IP}, byte(0), error(nil)
 	port := request.Port
 	if cfg.UDPSourceMode() == "nat" {
@@ -138,6 +157,11 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	}
 	remoteConn, reader := session.Conn, session.Reader
 	defer remoteConn.Close()
+	select {
+	case <-controlDone:
+		return
+	default:
+	}
 
 	bound := *udpConn.LocalAddr().(*net.UDPAddr)
 	if tcpLocal, ok := clientConn.LocalAddr().(*net.TCPAddr); ok {
@@ -180,9 +204,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 			close(stop)
 			_ = udpConn.Close()
 			tunnel.AbortDatagramConn(remoteConn)
-			if err := clientConn.SetReadDeadline(time.Now()); err != nil {
-				_ = clientConn.Close()
-			}
+			interruptControl()
 		})
 	}
 	var workers sync.WaitGroup
@@ -240,8 +262,8 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	workers.Add(4)
 	go func() {
 		defer workers.Done()
-		_, err := io.Copy(io.Discard, clientConn)
-		stopSession("udp_control", err)
+		<-controlDone
+		stopSession("udp_control", controlErr)
 	}()
 	go func() {
 		defer workers.Done()
