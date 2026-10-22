@@ -360,7 +360,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 		"connect_duration", time.Since(connectStarted),
 		"setup_duration", time.Since(startedAt)-idleDuration)
 	result := relay.CopyBidirectional(tunnelConn, reader, targetConn, targetConn)
-	logging.LogTunnelResult(requestLogger, result, startedAt)
+	logging.LogTunnelResult(requestLogger, result, startedAt, "tunnel", "target")
 }
 
 func acknowledgePrepared(conn net.Conn, controlDeadline time.Time) error {

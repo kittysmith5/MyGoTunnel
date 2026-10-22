@@ -9,7 +9,7 @@ import (
 
 // LogTunnelResult records transfer totals and distinguishes a clean close from
 // a relay failure without exposing protocol payloads.
-func LogTunnelResult(logger *slog.Logger, result relay.Result, startedAt time.Time) {
+func LogTunnelResult(logger *slog.Logger, result relay.Result, startedAt time.Time, endpointNames ...string) {
 	attributes := []any{
 		"upload_bytes", result.AToB.Bytes,
 		"download_bytes", result.BToA.Bytes,
@@ -22,6 +22,26 @@ func LogTunnelResult(logger *slog.Logger, result relay.Result, startedAt time.Ti
 			phase = "copy"
 		}
 		attributes = append(attributes, "failure_phase", phase)
+		fault := result.Fault
+		endpoint := "unknown"
+		if len(endpointNames) >= 2 {
+			switch fault.Endpoint {
+			case "a":
+				endpoint = endpointNames[0]
+			case "b":
+				endpoint = endpointNames[1]
+			}
+		}
+		if fault.Operation == "" {
+			fault.Operation = "unknown"
+		}
+		attributes = append(attributes, "error_operation", fault.Operation, "error_endpoint", endpoint)
+		if fault.Errno != 0 {
+			attributes = append(attributes, "error_errno", fault.Errno)
+		}
+		if fault.LocalAddr != "" {
+			attributes = append(attributes, "error_local_addr", fault.LocalAddr, "error_remote_addr", fault.RemoteAddr)
+		}
 		Failure(logger, result.FailureDirection, result.Err, attributes...)
 		return
 	}

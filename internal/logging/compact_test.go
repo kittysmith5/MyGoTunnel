@@ -152,6 +152,15 @@ func TestConnectionIDsAndStatsStop(t *testing.T) {
 	if before == 0 || out.Len() != before {
 		t.Fatal("stats missing or continued after stop")
 	}
+	var stats map[string]any
+	if err := json.Unmarshal(bytes.Split(bytes.TrimSpace(out.Bytes()), []byte{'\n'})[0], &stats); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"rss_bytes", "rss_available", "heap_alloc_bytes", "heap_inuse_bytes", "heap_idle_bytes", "heap_released_bytes", "gc_cycles", "goroutines", "fd_count", "fd_available", "cpu_available", "cpu_seconds"} {
+		if _, ok := stats[key]; !ok {
+			t.Errorf("periodic stats missing %s: %v", key, stats)
+		}
+	}
 }
 
 func TestSOCKSStageFieldNamesAndJSONUnits(t *testing.T) {

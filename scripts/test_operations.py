@@ -4,6 +4,29 @@ def load(name):
  spec=importlib.util.spec_from_file_location(name,pathlib.Path(__file__).with_name(name+'.py'))
  module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); return module
 class OperationsTest(unittest.TestCase):
+ def test_resource_availability_survives_text_and_json(self):
+  import json
+  m=load('observe')
+  for message in [
+   '2026-10-22 00:00:00.000 INFO C stats rss_bytes=0 rss_available=false fd_count=10 fd_available=true cpu_seconds=1.5 cpu_available=true',
+   json.dumps(dict(msg='stats',rss_bytes=0,rss_available=False,fd_count=10,fd_available=True,cpu_seconds=1.5,cpu_available=True))]:
+   a=m.Aggregator();a.consume(message)
+   self.assertIs(a.resources['rss_available'],False);self.assertIs(a.resources['fd_available'],True)
+   self.assertIs(a.resources['cpu_available'],True);self.assertEqual(a.resources['fd_count'],10)
+ def test_udp_control_and_data_failures_keep_legacy_totals(self):
+  import json
+  m=load('observe');a=m.Aggregator()
+  messages=[
+   '2026-10-22 00:00:00.000 WARN C failed id=control stage=udp_control reason=reset udp_termination_scope=control',
+   '2026-10-22 00:00:00.000 WARN S failed id=data stage=udp_tunnel_write reason=timeout udp_termination_scope=data',
+   json.dumps(dict(msg='failed',connection_id='json',stage='udp_read',close_reason='error',transport='udp',udp_termination_scope='data')),
+   '2026-10-22 00:00:00.000 WARN C failed id=old stage=udp_control reason=timeout',
+   '2026-10-22 00:00:00.000 WARN C failed id=tcp stage=up reason=reset phase=copy']
+  for message in messages:a.consume(message)
+  row=a.snapshot()
+  self.assertEqual(row['udp_control_failed'],2);self.assertEqual(row['udp_data_failed'],2)
+  self.assertEqual(row['relay_failed'],5);self.assertEqual(row['setup_failed'],0)
+  a.consume(messages[0]);self.assertEqual(a.snapshot(),row)
  def test_histogram_empty_and_tail(self):
   m=load('observe')
   self.assertIsNone(m.percentile({},.99))

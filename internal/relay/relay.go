@@ -28,6 +28,7 @@ type Result struct {
 	Err              error
 	FailureDirection string
 	FailurePhase     string
+	Fault            Fault
 }
 
 type closeWriter interface {
@@ -74,10 +75,12 @@ func CopyBidirectional(a net.Conn, aReader io.Reader, b net.Conn, bReader io.Rea
 		// remains in Result, but the first failure is the relay's root cause.
 		result.FailureDirection = directionName(first.direction)
 		result.FailurePhase = first.result.Phase
+		result.Fault = describeFault(first.result.Err, first.result.Phase, first.direction, a, b)
 		result.Err = errors.Join(directionError(first), interruptErr)
 	case second.result.Err != nil:
 		result.FailureDirection = directionName(second.direction)
 		result.FailurePhase = second.result.Phase
+		result.Fault = describeFault(second.result.Err, second.result.Phase, second.direction, a, b)
 		result.Err = directionError(second)
 	}
 

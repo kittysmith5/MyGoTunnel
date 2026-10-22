@@ -29,8 +29,10 @@ def parse_message(message):
  fields={'msg':match.group(1)}
  aliases={'id':'connection_id','phase':'failure_phase','reason':'close_reason'}
  for key,value in re.findall(r'\b([a-zA-Z_]\w*)=([^\s]+)',message):
-  if key in ('id','stage','phase','reason'):
+  if key in ('id','stage','phase','reason','udp_termination_scope'):
    fields[aliases.get(key,key)]=value
+  elif key in ('rss_available','fd_available','cpu_available') and value in ('true','false'):
+   fields[key]=value=='true'
   elif re.fullmatch(r'\d+(?:\.\d+)?(?:/\d+)?',value):
    number,_,limit=value.partition('/')
    fields[key]=float(number) if '.' in number else int(number)
@@ -45,11 +47,12 @@ class Aggregator:
   self.limit=limit; self.active=collections.OrderedDict(); self.finished=collections.OrderedDict()
   self.hist=collections.Counter(); self.ready=0; self.setup_failed=0; self.relay_failed=0; self.shutdown_failed=0; self.auth_failed=0
   self.tracking_gaps=0; self.resources=None
+  self.udp_control_failed=0; self.udp_data_failed=0
   self.setup_stages=collections.Counter(); self.setup_reasons=collections.Counter(); self.relay_reasons=collections.Counter(); self.shutdown_reasons=collections.Counter()
  def consume(self,message):
   f=parse_message(message); kind=f.get('msg'); ident=f.get('connection_id')
   if kind=='stats':
-   self.resources={k:v for k,v in f.items() if isinstance(v,(int,float)) and not isinstance(v,bool)}
+   self.resources={k:v for k,v in f.items() if (isinstance(v,(int,float)) and not isinstance(v,bool)) or (k in ('rss_available','fd_available','cpu_available') and isinstance(v,bool))}
   if not ident or kind not in ('ready','failed','closed'): return
   if kind=='ready':
    if ident in self.active or ident in self.finished: return
@@ -70,12 +73,15 @@ class Aggregator:
    self.shutdown_failed+=1; self.shutdown_reasons[reason]+=1
   elif was_ready or stage in ('up','down','relay','udp_control','udp_read','udp_tunnel_read','udp_tunnel_write','udp_session'):
    self.relay_failed+=1; self.relay_reasons[reason]+=1
+   if stage=='udp_control' or f.get('udp_termination_scope')=='control': self.udp_control_failed+=1
+   elif f.get('transport')=='udp' or f.get('udp_termination_scope')=='data' or stage.startswith('udp_'): self.udp_data_failed+=1
   else:
    self.setup_failed+=1; self.setup_stages[stage]+=1; self.setup_reasons[reason]+=1
    if stage=='auth' or (stage=='socks' and reason in ('auth_rejected','auth_limited','auth_protocol')): self.auth_failed+=1
  def snapshot(self):
   attempts=self.ready+self.setup_failed; proxy_attempts=attempts-self.auth_failed
   return dict(ready=self.ready,setup_failed=self.setup_failed,auth_failed=self.auth_failed,relay_failed=self.relay_failed,shutdown_failed=self.shutdown_failed,
+   udp_control_failed=self.udp_control_failed,udp_data_failed=self.udp_data_failed,
    failure_rate=self.setup_failed/attempts if attempts else None,
    proxy_failure_rate=(self.setup_failed-self.auth_failed)/proxy_attempts if proxy_attempts else None,
    setup_failures_by_stage=dict(self.setup_stages),setup_failures_by_reason=dict(self.setup_reasons),relay_failures_by_reason=dict(self.relay_reasons),shutdown_failures_by_reason=dict(self.shutdown_reasons),

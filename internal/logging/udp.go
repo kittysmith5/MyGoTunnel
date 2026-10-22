@@ -14,6 +14,7 @@ func UDPResourceAttrs(resources *datagram.Resources) []any {
 		"udp_transient_reserve_bytes", s.TransientReserve, "udp_resident_rejected", s.ResidentRejected,
 		"udp_memory_limit_bytes", s.MemoryLimit, "udp_socket_rejected", s.SocketRejected, "udp_memory_rejected", s.MemoryRejected,
 		"udp_sessions_closed", s.Sessions, "udp_session_errors", s.SessionErrors, "udp_tunnel_write_failures", s.WriteErrors, "udp_write_timeouts", s.WriteTimeouts,
+		"udp_control_errors", s.ControlSessionErrors, "udp_data_errors", s.DataSessionErrors,
 		"udp_end_eof", s.Terminations.EOF, "udp_end_timeout", s.Terminations.Timeout, "udp_end_reset", s.Terminations.Reset,
 		"udp_end_truncated", s.Terminations.Truncated, "udp_end_canceled", s.Terminations.Canceled, "udp_end_closed", s.Terminations.Closed, "udp_end_error", s.Terminations.Other}
 }
@@ -24,8 +25,12 @@ func LogUDPResult(logger *slog.Logger, resources *datagram.Resources, stage stri
 	reason := Reason(err)
 	failed := reason != "eof"
 	writeFailed := failed && stage == "udp_tunnel_write"
-	resources.RecordSession(reason, writeFailed)
-	attrs = append(attrs, "transport", "udp", "udp_tunnel_write_calls", writes.Calls, "udp_tunnel_write_errors", writes.Errors,
+	scope := "data"
+	if stage == "udp_control" {
+		scope = "control"
+	}
+	resources.RecordSession(reason, writeFailed, scope)
+	attrs = append(attrs, "transport", "udp", "udp_termination_scope", scope, "udp_tunnel_write_calls", writes.Calls, "udp_tunnel_write_errors", writes.Errors,
 		"udp_tunnel_write_timeouts", writes.Timeouts, "udp_tunnel_write_max_duration", writes.MaxDuration)
 	if failed {
 		Failure(logger, stage, err, attrs...)

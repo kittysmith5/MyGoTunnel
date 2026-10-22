@@ -13,11 +13,13 @@ import (
 
 type Factory func(context.Context) (*Entry, error)
 type Options struct {
-	Size     int
-	MaxSize  int // zero keeps a fixed-size pool
-	IdleTTL  time.Duration
-	RetryMin time.Duration
-	RetryMax time.Duration
+	Size      int
+	MaxSize   int // zero keeps a fixed-size pool
+	IdleTTL   time.Duration
+	IdleSize  int // zero preserves Size as the idle floor
+	IdleAfter time.Duration
+	RetryMin  time.Duration
+	RetryMax  time.Duration
 }
 
 // Pool owns only unused, authenticated connections. Used connections never return.
@@ -57,6 +59,12 @@ func New(opts Options, factory Factory, logger *slog.Logger) (*Pool, error) {
 	if opts.IdleTTL == 0 {
 		opts.IdleTTL = 45 * time.Second
 	}
+	if opts.IdleSize < 0 || opts.IdleSize > opts.Size || opts.IdleAfter < 0 {
+		return nil, fmt.Errorf("invalid idle pool limits")
+	}
+	if opts.IdleSize > 0 && opts.IdleAfter == 0 {
+		opts.IdleAfter = 2 * time.Minute
+	}
 	if opts.RetryMin == 0 {
 		opts.RetryMin = 500 * time.Millisecond
 	}
@@ -67,7 +75,8 @@ func New(opts Options, factory Factory, logger *slog.Logger) (*Pool, error) {
 		return nil, fmt.Errorf("invalid pool timing options")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &Pool{target: opts.Size, lastShrink: time.Now(), opts: opts, factory: factory, logger: logger, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1)}
+	now := time.Now()
+	p := &Pool{target: opts.Size, lastDemand: now, lastShrink: now, opts: opts, factory: factory, logger: logger, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1)}
 	p.wg.Add(1)
 	go p.manage()
 	return p, nil
@@ -96,7 +105,7 @@ func (p *Pool) manage() {
 			// At most one proactive replacement per batch. Keep the old entry until
 			// success when spare capacity exists. At the hard cap retire at most one,
 			// and never proactively remove the last ready connection.
-			if len(jobs) == 0 && p.filling == 0 {
+			if len(jobs) == 0 && p.filling == 0 && len(p.idle) <= p.target {
 				for i, e := range p.idle {
 					if now.Before(e.refreshAt) {
 						continue
@@ -280,6 +289,11 @@ func (p *Pool) Take(ctx context.Context) *Entry {
 	p.mu.Lock()
 	if ctx.Err() == nil && !p.closed {
 		p.lastDemand = time.Now()
+		if p.opts.IdleSize > 0 && p.target < p.opts.Size {
+			// Demand restores the normal floor immediately without waiting for
+			// shrink ticks; callers still never wait for background refill.
+			p.target = p.opts.Size
+		}
 		// Grow only when demand exhausts ready capacity; never exceed MaxSize.
 		if len(p.idle) <= 1 && p.target < p.opts.MaxSize {
 			p.target++
@@ -370,7 +384,11 @@ func (p *Pool) Stats() Stats {
 func (p *Pool) RecordFallback() { p.mu.Lock(); p.fallbacks++; p.mu.Unlock() }
 
 func (p *Pool) shrinkLocked(now time.Time) {
-	if p.target > p.opts.Size && now.Sub(p.lastDemand) >= 30*time.Second && now.Sub(p.lastShrink) >= 30*time.Second {
+	floor := p.opts.Size
+	if p.opts.IdleSize > 0 && now.Sub(p.lastDemand) >= p.opts.IdleAfter {
+		floor = p.opts.IdleSize
+	}
+	if p.target > floor && now.Sub(p.lastDemand) >= 30*time.Second && now.Sub(p.lastShrink) >= 30*time.Second {
 		p.target--
 		p.lastShrink = now
 	}

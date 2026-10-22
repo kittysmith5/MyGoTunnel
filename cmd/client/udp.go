@@ -15,6 +15,8 @@ import (
 	"mygotunnel/internal/tunnel"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -95,7 +97,8 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 		resolveCancel()
 	}
 	if err != nil {
-		logging.Failure(logger, "udp_source", err)
+		logging.Failure(logger, "udp_source", err, "udp_source_policy", cfg.UDPSourceMode(),
+			"udp_source_declared_addr", net.JoinHostPort(request.Address, strconv.Itoa(int(request.Port))))
 		_ = socks5.Reply(clientConn, rep)
 		return
 	}
@@ -158,6 +161,9 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	releaseSetup()
 	logger.Info("ready", "transport", "udp", "remote_addr", cfg.RemoteAddr,
 		"udp_source_policy", cfg.UDPSourceMode(), "udp_relay_port", bound.Port,
+		"udp_source_declared_addr", net.JoinHostPort(request.Address, strconv.Itoa(int(request.Port))),
+		"udp_source_allowed_ips", udpSourceIPSummary(allowedSources), "udp_source_allowed_count", len(allowedSources),
+		"udp_source_allowed_port", port,
 		"socks_duration", socksDuration, "pool_hit", session.PoolHit,
 		"pool_fallback", session.PoolFallback, "pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
@@ -193,6 +199,9 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	var writeErrors atomic.Uint64
 	var received, sourceIPDrops, sourcePortDrops, bindingDrops, invalidDrops, oversizedDrops uint64
 	var firstDatagramAt time.Time
+	var firstAcceptedAt time.Time
+	var firstRejectedSource netip.AddrPort
+	var firstRejectedReason string
 	readyAt := time.Now()
 	defer func() {
 		stopSession("udp_session", nil)
@@ -204,10 +213,24 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 		if !firstDatagramAt.IsZero() {
 			firstDuration = firstDatagramAt.Sub(readyAt)
 		}
-		logging.LogUDPResult(logger, resources, closeStage, closeErr, tunnelWriter.Stats(), "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(),
+		var acceptedDuration time.Duration
+		if !firstAcceptedAt.IsZero() {
+			acceptedDuration = firstAcceptedAt.Sub(readyAt)
+		}
+		var sourceAttrs []any
+		if firstRejectedSource.IsValid() {
+			peerIP, _ := netip.AddrFromSlice(tcpPeer.IP)
+			sameIP := firstRejectedSource.Addr() == peerIP.Unmap().WithZone(tcpPeer.Zone)
+			sourceAttrs = []any{"udp_source_first_rejected_addr", firstRejectedSource.String(), "udp_source_first_rejected_reason", firstRejectedReason,
+				"udp_source_rejected_matches_tcp_peer", sameIP,
+				"udp_source_nat_candidate", cfg.UDPSourceMode() == "strict" && sameIP && (firstRejectedReason == "ip" || firstRejectedReason == "port")}
+		}
+		endLogger := logger.With(sourceAttrs...)
+		logging.LogUDPResult(endLogger, resources, closeStage, closeErr, tunnelWriter.Stats(), "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(),
 			"received_datagrams", received, "source_ip_drops", sourceIPDrops, "source_port_drops", sourcePortDrops,
 			"source_binding_drops", bindingDrops, "invalid_datagrams", invalidDrops, "oversized_datagrams", oversizedDrops,
 			"first_datagram_seen", !firstDatagramAt.IsZero(), "first_datagram_duration", firstDuration,
+			"first_accepted_datagram_seen", !firstAcceptedAt.IsZero(), "first_accepted_datagram_duration", acceptedDuration,
 			"dropped_datagrams", dropped.Load()+in.ExpiredDrops+out.ExpiredDrops,
 			"queue_full_drops", in.FullDrops+out.FullDrops, "queue_expired_drops", in.ExpiredDrops+out.ExpiredDrops,
 			"queue_resource_drops", in.ResourceDrops+out.ResourceDrops,
@@ -311,6 +334,9 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 			continue
 		}
 		if reason := filter.rejection(source); reason != "" {
+			if !firstRejectedSource.IsValid() {
+				firstRejectedSource, firstRejectedReason = source, reason
+			}
 			switch reason {
 			case "ip":
 				sourceIPDrops++
@@ -327,6 +353,9 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 			dropped.Add(1)
 			logger.Debug("drop malformed SOCKS5 UDP datagram", "error", err)
 			continue
+		}
+		if firstAcceptedAt.IsZero() {
+			firstAcceptedAt = time.Now()
 		}
 		clientUDPmu.Lock()
 		if !clientUDP.IsValid() {
@@ -345,4 +374,15 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 			dropped.Add(1)
 		}
 	}
+}
+
+// Bound source diagnostics independently of resolver response size. The full
+// source filter is retained; this truncates only the presentation, not access.
+func udpSourceIPSummary(ips []net.IP) string {
+	const maxLoggedIPs = 8
+	names := make([]string, 0, min(len(ips), maxLoggedIPs))
+	for _, ip := range ips[:min(len(ips), maxLoggedIPs)] {
+		names = append(names, ip.String())
+	}
+	return strings.Join(names, ",")
 }

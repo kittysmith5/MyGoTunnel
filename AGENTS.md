@@ -147,6 +147,10 @@ go build ./cmd/...
 
 ## 日志契约
 
+- 30秒stats默认补充RSS/Go堆（alloc/inuse/idle/released）/累计分配/GC/goroutine/FD/CPU；Linux RSS/FD/CPU各有availability，其他平台不能宣称得到不可用指标。FD分批读取且排除自身目录描述符，计数允许并发近似；不启动逐连接或逐包采样，停止仍须join。
+- TCP根故障字段error_operation/error_endpoint/error_errno/error_local_addr/error_remote_addr（text op/endpoint/errno/error_local/error_remote）仅基于既有错误链及端点匹配；readfrom外层不能替代内层读错误，歧义/不明为unknown。只在失败路径收集，不包裹io.Copy端点，不改变根错误、排空、错误级别和字节计数。
+- UDP来源日志每会话仅保留首个拒绝端点及原因，ready允许IP摘要最多8项并输出完整数量；不截断实际filter。first_datagram仍为收到包，first_accepted_datagram为通过来源/格式校验，不表示送达；nat_candidate仅为诊断提示，不放宽strict/nat边界。UDP控制终止与数据故障用udp_termination_scope及udp_control_errors/data_errors细分，原session_errors与互斥终止计数不变；观察器保留relay_failed并补充子计数。
+
 - 默认 text 必须紧凑英文，不重复 time=/level=/msg=/component=；使用 UTC 完整日期时间 `YYYY-MM-DD HH:MM:SS.mmm`，启动输出 timezone=UTC，C/S 区分两端。JSON 继续使用标准字段和现有长字段名，Duration 为纳秒整数，字节数为原始整数；时间统一 UTC。事件名使用 listening/ready/closed/failed/stats 等短英文。
 - 目标域名/IP:端口和 peer 保留；不解密 HTTPS、不记录 URL 路径、token、私钥、连接码或原始控制报文。文本属性中的控制字符必须转义，写入一次完整记录，并在 With/WithGroup 派生处理器间共享写锁。
 - connection_id/id 只在进程内关联，包含进程前缀和原子递增编号，不通过协议传递ID，不宣称两端 ID 一致。
@@ -166,6 +170,8 @@ go build ./cmd/...
 服务端继续使用 Go 标准 TLS，明确最低 TLS 1.2，TLS 1.2 仅允许 ECDHE + AES-GCM/ChaCha20-Poly1305；TLS 1.3 密码套件及密钥交换保留 Go 默认配置。此为一致性与安全整改，不是 nginx/OpenSSL 服务端指纹模仿。自定义 AUTH/CONNECT 仍不是 HTTP，即使协商 http/1.1 也不表示支持网页。TCP、预连接、半关闭及证书指纹验证保持原有机制；不引入 WSS，不增加握手往返。旧客户端仍可连接新服务端，TLS 1.0/1.1 和仅支持旧 TLS 1.2 套件的外部客户端不再支持。
 
 ## 自适应预连接与拨号测量
+
+可选-pool-idle-size（默认0关闭，启用为1..pool-size）与-pool-idle-after（默认2分钟）允许长期无需求后每30秒向更低空闲容量缩减；默认保持原floor。启动记录pool_idle_size；取用立即恢复正常size，交接连接不归池、不因收缩关闭；超出目标的备用自然到期且不主动续期。测试覆盖默认/非法配置、空闲门槛与节奏、首个就绪连接、恢复与交接所有权、受控续期工作量对照；不以实验次数变化承诺线上P95提升。
 
 客户端 `-pool-size 4 -pool-max 16`：size 是备用容量下限，max 是自适应上限（均不含已经转发的连接）。当请求取用时就绪数不超过 1，目标容量增加 1，最多达到 max；取用、失效立即触发补充。连续 30 秒无取用后，每 30 秒目标容量减 1，最低回到 size。已有多余空闲连接自然到期释放，不中断正在使用的连接。此为需求耗尽驱动的保守自适应，不是基于 QPS/补充时长的预测算法。后台补充与 ready 总量受目标限制；收缩后已经启动的补充可能短暂超过新目标，但不超过 max。`-pool-max 0` 或等于 size 使用固定容量；`-pool-size 0` 禁用池。非零 max 必须不小于 size，最大 32；例如 size=32 时须同时指定 max=32。服务端 `-max-idle` 为所有客户端共享，扩容仍可能被 BUSY 拒绝，沿用有界退避。
 

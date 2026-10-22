@@ -56,3 +56,24 @@ func TestDisabledMetrics(t *testing.T) {
 	stop()
 	stop()
 }
+
+func TestSnapshotIncludesHeapAndProcessState(t *testing.T) {
+	s := Snapshot()
+	if s.Goroutines < 1 || s.HeapAlloc == 0 || s.HeapAlloc > s.HeapInuse || s.HeapReleased > s.HeapIdle {
+		t.Fatalf("inconsistent heap/process sample: %+v", s)
+	}
+	if runtime.GOOS == "linux" && (!s.FDAvailable || s.FDCount < 1 || !s.RSSAvailable || s.RSSBytes == 0) {
+		t.Fatalf("missing Linux process sample: %+v", s)
+	}
+	if runtime.GOOS == "linux" {
+		f, err := os.CreateTemp(t.TempDir(), "fd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		next := Snapshot()
+		if next.FDCount < s.FDCount+1 {
+			t.Fatalf("new descriptor not counted: before=%d after=%d", s.FDCount, next.FDCount)
+		}
+	}
+}

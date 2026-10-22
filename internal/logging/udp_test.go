@@ -25,6 +25,7 @@ func TestUDPTerminationReasonRootAndProcessCounters(t *testing.T) {
 			failed bool
 		}{
 			{"udp_control", nil, "eof", false}, {"udp_tunnel_read", io.EOF, "eof", false},
+			{"udp_control", syscall.ECONNRESET, "reset", true}, {"udp_control", context.DeadlineExceeded, "timeout", true},
 			{"udp_tunnel_write", context.DeadlineExceeded, "timeout", true},
 			{"udp_tunnel_read", io.ErrUnexpectedEOF, "truncated", true},
 			{"udp_tunnel_read", syscall.ECONNRESET, "reset", true},
@@ -49,6 +50,9 @@ func TestUDPTerminationReasonRootAndProcessCounters(t *testing.T) {
 				if s.Sessions != 1 || s.SessionErrors != wantErrors {
 					t.Fatal(s)
 				}
+				if s.ControlSessionErrors+s.DataSessionErrors != s.SessionErrors || (tc.stage == "udp_control" && s.DataSessionErrors != 0) || (tc.stage != "udp_control" && s.ControlSessionErrors != 0) {
+					t.Fatal("control/data termination scopes overlap", s)
+				}
 				if tc.stage == "udp_tunnel_write" && s.WriteTimeouts != 1 {
 					t.Fatal(s)
 				}
@@ -69,6 +73,13 @@ func TestUDPTerminationReasonRootAndProcessCounters(t *testing.T) {
 						t.Fatal(err)
 					}
 					if row["stage"] != tc.stage || row["close_reason"] != tc.reason || row["udp_tunnel_write_max_duration"] != float64(1234000) {
+						t.Fatal(row)
+					}
+					wantScope := "data"
+					if tc.stage == "udp_control" {
+						wantScope = "control"
+					}
+					if row["udp_termination_scope"] != wantScope {
 						t.Fatal(row)
 					}
 				}

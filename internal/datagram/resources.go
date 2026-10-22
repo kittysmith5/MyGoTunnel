@@ -42,6 +42,7 @@ type Resources struct {
 	socketRejected, memoryRejected                      uint64
 	residentRejected                                    uint64
 	sessions, sessionErrors, writeErrors, writeTimeouts uint64
+	controlSessionErrors, dataSessionErrors             uint64
 	ends                                                TerminationStats
 }
 
@@ -53,6 +54,7 @@ type ResourceStats struct {
 	SocketRejected, MemoryRejected                                        uint64
 	ResidentRejected                                                      uint64
 	Sessions, SessionErrors, WriteErrors, WriteTimeouts                   uint64
+	ControlSessionErrors, DataSessionErrors                               uint64
 	Terminations                                                          TerminationStats
 }
 
@@ -190,12 +192,17 @@ func (r *Resources) Close() {
 	r.evictLocked()
 }
 
-func (r *Resources) RecordSession(reason string, writeFailed bool) {
+func (r *Resources) RecordSession(reason string, writeFailed bool, scope ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.sessions++
 	if reason != "eof" {
 		r.sessionErrors++
+		if len(scope) > 0 && scope[0] == "control" {
+			r.controlSessionErrors++
+		} else {
+			r.dataSessionErrors++
+		}
 	}
 	if writeFailed {
 		r.writeErrors++
@@ -226,5 +233,7 @@ func (r *Resources) Stats() ResourceStats {
 	defer r.mu.Unlock()
 	return ResourceStats{Sockets: r.sockets, MaxSockets: r.maxSockets, BufferBytes: r.bytes, CachedBytes: r.cached, PeakBytes: r.peak, MemoryLimit: r.limit,
 		ResidentBytes: r.resident, ResidentLimit: r.residentLimit, TransientReserve: min(r.limit, TransientReserveBytes), ResidentRejected: r.residentRejected,
-		SocketRejected: r.socketRejected, MemoryRejected: r.memoryRejected, Sessions: r.sessions, SessionErrors: r.sessionErrors, WriteErrors: r.writeErrors, WriteTimeouts: r.writeTimeouts, Terminations: r.ends}
+		SocketRejected: r.socketRejected, MemoryRejected: r.memoryRejected, Sessions: r.sessions, SessionErrors: r.sessionErrors,
+		ControlSessionErrors: r.controlSessionErrors, DataSessionErrors: r.dataSessionErrors,
+		WriteErrors: r.writeErrors, WriteTimeouts: r.writeTimeouts, Terminations: r.ends}
 }

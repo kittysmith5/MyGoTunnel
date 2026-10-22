@@ -49,6 +49,10 @@ SOCKS5 同时支持 TCP CONNECT 与 UDP ASSOCIATE。UDP 经现有 TLS/TCP 隧道
 
 应用声明内网地址或端口、实际报文经过 NAT 映射时，可在客户端显式启用 `udp_source_policy="nat"`。此模式仅允许 SOCKS TCP 对端 IP，忽略声明的来源地址/端口且不解析该来源域名；收到首个合法 SOCKS UDP 数据报后固定实际来源端口。不同 IP 的报文不能绑定，绑定后也不能换端口或 IPv6 接口范围。它适用于 TCP/UDP 共用出口 IP 的 NAT；两者出口 IP 不同仍需使用 strict 并正确声明来源。
 
+UDP ready 日志补充 `udp_source_declared_addr`（ASSOCIATE 声明）、`udp_source_allowed_ips`（最多前8个IP）、`udp_source_allowed_count`（完整数量）和 `udp_source_allowed_port`（0表示由合法首包学习）。会话结束仅记录首个来源拒绝样本 `udp_source_first_rejected_addr/reason` 和 `udp_source_rejected_matches_tcp_peer`；不逐包输出、不记录报文。`udp_source_nat_candidate=true` 只提示 strict 下首个被拒绝的 IP/声明端口与 TCP peer 具备 NAT 排查条件，不能证明报文合法或自动切换模式。`first_datagram_seen/duration` 保持表示首个收到的报文；新增 `first_accepted_datagram_seen/duration` 表示首个通过来源及格式校验的报文，未出现时为 false/0，并不承诺已入队或送达。
+
+UDP 结束日志新增 `udp_termination_scope`：`control` 为本地 SOCKS TCP 控制连接终止，`data` 为其余转发阶段终止。stats 的 `udp_control_errors/udp_data_errors` 互斥，之和等于原有 `udp_session_errors`；既有错误与终止原因计数保持，不把控制 reset/timeout 隐藏成正常 EOF。观察器新增对应子计数 `udp_control_failed/udp_data_failed`，保留原 `relay_failed` 总数及旧日志兼容。
+
 客户端可选以下本地策略，不进入连接码：
 
 ```json
@@ -162,7 +166,11 @@ SOCKS 子阶段均包含对端/网络等待，不能当作纯计算耗时；与�
 
 转发失败增加 JSON `failure_phase`（text `phase`）：`copy` 为数据复制失败，`half_close` 为 EOF 后发送半关闭失败。ENOTCONN 归类为 `closed`，仍输出 WARN failed，并保留首个失败方向；正常半关闭仍等待反向数据排空。
 
+TCP 转发失败补充 JSON `error_operation/error_endpoint/error_errno/error_local_addr/error_remote_addr`（text `op/endpoint/errno/error_local/error_remote`）。操作为 read/write/close_write/unknown，端点为 application/tunnel/target/unknown；errno 是所在操作系统的数值，仅可用时输出。仅从根错误的既有 net.OpError 及连接地址推断，嵌套 ReadFrom 优先检查内层错误；歧义、无地址或无法识别时明确 unknown。半关闭目的端由调用位置确定。字段定位的是报错 socket，不能直接归因中间线路或应用行为；不包裹读写、不改变 io.Copy 快速路径和半关闭行为。
+
 每 30 秒输出一条 stats：`active` 是已接入但尚未退出的连接总数（包含建连、备用和转发），`setup` 是正在占用建连名额的数量，`idle` 是客户端备用池 / 服务端已认证备用数量，斜线后是配置上限。`rejected` 是本次服务进程启动后的准入超限累计数。快照是实时近似值；客户端后台备用连接另由 pool-size 限制，不计入本地 accepted active。超限不逐条刷日志，汇总数用于发现限额问题。stats 定时器在监听流程退出时停止。
+
+stats 默认同时采样 `rss_bytes/rss_available`、`heap_alloc_bytes/heap_inuse_bytes/heap_idle_bytes/heap_released_bytes`、`total_alloc_bytes/mallocs/gc_cycles`、`goroutines`、`fd_count/fd_available` 和 `cpu_seconds/cpu_available`；text 与 JSON 使用相同字段名和原始字节数。进程 CPU 为累计秒，RSS/FD 不可用时 availability=false，不能把0当作真实测量；FD 排除采样目录本身，但并发变化使快照近似。Go 堆不等于 RSS，需结合 GC、连接数和多次采样判断增长。沿用30秒定时器，不新增文件或逐包采样；可选 `-runtime-metrics` JSONL 也包含新增堆、goroutine和FD字段。
 
 ### JSON 与调试
 
@@ -220,6 +228,8 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 服务端继续使用 Go 标准 TLS，明确最低 TLS 1.2，TLS 1.2 仅允许 ECDHE + AES-GCM/ChaCha20-Poly1305；TLS 1.3 密码套件及密钥交换保留 Go 默认配置。此为一致性与安全整改，不是 nginx/OpenSSL 服务端指纹模仿。自定义 AUTH/CONNECT 仍不是 HTTP，即使协商 http/1.1 也不表示支持网页。TCP、预连接、半关闭及证书指纹验证保持原有机制；不引入 WSS，不增加握手往返。旧客户端仍可连接新服务端，TLS 1.0/1.1 和仅支持旧 TLS 1.2 套件的外部客户端不再支持。
 
 ## 自适应预连接与拨号测量
+
+可选 `-pool-idle-size 1 -pool-idle-after 2m`：连续无取用达到 idle-after 后，每30秒向指定空闲下限缩减1条；范围1～pool-size，至少保留一条目标备用。默认 idle-size=0 禁用此功能，维持原有容量下限；pool-size=0 时不能启用。多余连接自然到期，收缩期间不为超出目标的备用做主动续期。新请求立即将目标恢复到正常 pool-size，再按既有规则扩容；取用不等待补充，突发请求可能直接建连。TTL、证书、协议和已交接连接保持原语义。该选项需要以实际命中率/P95验证，不保证吞吐或时延提升；`pool-max=0` 仍固定正常容量，但显式启用 idle-size 可在空闲时缩减。
 
 客户端 `-pool-size 4 -pool-max 16`：size 是备用容量下限，max 是自适应上限（均不含已经转发的连接）。当请求取用时就绪数不超过 1，目标容量增加 1，最多达到 max；取用、失效立即触发补充。连续 30 秒无取用后，每 30 秒目标容量减 1，最低回到 size。已有多余空闲连接自然到期释放，不中断正在使用的连接。此为需求耗尽驱动的保守自适应，不是基于 QPS/补充时长的预测算法。后台补充与 ready 总量受目标限制；收缩后已经启动的补充可能短暂超过新目标，但不超过 max。`-pool-max 0` 或等于 size 使用固定容量；`-pool-size 0` 禁用池。非零 max 必须不小于 size，最大 32；例如 size=32 时须同时指定 max=32。服务端 `-max-idle` 为所有客户端共享，扩容仍可能被 BUSY 拒绝，沿用有界退避。
 

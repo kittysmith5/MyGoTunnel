@@ -42,6 +42,8 @@ func main() {
 	importCode := flag.Bool("import", false, "import connection code from stdin and exit")
 	poolMax := flag.Int("pool-max", 16, "maximum adaptive preconnections, size must not exceed this; 0 fixes pool at pool-size")
 	poolSize := flag.Int("pool-size", 4, "authenticated preconnections, 0 disables, maximum 32")
+	poolIdleSize := flag.Int("pool-idle-size", 0, "optional idle pool floor, 1..pool-size; 0 keeps normal floor")
+	poolIdleAfter := flag.Duration("pool-idle-after", 2*time.Minute, "no-demand interval before shrinking toward pool-idle-size")
 	maxConnections := flag.Int("max-connections", 1024, "maximum accepted local connections")
 	maxSetup := flag.Int("max-setup", 128, "maximum concurrent connection setups; established tunnels do not count")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, or error")
@@ -85,14 +87,17 @@ func main() {
 	defer stopMetrics()
 	ctx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
-	if err := runContext(ctx, *shutdownTimeout, *configPath, logger, *maxSetup, clientOptions{*poolSize, *maxConnections, *poolMax}); err != nil {
+	if err := runContext(ctx, *shutdownTimeout, *configPath, logger, *maxSetup, clientOptions{poolSize: *poolSize, maxConnections: *maxConnections, poolMax: *poolMax, poolIdleSize: *poolIdleSize, poolIdleAfter: *poolIdleAfter}); err != nil {
 		logger.Error("stopped", "error", err)
 		stopMetrics()
 		os.Exit(1)
 	}
 }
 
-type clientOptions struct{ poolSize, maxConnections, poolMax int }
+type clientOptions struct {
+	poolSize, maxConnections, poolMax, poolIdleSize int
+	poolIdleAfter                                   time.Duration
+}
 
 func run(configPath string, logger *slog.Logger, maxSetup int, options ...clientOptions) error {
 	return runContext(context.Background(), 0, configPath, logger, maxSetup, options...)
@@ -102,7 +107,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	if grace < 0 {
 		return fmt.Errorf("shutdown-timeout must not be negative")
 	}
-	opts := clientOptions{4, 1024, 16}
+	opts := clientOptions{poolSize: 4, maxConnections: 1024, poolMax: 16}
 	if len(options) > 0 {
 		opts = options[0]
 	}
@@ -111,6 +116,9 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	}
 	if maxSetup <= 0 {
 		return fmt.Errorf("max-setup must be positive")
+	}
+	if opts.poolIdleSize < 0 || opts.poolIdleSize > opts.poolSize || opts.poolIdleAfter < 0 {
+		return fmt.Errorf("invalid idle pool limits")
 	}
 	cfg, err := config.LoadClientConfig(configPath)
 	if err != nil {
@@ -144,11 +152,12 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"max_connections", opts.maxConnections,
 		"max_setup", maxSetup,
 		"max_idle", poolLimit,
+		"pool_idle_size", opts.poolIdleSize,
 	)
 
 	var pool *preconnect.Pool
 	if opts.poolSize > 0 {
-		pool, err = preconnect.New(preconnect.Options{Size: opts.poolSize, MaxSize: opts.poolMax}, preconnect.NewPreparer(cfg), logger)
+		pool, err = preconnect.New(preconnect.Options{Size: opts.poolSize, MaxSize: opts.poolMax, IdleSize: opts.poolIdleSize, IdleAfter: opts.poolIdleAfter}, preconnect.NewPreparer(cfg), logger)
 		if err != nil {
 			return err
 		}
@@ -300,5 +309,5 @@ func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn 
 		"pool_ack_duration", session.AckDuration,
 		"setup_duration", time.Since(startedAt))
 	result := relay.CopyBidirectional(clientConn, clientReader, remoteConn, remoteReader)
-	logging.LogTunnelResult(requestLogger, result, startedAt)
+	logging.LogTunnelResult(requestLogger, result, startedAt, "application", "tunnel")
 }

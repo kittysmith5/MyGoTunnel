@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"mygotunnel/internal/datagram"
+	"mygotunnel/internal/diagnostics"
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
 	"net"
@@ -139,9 +140,20 @@ func StartStats(logger *slog.Logger, interval time.Duration, snapshot func() []a
 			case <-stop:
 				return
 			case <-ticker.C:
-				logger.Info("stats", snapshot()...)
+				if logger.Enabled(context.Background(), slog.LevelInfo) {
+					logger.Info("stats", append(snapshot(), RuntimeAttrs()...)...)
+				}
 			}
 		}
 	}()
 	return func() { once.Do(func() { close(stop) }); <-done }
+}
+
+// RuntimeAttrs is sampled only at the stats interval, never per connection.
+func RuntimeAttrs() []any {
+	s := diagnostics.Snapshot()
+	return []any{"rss_available", s.RSSAvailable, "rss_bytes", s.RSSBytes,
+		"heap_alloc_bytes", s.HeapAlloc, "heap_inuse_bytes", s.HeapInuse, "heap_idle_bytes", s.HeapIdle, "heap_released_bytes", s.HeapReleased,
+		"total_alloc_bytes", s.TotalAlloc, "mallocs", s.Mallocs, "gc_cycles", s.NumGC, "goroutines", s.Goroutines,
+		"fd_available", s.FDAvailable, "fd_count", s.FDCount, "cpu_available", s.CPUAvailable, "cpu_seconds", s.CPUSeconds}
 }
