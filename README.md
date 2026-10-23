@@ -1,5 +1,27 @@
 # MyGoTunnel
 
+HTTPS 入口与认证前失败处理见 [设计文档](docs/https-entry-design.md)。
+
+## 可选 HTTPS 网页入口
+
+服务端配置增加以下字段即可启用同端口网页回退，无需更改客户端或连接码：
+
+```json
+"https_entry": {"enabled": true}
+```
+
+正确 AUTH 继续原 TCP/UDP 隧道和预连接流程；普通 HTTPS 访问显示静态首页，失败 AUTH 原样交给标准 HTTP 解析器，通常返回 400，不先发送旧 `ERR`。公开 HTTP 请求不会拨号目标或切回隧道，也不计入代理失败率。未配置/关闭时保留原入口行为。成功隧道不增加应用层握手往返。
+
+可选 `index_file` 指向自己的公开 HTML：最多 64 KiB，拒绝符号链接，启动时加载到内存；缺省使用内嵌页。不开放目录、管理页或外部回退代理。首页支持 GET/HEAD，其他路径 404，其他方法 405；旧协议保留 AUTH 关键字，具体边界见设计文档。
+
+启用时新增认证前单 IP 并发限制（默认不超过全局 setup 的约四分之一且最多32）、新连接限速（20次/秒，突发40）及独立 HTTP 连接上限（默认64，受全局连接上限约束）。可通过 `max_pre_auth_per_ip`、`pre_auth_rate_per_ip`、`pre_auth_burst_per_ip`、`max_connections` 在 `https_entry` 内调整；0取默认，负数或超过10000拒绝启动，显式并发值不能超过对应服务端 CLI 上限。共享出口或大预连接池应根据合法突发调整额度。
+
+TLS、认证和首个 HTTP 请求头共享5秒总期限；HTTP 响应写入最多5秒，keep-alive空闲15秒、最多8请求。全部连接仍受原 `-max-connections/-max-setup` 管理，正常网页请求头完成后释放 setup，网页连接另受 HTTP 上限约束。HTTP body 不处理且不复用该连接，清理读取有界。
+
+启动输出 `https_entry` 和实际限额，30秒 stats 提供 `ingress_*` 指标。`ingress_http_unparsed` 表示首个请求未进入 Handler 的连接，包含格式拒绝及提前关闭，不能当成精确的 HTTP 400 计数；认证前超时另计。HTTP/TLS 失败以入口聚合指标统计，不发代理 `failed/ready` 事件，不记录 URL、请求头或凭据。`-check-config` 同时检查入口配置和公开 HTML。
+
+该功能是兼容原协议的 HTTPS 回退入口，认证成功后的流仍是自定义隧道。现有自签名证书仍会触发浏览器信任警告；要提供浏览器正常信任的网站，需要自己的域名与受信证书，并同步迁移现有客户端证书指纹。
+
 ## 连接码快速配置
 
 在服务端执行（将 `example.com:9001` 替换成客户端能够访问的域名或 IP 和端口）：

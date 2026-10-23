@@ -48,11 +48,7 @@ func ReadLine(reader *bufio.Reader) (string, error) {
 		}
 		line = append(line, fragment...)
 		if err == nil {
-			text := strings.TrimSuffix(string(line[:len(line)-1]), "\r")
-			if containsControl(text) {
-				return "", errors.New("invalid control character in control line")
-			}
-			return strings.TrimSpace(text), nil
+			return ParseControlLine(line)
 		}
 		if len(line) == MaxControlLineBytes {
 			return "", ErrControlLineTooLong
@@ -64,6 +60,22 @@ func ReadLine(reader *bufio.Reader) (string, error) {
 			return "", err
 		}
 	}
+}
+
+// ParseControlLine validates one complete, bounded control line without reading
+// or changing its original bytes. HTTPS fallback can replay these bytes exactly.
+func ParseControlLine(line []byte) (string, error) {
+	if len(line) > MaxControlLineBytes {
+		return "", ErrControlLineTooLong
+	}
+	if len(line) == 0 || line[len(line)-1] != '\n' {
+		return "", io.ErrUnexpectedEOF
+	}
+	text := strings.TrimSuffix(string(line[:len(line)-1]), "\r")
+	if containsControl(text) {
+		return "", errors.New("invalid control character in control line")
+	}
+	return strings.TrimSpace(text), nil
 }
 
 func SendConnect(conn net.Conn, targetAddr string) error {

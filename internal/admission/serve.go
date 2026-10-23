@@ -14,12 +14,26 @@ import (
 // Permit supports temporarily releasing setup capacity while an authenticated
 // connection waits in the idle pool, then reacquiring before target dial.
 type Permit struct {
-	mu       sync.Mutex
-	slots    chan struct{}
-	held     bool
-	metrics  *Counters
-	abortCtx context.Context
+	mu             sync.Mutex
+	slots          chan struct{}
+	held           bool
+	metrics        *Counters
+	abortCtx       context.Context
+	preAuthRelease func()
+	startedAt      time.Time
 }
+
+// ReleasePreAuth releases only the optional source-IP admission slot.
+func (p *Permit) ReleasePreAuth() {
+	if p.preAuthRelease != nil {
+		p.preAuthRelease()
+	}
+}
+
+func (p *Permit) StartedAt() time.Time { return p.startedAt }
+
+// AcceptGate runs before global slots or TLS handshakes. Release must be idempotent.
+type AcceptGate func(net.Conn) (release func(), allowed bool)
 
 // AbortContext is canceled only when the connection's shutdown grace expires.
 // Process cancellation initially stops setup/acceptance and allows relay drain.
@@ -82,7 +96,10 @@ func ServeWithMetrics(listener net.Listener, maxSetup, maxConnections int, handl
 
 // ServeContext stops accepting on cancellation, drains handlers, then closes
 // remaining connections after grace. Handlers must exit when their socket closes.
-func ServeContext(ctx context.Context, grace time.Duration, listener net.Listener, maxSetup, maxConnections int, handler func(net.Conn, *Permit), onOverload func(), metrics *Counters) error {
+func ServeContext(ctx context.Context, grace time.Duration, listener net.Listener, maxSetup, maxConnections int, handler func(net.Conn, *Permit), onOverload func(), metrics *Counters, gates ...AcceptGate) error {
+	if len(gates) > 1 {
+		return errors.New("at most one accept gate is supported")
+	}
 	if grace < 0 {
 		return fmt.Errorf("shutdown timeout must not be negative")
 	}
@@ -167,17 +184,30 @@ func ServeContext(ctx context.Context, grace time.Duration, listener net.Listene
 			return nil
 		}
 		delay = 0
+		startedAt := time.Now()
+		var releasePreAuth func()
+		if len(gates) != 0 && gates[0] != nil {
+			var allowed bool
+			releasePreAuth, allowed = gates[0](c)
+			if !allowed {
+				reject(c)
+				continue
+			}
+		}
 		if connections != nil {
 			select {
 			case connections <- struct{}{}:
 			default:
+				if releasePreAuth != nil {
+					releasePreAuth()
+				}
 				reject(c)
 				continue
 			}
 		}
 		select {
 		case slots <- struct{}{}:
-			permit := &Permit{slots: slots, held: true, metrics: metrics, abortCtx: abortCtx}
+			permit := &Permit{slots: slots, held: true, metrics: metrics, abortCtx: abortCtx, preAuthRelease: releasePreAuth, startedAt: startedAt}
 			if metrics != nil {
 				metrics.Open.Add(1)
 				metrics.Setup.Add(1)
@@ -196,9 +226,13 @@ func ServeContext(ctx context.Context, grace time.Duration, listener net.Listene
 					defer func() { <-connections }()
 				}
 				defer permit.Release()
+				defer permit.ReleasePreAuth()
 				handler(c, permit)
 			}()
 		default:
+			if releasePreAuth != nil {
+				releasePreAuth()
+			}
 			if connections != nil {
 				<-connections
 			}

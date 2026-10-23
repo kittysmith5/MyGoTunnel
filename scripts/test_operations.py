@@ -4,6 +4,18 @@ def load(name):
  spec=importlib.util.spec_from_file_location(name,pathlib.Path(__file__).with_name(name+'.py'))
  module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); return module
 class OperationsTest(unittest.TestCase):
+ def test_https_ingress_stats_do_not_pollute_proxy_failures(self):
+  import json
+  m=load('observe')
+  for message in [
+   '2026-10-22 00:00:00.000 INFO S stats ingress_http_requests=50 ingress_auth_rejected=6 ingress_http_unparsed=4 ingress_pre_auth_active=2',
+   json.dumps(dict(msg='stats',ingress_http_requests=50,ingress_auth_rejected=6,ingress_http_unparsed=4,ingress_pre_auth_active=2))]:
+   a=m.Aggregator();a.consume(message)
+   self.assertEqual(a.resources['ingress_http_requests'],50)
+   self.assertEqual(a.resources['ingress_auth_rejected'],6)
+   self.assertEqual(a.snapshot()['setup_failed'],0)
+   self.assertEqual(a.snapshot()['latency_samples'],0)
+   self.assertIsNone(a.snapshot()['proxy_failure_rate'])
  def test_resource_availability_survives_text_and_json(self):
   import json
   m=load('observe')

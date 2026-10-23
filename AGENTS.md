@@ -77,6 +77,7 @@ SOCKS5 应用
 - `auth_token`：必填，必须与客户端一致。
 - `cert_file`：可选，默认 `certs/cert.pem`。
 - `key_file`：可选，默认 `certs/key.pem`。
+- `https_entry`：可选同端口 HTTPS 网页回退，缺省关闭。启用时增加认证前单 IP 并发/速率与 HTTP 容量保护；字段、默认值和边界见 README 与 `docs/https-entry-design.md`。
 
 JSON 中的未知字段目前会被忽略，不能仅凭某个本地配置中存在额外字段就认为功能已经实现。新增或重命名配置项时，应同步更新结构体、JSON 标签、默认值/校验、示例或说明，以及配置加载测试。
 
@@ -169,6 +170,8 @@ go build ./cmd/...
 客户端使用 uTLS `HelloChrome_133` 基线，每条连接独立生成模板；实际 ALPN 仅提供 `http/1.1`，移除模板中仅适用于 h2 的 ALPS 扩展。此前 `HelloChrome_Auto` 在当前依赖版本也对应 Chrome 133，但模板自带的 h2/ALPS 不会仅因 Config.NextProtos 而移除。此修改验证实际线上 ClientHello，避免服务端选择客户端未实现的 h2。调整后的模板不是完整 Chrome 指纹，也不宣称模拟当前最新 Chrome。
 
 服务端继续使用 Go 标准 TLS，明确最低 TLS 1.2，TLS 1.2 仅允许 ECDHE + AES-GCM/ChaCha20-Poly1305；TLS 1.3 密码套件及密钥交换保留 Go 默认配置。此为一致性与安全整改，不是 nginx/OpenSSL 服务端指纹模仿。自定义 AUTH/CONNECT 仍不是 HTTP，即使协商 http/1.1 也不表示支持网页。TCP、预连接、半关闭及证书指纹验证保持原有机制；不引入 WSS，不增加握手往返。旧客户端仍可连接新服务端，TLS 1.0/1.1 和仅支持旧 TLS 1.2 套件的外部客户端不再支持。
+
+启用可选 https_entry 后，认证失败与非 AUTH 输入转入同一个标准 HTTP 服务，不先写 ERR；成功 AUTH 与认证后 wire 不变。分类最多保留4096字节原始前缀，回放必须原样连接原 Reader，不能重建或丢失预读。TLS/分类/首请求共享从 admission 准入起的5秒绝对期限，HTTP setter不得延长或清除；HTTP首个Handler才解除此约束。HTTP分支不再进入认证，不拨号任意Host/URL/CONNECT后端。HTTP名额与总连接计数覆盖至实际关闭；setup与单IP并发在成功AUTH/首HTTP请求头后按职责释放。AUTH关键字保留，凭据失败仍原子判定且常量时间比较。HTTP与TLS失败聚合在ingress_*，不能混入代理failed/ready和P95/P99，禁止原样记录标准库HTTP错误文本。新增入口测试覆盖失败回放、期限、body清理、配额、退出及真实uTLS/TLS的TCP/UDP/预连接/半关闭。
 
 ## 自适应预连接与拨号测量
 

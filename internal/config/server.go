@@ -20,6 +20,7 @@ type ServerConfig struct {
 	PreviousAuthTokens []PreviousToken `json:"previous_auth_tokens,omitempty"`
 	CertFile           string          `json:"cert_file"`
 	KeyFile            string          `json:"key_file"`
+	HTTPS              HTTPSConfig     `json:"https_entry,omitempty"`
 }
 
 func LoadServerConfig(path string) (*ServerConfig, error) {
@@ -60,6 +61,9 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 		cfg.KeyFile = "certs/key.pem"
 	}
 	if err := cfg.UDPQueueConfig.validate(); err != nil {
+		return nil, err
+	}
+	if err := cfg.HTTPS.validate(); err != nil {
 		return nil, err
 	}
 

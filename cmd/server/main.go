@@ -24,6 +24,7 @@ import (
 	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/diagnostics"
 	"mygotunnel/internal/dialmetrics"
+	"mygotunnel/internal/ingress"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/operations"
 	"mygotunnel/internal/relay"
@@ -130,6 +131,34 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	var entrance *ingress.Server
+	var gate admission.AcceptGate
+	var httpsLimits config.HTTPSConfig
+	if cfg.HTTPS.Enabled {
+		httpsLimits, err = cfg.HTTPS.Effective(maxSetup, opts.maxConnections)
+		if err != nil {
+			return err
+		}
+		entrance, err = ingress.New(cfg.HTTPS.HTML(), httpsLimits.MaxConnections, httpsLimits.MaxPreAuthPerIP, httpsLimits.PreAuthRatePerIP, httpsLimits.PreAuthBurstPerIP)
+		if err != nil {
+			return err
+		}
+		defer entrance.Close()
+		gate = entrance.Accept
+		shutdownDone := make(chan struct{})
+		stopHTTP := context.AfterFunc(ctx, func() {
+			defer close(shutdownDone)
+			drain, cancel := context.WithTimeout(context.Background(), grace)
+			defer cancel()
+			_ = entrance.Shutdown(drain)
+		})
+		defer func() {
+			if stopHTTP() {
+				close(shutdownDone)
+			}
+			<-shutdownDone
+		}()
+	}
 	resources := datagram.NewResources(cfg.ProcessLimits())
 	authLimiter := authlimit.New(4096, 5, time.Minute, time.Minute)
 	defer resources.Close()
@@ -156,23 +185,35 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"max_connections", opts.maxConnections,
 		"max_setup", maxSetup,
 		"max_idle", opts.maxIdle,
+		"https_entry", cfg.HTTPS.Enabled,
+		"https_max_connections", httpsLimits.MaxConnections,
+		"https_max_pre_auth_per_ip", httpsLimits.MaxPreAuthPerIP,
+		"https_pre_auth_rate_per_ip", httpsLimits.PreAuthRatePerIP,
+		"https_pre_auth_burst_per_ip", httpsLimits.PreAuthBurstPerIP,
 	)
 
 	idleSlots := make(chan struct{}, opts.maxIdle)
 	metrics := &admission.Counters{}
 	stopStats := logging.StartStats(logger, 30*time.Second, func() []any {
-		return append([]any{"auth_rate_limited", authLimiter.Limited(), "active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", len(idleSlots), "max_idle", opts.maxIdle, "rejected", metrics.Rejected.Load()}, logging.UDPResourceAttrs(resources)...)
+		attrs := append([]any{"auth_rate_limited", authLimiter.Limited(), "active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", len(idleSlots), "max_idle", opts.maxIdle, "rejected", metrics.Rejected.Load()}, logging.UDPResourceAttrs(resources)...)
+		if entrance != nil {
+			attrs = append(attrs, entrance.Metrics.Attrs()...)
+		}
+		return attrs
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleTunnelContextWithLimiter(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire, abortContext: permit.AbortContext()}, authLimiter, resources)
-	}, nil, metrics)
+		handleTunnelContextWithLimiter(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire, abortContext: permit.AbortContext(), entrance: entrance, releasePreAuth: permit.ReleasePreAuth, acceptedAt: permit.StartedAt()}, authLimiter, resources)
+	}, nil, metrics, gate)
 }
 
 type serverPoolOptions struct {
-	idleSlots    chan struct{}
-	resumeSetup  func() bool
-	abortContext context.Context
+	idleSlots      chan struct{}
+	resumeSetup    func() bool
+	abortContext   context.Context
+	entrance       *ingress.Server
+	releasePreAuth func()
+	acceptedAt     time.Time
 }
 
 func handleTunnel(tunnelConn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, releaseSetup func()) {
@@ -198,17 +239,34 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 		connectionLogger.Debug("released", "duration", time.Since(startedAt))
 	}()
 
-	reader := bufio.NewReader(tunnelConn)
+	var reader *bufio.Reader
 
 	authStarted := time.Now()
 	peerKey := authlimit.PeerKey(tunnelConn.RemoteAddr())
-	if err := checkAuthTokenProvider(tunnelConn, reader, func() []string { return cfg.ActiveAuthTokens(time.Now()) }, authLimiter, peerKey); err != nil {
-		if errors.Is(err, authlimit.ErrLimited) {
-			connectionLogger.Debug("authentication rate limited")
+	tokenProvider := func() []string { return cfg.ActiveAuthTokens(time.Now()) }
+	if poolOptions != nil && poolOptions.entrance != nil {
+		var err error
+		reader, err = poolOptions.entrance.Route(parent, tunnelConn, poolOptions.acceptedAt, releaseSetup, poolOptions.releasePreAuth, func(line string) error {
+			return authenticateTokenLine(line, tokenProvider, authLimiter, peerKey)
+		})
+		if err != nil {
+			// Public ingress failures are aggregated separately from proxy attempts.
+			connectionLogger.Debug("ingress closed")
 			return
 		}
-		logging.Failure(connectionLogger, "auth", err, "auth_duration", time.Since(authStarted), "setup_duration", time.Since(startedAt))
-		return
+		if reader == nil {
+			return
+		}
+	} else {
+		reader = bufio.NewReader(tunnelConn)
+		if err := checkAuthTokenProvider(tunnelConn, reader, tokenProvider, authLimiter, peerKey); err != nil {
+			if errors.Is(err, authlimit.ErrLimited) {
+				connectionLogger.Debug("authentication rate limited")
+				return
+			}
+			logging.Failure(connectionLogger, "auth", err, "auth_duration", time.Since(authStarted), "setup_duration", time.Since(startedAt))
+			return
+		}
 	}
 
 	authDuration := time.Since(authStarted)
@@ -405,8 +463,20 @@ func checkAuthTokenProvider(conn net.Conn, reader *bufio.Reader, tokenProvider f
 		return fmt.Errorf("read authentication request: %w", err)
 	}
 
+	if err := authenticateTokenLine(line, tokenProvider, limiter, peerKey); err != nil {
+		return rejectAuth(conn, err)
+	}
+	if err := tunnel.SendOK(conn); err != nil {
+		return fmt.Errorf("send authentication response: %w", err)
+	}
+	return nil
+}
+
+// authenticateTokenLine does not write: HTTPS fallback must own the first byte
+// of any rejection response. Both entrances share the same credential decision.
+func authenticateTokenLine(line string, tokenProvider func() []string, limiter *authlimit.Limiter, peerKey string) error {
 	if !strings.HasPrefix(line, "AUTH ") {
-		return rejectAuth(conn, errors.New("invalid authentication command"))
+		return errors.New("invalid authentication command")
 	}
 	expectedTokens := tokenProvider()
 
@@ -420,15 +490,11 @@ func checkAuthTokenProvider(conn net.Conn, reader *bufio.Reader, tokenProvider f
 	}
 	if limiter != nil {
 		if err := limiter.Authenticate(peerKey, matched == 1); errors.Is(err, authlimit.ErrLimited) {
-			return rejectAuth(conn, err)
+			return err
 		}
 	}
 	if matched != 1 {
-		return rejectAuth(conn, errors.New("authentication token mismatch"))
-	}
-
-	if err := tunnel.SendOK(conn); err != nil {
-		return fmt.Errorf("send authentication response: %w", err)
+		return errors.New("authentication token mismatch")
 	}
 
 	return nil
