@@ -88,7 +88,7 @@ func openRemoteCommand(ctx context.Context, cfg *config.ClientConfig, target str
 		}
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, remoteDialTimeout)
-	conn, timings, err := utlsconn.DialWithTimings(dialCtx, cfg.RemoteAddr, cfg.SNI, cfg.CertificateFingerprint)
+	conn, timings, err := utlsconn.DialWithOptions(dialCtx, cfg.RemoteAddr, cfg.SNI, cfg.CertificateFingerprint, utlsconn.Options{SessionCache: cfg.TLSSessionCache})
 	cancel()
 	session.Dial = timings
 	session.Stage = timings.Stage

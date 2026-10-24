@@ -60,7 +60,7 @@ func NewPreparer(cfg *config.ClientConfig) Factory {
 
 func prepare(ctx context.Context, cfg *config.ClientConfig, ack bool) (entry *Entry, err error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	conn, timings, err := utlsconn.DialWithTimings(dialCtx, cfg.RemoteAddr, cfg.SNI, cfg.CertificateFingerprint)
+	conn, timings, err := utlsconn.DialWithOptions(dialCtx, cfg.RemoteAddr, cfg.SNI, cfg.CertificateFingerprint, utlsconn.Options{SessionCache: cfg.TLSSessionCache})
 	cancel()
 	if err != nil {
 		return nil, err

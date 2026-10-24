@@ -40,10 +40,15 @@ func TestCompactPoolAndStats(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	logger.Info("ready", "pool_hit", true, "pool_fallback", false, "tcp_duration", time.Duration(0), "tls_duration", time.Duration(0), "pool_acquire_duration", 100*time.Microsecond, "control_duration", 105*time.Millisecond)
+	logger.Info("ready", "pool_hit", true, "pool_fallback", false, "tcp_duration", time.Duration(0), "tls_duration", time.Duration(0), "tls_resumed", false, "pool_acquire_duration", 100*time.Microsecond, "control_duration", 105*time.Millisecond)
 	got := out.String()
-	if !strings.Contains(got, "pool=hit take=0.1ms ctl=105ms") || strings.Contains(got, "tcp=") || strings.Contains(got, "tls=") {
+	if !strings.Contains(got, "pool=hit take=0.1ms ctl=105ms") || strings.Contains(got, "tcp=") || strings.Contains(got, "tls=") || strings.Contains(got, "resumed=") {
 		t.Fatal(got)
+	}
+	out.Reset()
+	logger.Info("ready", "tls_duration", time.Millisecond, "tls_resumed", true)
+	if !strings.Contains(out.String(), "tls=1ms resumed=true") {
+		t.Fatal(out.String())
 	}
 	out.Reset()
 	logger.Warn("failed", "stage", "dial", "close_reason", "dns_timeout", "dns_retry_count", 1)

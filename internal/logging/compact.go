@@ -75,8 +75,8 @@ var shortKeys = map[string]string{
 	"pool_renewed": "renewed", "pool_retry": "retry", "dns_duration": "dns", "target_tcp_duration": "target_tcp", "dns_retry_count": "dns_retry", "pool_hits": "hit", "pool_misses": "miss", "pool_fallbacks": "fallbacks", "pool_hit_rate": "hit_pct", "pool_target": "pool_target", "pool_filling": "filling",
 	"connection_id": "id", "client_addr": "peer", "remote_addr": "server", "listen_addr": "listen",
 	"config_path": "config", "socks_duration": "socks", "tcp_duration": "tcp", "tls_duration": "tls",
-	"pool_ack_duration": "ack",
-	"control_duration":  "ctl", "pool_acquire_duration": "take", "setup_duration": "total",
+	"pool_ack_duration": "ack", "tls_resumed": "resumed",
+	"control_duration": "ctl", "pool_acquire_duration": "take", "setup_duration": "total",
 	"auth_duration": "auth", "target_dial_duration": "dial", "connect_duration": "connect",
 	"wait_duration": "wait", "reply_duration": "reply", "idle_duration": "idle", "duration": "dur",
 	"close_reason": "reason", "error": "err", "max_setup": "setup_max", "max_connections": "conn_max", "max_idle": "idle_max",
@@ -167,7 +167,7 @@ func (h *compactHandler) Handle(_ context.Context, record slog.Record) error {
 		if key == "component" || key == "target_addr" || key == "pool_fallback" {
 			continue
 		}
-		if hit && (key == "tcp_duration" || key == "tls_duration") {
+		if hit && (key == "tcp_duration" || key == "tls_duration" || key == "tls_resumed") {
 			continue
 		}
 		b.WriteByte(' ')

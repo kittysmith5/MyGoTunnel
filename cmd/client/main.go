@@ -147,6 +147,8 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"listen_addr", cfg.LocalAddr,
 		"remote_addr", cfg.RemoteAddr,
 		"sni", cfg.SNI,
+		"trust_mode", cfg.EffectiveTrustMode(),
+		"tls_session_cache", cfg.TLSSessionCache,
 		"socks_auth", cfg.SOCKSAuth != nil || cfg.SocksUsername != "" || cfg.SocksPassword != "",
 		"timezone", "UTC",
 		"max_connections", opts.maxConnections,
@@ -272,7 +274,7 @@ func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn 
 	}
 	cancel()
 	if err != nil {
-		logging.Failure(requestLogger, session.Stage, err, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "pool_ack_duration", session.AckDuration, "tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "setup_duration", time.Since(startedAt))
+		logging.Failure(requestLogger, session.Stage, err, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "pool_ack_duration", session.AckDuration, "tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed, "setup_duration", time.Since(startedAt))
 		code := socks5.ReplyCode(err)
 		var typed *tunnel.TargetError
 		if !errors.As(err, &typed) && errors.Is(err, errTargetRejected) {
@@ -301,7 +303,7 @@ func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn 
 	requestLogger.Info("ready", "remote_addr", cfg.RemoteAddr,
 		"socks_duration", socksDuration,
 		"tcp_duration", session.Dial.TCPDuration,
-		"tls_duration", session.Dial.TLSDuration,
+		"tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed,
 		"control_duration", session.ControlDuration,
 		"pool_hit", session.PoolHit,
 		"pool_fallback", session.PoolFallback,

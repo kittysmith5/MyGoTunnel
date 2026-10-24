@@ -26,7 +26,7 @@ TLS、认证和首个 HTTP 请求头共享5秒总期限；HTTP 响应写入最�
 
 客户端无 `certificate_fingerprint` 时使用系统 CA 与 SNI 主机名验证，适合自动续期。迁移前先在独立端口验证服务端完整证书链及客户端系统信任；同步调整客户端 SNI 和信任配置，保留 SOCKS 认证。旧证书指纹不能继续用于新证书。
 
-当前默认导出的连接码仍含叶证书指纹。自动续期部署新增客户端时，需要移除该指纹并设置正确 SNI，使用系统 CA 校验；不能将默认导出的固定指纹当作跨续期的信任配置。
+公有 CA 部署可用 `-export -trust-mode ca` 导出不绑定叶证书的连接码，续期后无需重新导入；导出会先验证现有证书链、有效期及公网地址的主机名。默认 `-trust-mode pin` 保留旧行为，自签名初始化仍只支持 pin。
 
 `scripts/sync_certificate.py` 负责把 ACME 已导出的证书部署给服务端，不负责签发。安装为 root 管理的 `/usr/local/sbin/mygotunnel-cert-sync`；依赖已安装的 `/usr/local/sbin/mygotunnelctl`。使用 root 所有、0600 的策略文件，例如：
 
@@ -44,9 +44,9 @@ TLS、认证和首个 HTTP 请求头共享5秒总期限；HTTP 响应写入最�
 
 运行 `mygotunnel-cert-sync --policy /etc/mygotunnel/certificate-policy.json --check` 只校验证书快照；不带 `--check` 才部署。输入拒绝 symlink/特殊文件和超限文件，私钥与配置必须私有；部署前校验密钥匹配、系统 CA 链、域名及至少24小时剩余有效期。完整证书和密钥作为不可变目录一起发布，再原子切换配置中的两条路径。只改证书路径，认证及其他配置保留。
 
-它与二进制升级共用 server 锁；持久记录准备/提交阶段，受控重启后核对运行文件、配置、unit 和实际 TLS 证书。失败恢复原配置并重启；中断后下次先恢复，不继续第二次变更。已提交事务只完成校验与清理，不退回旧证书；外部配置、程序或 unit 变化时保留记录并停止。旧证书目录与 `previous-config.json` 保留用于回滚。
+它与二进制升级共用 server 锁；持久记录准备/提交阶段，加载后核对运行文件、配置、unit 和实际 TLS 证书。通过 `-capabilities` 确认新服务端支持 SIGHUP 时采用热加载，并验证 PID 未变化；旧版本仍采用受控重启。失败恢复原配置并按同一方式重新加载；中断后下次先恢复，不继续第二次变更。已提交事务只完成校验与清理，不退回旧证书；外部配置、程序或 unit 变化时保留记录并停止。旧证书目录与 `previous-config.json` 保留用于回滚。
 
-将该命令接入 ACME 成功安装后的 reload hook，并可加 systemd 定时检查兜底。接入时保留原导出路径和其他服务已有的 reload 动作。证书内容未变化时不重启；变化时通过现有优雅退出策略重启加载，属于受控重启，并非热加载。自动化日志只给固定结果，不输出配置、凭据或原始解析错误。
+将该命令接入 ACME 成功安装后的 reload hook，并可加 systemd 定时检查兜底。接入时保留原导出路径和其他服务已有的 reload 动作。证书内容未变化时不重启。支持热加载的 Unix 服务端接收 SIGHUP 后只允许证书路径/内容变化，拒绝其他已识别配置变化；坏证书、密钥不匹配、过期/尚未生效均保留旧证书。现有连接保留旧快照，新握手使用新证书，并使用独立会话票据密钥（保留 Go 自动轮换），旧票据回退完整握手。未支持该能力的旧版本/平台仍通过原优雅退出策略重启，不能向旧二进制盲发 SIGHUP。自动化日志只给固定结果，不输出配置、凭据或原始解析错误。
 
 ## 连接码快速配置
 
@@ -84,10 +84,32 @@ go run ./cmd/client
 go run ./cmd/server -export -config configs/server.json -public-addr example.com:9001
 ```
 
-连接码是带版本号的 JSON 经 Base64URL 编码，包含远端地址、token、SNI 和服务端叶证书 DER 的 SHA-256 指纹，不包含私钥。它包含访问凭据，应通过可信渠道传递；编码不等于加密。导出仅在显式执行 `-init` / `-export` 时输出到 stdout，不写入运行日志。生成的凭据文件使用 0600 权限（Windows 下需按系统 ACL 管理）。
+受信域名证书的导出示例：
 
-客户端新增 `certificate_fingerprint` 配置项：导入后使用固定证书指纹验证服务端，替代公共 CA 验证；证书变更后需重新导出、导入。没有指纹的旧配置改为使用系统 CA 及主机名验证，因此旧的自签名部署需要先导出连接码再导入。SNI 默认取远端地址中的主机名。没有新增协议消息，AUTH/CONNECT 保持不变。
+```sh
+go run ./cmd/server -export -trust-mode ca -config configs/server.json -public-addr tunnel.example.com:8443
+```
 
+连接码是带版本号的 JSON 经 Base64URL 编码，包含远端地址、token、SNI 和信任配置，不包含私钥。pin 仍导出兼容旧客户端的 v1 连接码；ca 使用明确标注 `trust_mode=ca`、无指纹的 v2 连接码，旧客户端会明确拒绝不支持的版本。v1 缺指纹、v2 缺信任模式、ca 携带指纹或 pin 缺指纹均拒绝，不能静默降级。它包含访问凭据，应通过可信渠道传递；编码不等于加密。导出仅在显式执行 `-init` / `-export` 时输出到 stdout，不写入运行日志。生成的凭据文件使用 0600 权限（Windows 下需按系统 ACL 管理）。
+
+客户端新增 `certificate_fingerprint` 配置项：导入后使用固定证书指纹验证服务端，替代公共 CA 验证；证书变更后需重新导出、导入。没有指纹的旧配置改为使用系统 CA 及主机名验证，因此旧的自签名部署需要先导出连接码再导入。配置可显式设置 `trust_mode` 为 `ca` 或 `pin`，并校验其与指纹的一致性；省略时按有无指纹兼容推导。SNI 默认取远端地址中的主机名。没有新增协议消息，AUTH/CONNECT 保持不变。
+
+
+## 可选 TLS 会话恢复
+
+客户端 JSON 设置 `"tls_session_cache": true`，可为普通拨号和后台预连接启用 TLS 1.2/1.3 会话恢复，缺省/false 保持原行为。该本地策略不进入连接码。进程共享最多64项的 LRU 内存缓存，按远端地址、实际 SNI 和信任配置隔离；不落盘，不缓存 AUTH 成功，不发送应用 0-RTT。
+
+指纹模式通过 VerifyConnection 在完整和恢复握手中都比较叶证书指纹；CA 恢复握手重新验证证书链、主机名及有效期。无票据或服务端拒绝票据时执行完整握手。启用时仅在有真实票据时发送 PSK 扩展，保留现有 h1 ALPN 和模板的其他约束。
+
+普通 TCP/UDP 建连日志增加布尔 `tls_resumed`（text `resumed`）；预连接池的后台建连在 DEBUG `pool prepared` 中记录。pool hit 的前台没有新握手，JSON false 不代表后台没恢复，text 与零值 tcp/tls 一起省略该字段。启动记录 trust_mode 和 tls_session_cache。
+
+可在独立测试入口进行 A/B/B/A 握手对照：
+
+```sh
+go run scripts/tls_compare.go -remote tunnel.example.com:8443 -sni tunnel.example.com -n 50
+```
+
+工具仅执行系统 CA 校验和正常 HTTPS GET，目标需启用 HTTPS 入口；逐块输出 TLS P50/P95/P99、真实恢复数、失败数及客户端 CPU/分配。CPU/分配包含拨号与 HTTP 响应读取，握手时间不含 TCP/DNS，不是应用 RTT 或完整代理请求耗时。缓存收益须结合 TLS 版本和线路实测，不能据本地均值承诺公网长尾改善。
 
 ## SOCKS5 UDP
 
@@ -253,7 +275,7 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 
 两个程序新增 `-max-setup` 参数，默认 128，必须为正数。它限制同时进行 SOCKS5 协商、TLS 握手、认证和目标拨号的建连请求；进入转发后立即释放额度，错误或超时也会释放。超过限制的新连接立即关闭，不创建无限队列；超限次数进入每 30 秒的 stats 汇总，不逐条刷日志。此项不是已建立隧道总数限制。不可恢复的 Accept 错误使程序退出，临时错误采用最长 1 秒退避。
 
-客户端成功建连日志包含 `socks_duration`、`tcp_duration`（包括远端域名解析）、`tls_duration`、`control_duration`（包含服务端目标建连等待）及 `setup_duration`。服务端记录 `auth_duration`（包括 TLS 握手）、`target_dial_duration`（包括目标域名解析）、`connect_duration` 和 `setup_duration`。日志不包含令牌或控制报文。没有启用 TLS 会话恢复，指纹验证和半关闭语义保持原有行为。
+客户端成功建连日志包含 `socks_duration`、`tcp_duration`（包括远端域名解析）、`tls_duration`、`control_duration`（包含服务端目标建连等待）及 `setup_duration`。服务端记录 `auth_duration`（包括 TLS 握手）、`target_dial_duration`（包括目标域名解析）、`connect_duration` 和 `setup_duration`。日志不包含令牌或控制报文。TLS 会话恢复默认关闭；可按下节显式启用，指纹验证和半关闭语义保持原有行为。
 
 ## 预连接池
 

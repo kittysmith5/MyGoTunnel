@@ -19,6 +19,7 @@ import ssl
 import stat
 import subprocess
 import tempfile
+import time
 
 
 def digest_bytes(data):
@@ -74,7 +75,7 @@ def validate_pair(cert, key, domain):
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
 
 
-def probe_live(config, domain):
+def probe_live(config, domain, verify_ca=True):
     cert_path = pathlib.Path(config['cert_file'])
     first = re.search(br'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----', cert_path.read_bytes(), re.S)
     if first is None:
@@ -85,10 +86,54 @@ def probe_live(config, domain):
     if host in ('', '0.0.0.0', '::'):
         host = '127.0.0.1'
     context = ssl.create_default_context()
+    if not verify_ca:
+        # Recovery may restore a formerly pinned self-signed certificate.
+        # Its exact leaf digest is still checked against the private snapshot.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
     with socket.create_connection((host, int(port)), timeout=6) as raw:
         with context.wrap_socket(raw, server_hostname=domain) as connection:
             if hashlib.sha256(connection.getpeercert(binary_form=True)).digest() != expected:
                 raise RuntimeError('service did not load the expected certificate')
+
+
+def activation_mode(binary, ops):
+    try:
+        capabilities = json.loads(ops.run(str(binary), '-capabilities'))
+        if capabilities.get('certificate_reload') == 'sighup':
+            return 'reload'
+    except (subprocess.SubprocessError, ValueError, TypeError, AttributeError):
+        pass
+    return 'restart'
+
+
+def activate(record, policy, ops, verify_ca=True):
+    binary, config = pathlib.Path(policy['binary']), pathlib.Path(policy['config'])
+    unit = policy['unit']
+    expected_config = record['after_sha256'] if verify_ca else record['before_sha256']
+    if ops.digest(config) != expected_config or ops.digest(binary) != record['binary_sha256'] or ops.unit_digest(unit) != record['unit_sha256']:
+        raise RuntimeError('protected files changed before certificate activation')
+    if record.get('activation', 'restart') == 'reload':
+        pid = ops.run('systemctl', 'show', '-p', 'MainPID', '--value', unit)
+        if not pid.isdecimal() or int(pid) == 0 or ops.digest(pathlib.Path('/proc')/pid/'exe') != record['binary_sha256']:
+            raise RuntimeError('reload process identity mismatch')
+        ops.run('systemctl', 'kill', '--kill-who=main', '--signal=HUP', unit)
+        # Signal delivery is asynchronous. Verify the actual served certificate,
+        # not merely signal acceptance or the config already on disk.
+        deadline = time.monotonic()+10
+        while True:
+            try:
+                probe_live(json.loads(config.read_bytes()), policy['domain'], verify_ca=verify_ca)
+                break
+            except (OSError, RuntimeError):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
+        if ops.run('systemctl', 'show', '-p', 'MainPID', '--value', unit) != pid:
+            raise RuntimeError('process changed during certificate reload')
+    else:
+        ops.run('systemctl', 'restart', unit)
+    ops.validate_running(binary, config, unit, record['binary_sha256'], expected_config, record['unit_sha256'])
 
 
 def guard_record(record, policy, ops):
@@ -97,6 +142,8 @@ def guard_record(record, policy, ops):
     unit = policy['unit']
     if record.get('schema') != 1 or record.get('phase') not in ('prepared', 'committed'):
         raise RuntimeError('invalid certificate transaction')
+    if record.get('activation', 'restart') not in ('reload', 'restart'):
+        raise RuntimeError('invalid certificate activation mode')
     if record.get('config') != str(config) or record.get('binary') != str(binary) or record.get('unit') != unit:
         raise RuntimeError('certificate transaction policy changed')
     if ops.digest(binary) != record['binary_sha256'] or ops.unit_digest(unit) != record['unit_sha256']:
@@ -108,20 +155,18 @@ def guard_record(record, policy, ops):
 def recover(record, policy, ops, journal):
     guard_record(record, policy, ops)
     config, binary = pathlib.Path(policy['config']), pathlib.Path(policy['binary'])
+    before = base64.b64decode(record['before'], validate=True)
+    if digest_bytes(before) != record['before_sha256']:
+        raise RuntimeError('certificate rollback snapshot changed')
     if record['phase'] == 'committed':
         if ops.digest(config) != record['after_sha256']:
             raise RuntimeError('committed certificate configuration changed')
         ops.ensure_running(binary, config, policy['unit'], record['binary_sha256'], record['after_sha256'], record['unit_sha256'])
         probe_live(json.loads(config.read_bytes()), policy['domain'])
-        atomic_bytes(journal.parent/'previous-config.json', base64.b64decode(record['before'], validate=True), ops)
+        atomic_bytes(journal.parent/'previous-config.json', before, ops)
     else:
-        before = base64.b64decode(record['before'], validate=True)
-        if digest_bytes(before) != record['before_sha256']:
-            raise RuntimeError('certificate rollback snapshot changed')
         atomic_bytes(config, before, ops)
-        # Force a reload: the process might have loaded the new pair before a crash.
-        ops.run('systemctl', 'restart', policy['unit'])
-        ops.validate_running(binary, config, policy['unit'], record['binary_sha256'], record['before_sha256'], record['unit_sha256'])
+        activate(record, policy, ops, verify_ca=False)
     journal.unlink()
     ops.fsync_directory(journal.parent)
 
@@ -179,6 +224,7 @@ def synchronize(policy, ops, check_only=False):
         finally:
             pending.unlink()
         record = {'schema': 1, 'phase': 'prepared', 'config': str(config_path), 'binary': str(binary), 'unit': unit,
+                  'activation': activation_mode(binary, ops),
                   'binary_sha256': ops.digest(binary), 'unit_sha256': ops.unit_digest(unit),
                   'before': base64.b64encode(raw).decode('ascii'), 'before_sha256': digest_bytes(raw), 'after_sha256': digest_bytes(after)}
         if config_path.read_bytes() != raw:
@@ -188,8 +234,7 @@ def synchronize(policy, ops, check_only=False):
             if config_path.read_bytes() != raw:
                 raise RuntimeError('configuration changed after preparing certificate deployment')
             atomic_bytes(config_path, after, ops)
-            ops.run('systemctl', 'restart', unit)
-            ops.validate_running(binary, config_path, unit, record['binary_sha256'], record['after_sha256'], record['unit_sha256'])
+            activate(record, policy, ops)
             probe_live(next_config, domain)
             record['phase'] = 'committed'
             ops.write_json(journal, record)
@@ -202,7 +247,7 @@ def synchronize(policy, ops, check_only=False):
         atomic_bytes(root/'previous-config.json', raw, ops)
         journal.unlink()
         ops.fsync_directory(root)
-        return {'ok': True, 'action': 'updated'}
+        return {'ok': True, 'action': 'updated', 'activation': record['activation']}
 
 
 def main():

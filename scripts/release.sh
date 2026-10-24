@@ -24,11 +24,12 @@ for arch in arm64 amd64; do
 done
 cp scripts/mygotunnelctl.py "$out/mygotunnelctl"
 cp scripts/observe.py "$out/observe.py"
+cp scripts/sync_certificate.py "$out/mygotunnel-cert-sync"
 cp "$public_key" "$out/release-ed25519.pub.pem"
 python3 - "$out" "$version" "$commit" "$built" "$signing_key" <<'PY'
 import base64,hashlib,json,pathlib,subprocess,sys,tempfile
 out=pathlib.Path(sys.argv[1]); key=pathlib.Path(sys.argv[5])
-files={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in out.iterdir() if p.name in ['server-linux-arm64','server-linux-amd64','client-linux-arm64','client-linux-amd64','mygotunnelctl','observe.py','release-ed25519.pub.pem']}
+files={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in out.iterdir() if p.name in ['server-linux-arm64','server-linux-amd64','client-linux-arm64','client-linux-amd64','mygotunnelctl','observe.py','mygotunnel-cert-sync','release-ed25519.pub.pem']}
 with tempfile.TemporaryDirectory() as d:
  pub=pathlib.Path(d)/'pub.der'; subprocess.run(['openssl','pkey','-in',str(key),'-pubout','-outform','DER','-out',str(pub)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
  keyid=hashlib.sha256(pub.read_bytes()[-32:]).hexdigest()[:16]

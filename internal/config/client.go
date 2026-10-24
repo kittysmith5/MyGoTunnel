@@ -28,6 +28,8 @@ type ClientConfig struct {
 	AuthToken              string              `json:"auth_token"`
 	SNI                    string              `json:"sni"`
 	CertificateFingerprint string              `json:"certificate_fingerprint,omitempty"`
+	TrustMode              string              `json:"trust_mode,omitempty"`
+	TLSSessionCache        bool                `json:"tls_session_cache,omitempty"`
 	UDPSourcePolicy        string              `json:"udp_source_policy,omitempty"`
 	UDPRelayPortMin        int                 `json:"udp_relay_port_min,omitempty"`
 	UDPRelayPortMax        int                 `json:"udp_relay_port_max,omitempty"`

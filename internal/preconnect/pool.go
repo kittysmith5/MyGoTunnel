@@ -246,6 +246,9 @@ func (p *Pool) fill(old *Entry) {
 	p.wg.Add(1)
 	go p.guard(entry)
 	p.mu.Unlock()
+	if p.logger != nil {
+		p.logger.Debug("pool prepared", "tls_duration", entry.DialTimings.TLSDuration, "tls_resumed", entry.DialTimings.TLSResumed)
+	}
 	if retired != nil {
 		closeUnused(retired.Conn)
 	}

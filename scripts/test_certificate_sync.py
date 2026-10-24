@@ -33,6 +33,7 @@ class CertificateSyncTest(unittest.TestCase):
                            source_cert=str(self.cert), source_key=str(self.key), state_dir=str(self.root/'certificates'))
         self.restart = mock.Mock()
         for obj, name, value in [(self.module, 'validate_pair', mock.Mock()), (self.module, 'probe_live', mock.Mock()),
+                                 (self.module, 'activation_mode', mock.Mock(return_value='restart')),
                                  (self.ops, 'run', self.restart), (self.ops, 'validate_running', mock.Mock()),
                                  (self.ops, 'ensure_running', mock.Mock()), (self.ops, 'unit_digest', lambda unit: 'unit-hash'),
                                  (self.ops, 'check', mock.Mock())]:
@@ -126,6 +127,51 @@ class CertificateSyncTest(unittest.TestCase):
         self.key.chmod(0o600)
         self.key.unlink(); self.key.symlink_to(self.cert)
         with self.assertRaises(OSError): self.sync()
+
+    def enable_reload(self):
+        self.module.activation_mode.return_value = 'reload'
+        self.restart.return_value = '1234'
+        original_digest = self.ops.digest
+        patch = mock.patch.object(self.ops, 'digest', side_effect=lambda path: original_digest(self.binary) if str(path) == '/proc/1234/exe' else original_digest(path))
+        patch.start(); self.addCleanup(patch.stop)
+
+    def test_hot_reload_keeps_pid_and_does_not_restart(self):
+        self.enable_reload()
+        result = self.sync()
+        self.assertEqual(result['activation'], 'reload')
+        self.assertIn(mock.call('systemctl', 'kill', '--kill-who=main', '--signal=HUP', self.policy['unit']), self.restart.call_args_list)
+        self.assertNotIn(mock.call('systemctl', 'restart', self.policy['unit']), self.restart.call_args_list)
+        self.assertEqual(self.sync()['action'], 'unchanged')
+
+    def test_hot_reload_waits_for_new_leaf_and_rolls_back_without_restart(self):
+        self.enable_reload()
+        before = self.config.read_bytes()
+        # The first signal never loads the new pair; rollback reload succeeds.
+        self.module.probe_live.side_effect = [RuntimeError('stale leaf'), None]
+        with mock.patch.object(self.module.time, 'monotonic', side_effect=[0, 11, 12]):
+            with self.assertRaises(RuntimeError): self.sync()
+        self.assertEqual(self.config.read_bytes(), before)
+        signals = [call for call in self.restart.call_args_list if 'kill' in call.args]
+        self.assertEqual(len(signals), 2)
+        self.assertNotIn(mock.call('systemctl', 'restart', self.policy['unit']), self.restart.call_args_list)
+        self.assertFalse((self.root/'certificates/transaction.json').exists())
+
+    def test_hot_reload_rejects_running_binary_mismatch(self):
+        self.module.activation_mode.return_value = 'reload'
+        self.restart.return_value = '0'
+        before = self.config.read_bytes()
+        with self.assertRaises(RuntimeError): self.sync()
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertTrue((self.root/'certificates/transaction.json').exists())
+        self.assertFalse(any('kill' in call.args for call in self.restart.call_args_list))
+
+
+class CapabilitiesTest(unittest.TestCase):
+    def test_capability_detection_preserves_legacy_restart(self):
+        module, ops = load('sync_certificate'), mock.Mock()
+        for output, expected in [('{}', 'restart'), ('not json', 'restart'), ('{"certificate_reload":"sighup"}', 'reload'), ('{"certificate_reload":"unsupported"}', 'restart')]:
+            ops.run.return_value = output
+            self.assertEqual(module.activation_mode(pathlib.Path('/test/server'), ops), expected)
 
 
 if __name__ == '__main__':

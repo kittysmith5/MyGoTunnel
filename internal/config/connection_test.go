@@ -2,6 +2,7 @@ package config
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -97,7 +98,7 @@ func TestConnectionValidation(t *testing.T) {
 		func(c *ClientConfig) { c.RemoteAddr = ":9001" },
 		func(c *ClientConfig) { c.AuthToken = "secret\nAUTH x" },
 		func(c *ClientConfig) { c.AuthToken = "" },
-		func(c *ClientConfig) { c.CertificateFingerprint = "" },
+		func(c *ClientConfig) { c.CertificateFingerprint = ""; c.TrustMode = "pin" },
 		func(c *ClientConfig) { c.CertificateFingerprint = "bad" },
 		func(c *ClientConfig) { c.SNI = "bad\nhost" },
 	} {
@@ -112,7 +113,7 @@ func TestConnectionValidation(t *testing.T) {
 			t.Fatal("accepted invalid code")
 		}
 	}
-	for _, version := range []int{0, 2} {
+	for _, version := range []int{0, 3} {
 		data, _ := json.Marshal(connectionCode{Version: version, RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken, Fingerprint: cfg.CertificateFingerprint})
 		if _, err := DecodeConnection(codePrefix + base64.RawURLEncoding.EncodeToString(data)); err == nil {
 			t.Fatal("accepted unsupported version")
@@ -124,6 +125,80 @@ func TestConnectionValidation(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("invalid import wrote a file")
+	}
+}
+
+func TestConnectionCATrustAndLegacyBoundary(t *testing.T) {
+	cfg := &ClientConfig{RemoteAddr: "localhost:8443", AuthToken: "test-only", SNI: "localhost", TrustMode: "ca", TLSSessionCache: true, SOCKSAuth: &SOCKSAuth{Username: "local-only", Password: "local-only"}}
+	code, err := EncodeConnection(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeConnection(code)
+	if err != nil || decoded.TrustMode != "ca" || decoded.CertificateFingerprint != "" || decoded.TLSSessionCache || decoded.SOCKSAuth != nil {
+		t.Fatalf("CA import or local policy isolation: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "client.json")
+	if err := ImportClient(strings.NewReader(code), path); err != nil {
+		t.Fatal(err)
+	}
+	if loaded, err := LoadClientConfig(path); err != nil || loaded.EffectiveTrustMode() != "ca" {
+		t.Fatalf("CA load: %v", err)
+	}
+	for _, tc := range []connectionCode{
+		{Version: 1, RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken},
+		{Version: 1, RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken, TrustMode: "ca"},
+		{Version: 2, RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken},
+		{Version: 2, RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken, TrustMode: "ca", Fingerprint: strings.Repeat("ab", 32)},
+		{Version: 2, RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken, TrustMode: "pin"},
+	} {
+		data, _ := json.Marshal(tc)
+		if _, err := DecodeConnection(codePrefix + base64.RawURLEncoding.EncodeToString(data)); err == nil {
+			t.Fatal("accepted ambiguous trust")
+		}
+	}
+	for _, tc := range []ClientConfig{
+		{RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken, TrustMode: "skip"},
+		{RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken, TrustMode: "pin"},
+		{RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken, TrustMode: "ca", CertificateFingerprint: strings.Repeat("ab", 32)},
+	} {
+		data, _ := json.Marshal(tc)
+		os.WriteFile(path, data, 0600)
+		if _, err := LoadClientConfig(path); err == nil {
+			t.Fatal("accepted invalid config trust mode")
+		}
+	}
+}
+
+func TestCAExportValidatesChainAndHostname(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.json")
+	if _, err := InitializeServer(path, "localhost:8443", ":8443"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportServerWithTrust(path, "localhost:8443", "ca"); err == nil {
+		t.Fatal("self-signed cert exported as public CA")
+	}
+	cfg, _ := LoadServerConfig(path)
+	pair, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := x509.ParseCertificate(pair.Certificate[0])
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+	code, err := exportServerWithTrust(path, "localhost:8443", "ca", roots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := DecodeConnection(code)
+	if err != nil || client.TrustMode != "ca" || client.SNI != "localhost" || client.CertificateFingerprint != "" {
+		t.Fatalf("CA export: %v", err)
+	}
+	if _, err := exportServerWithTrust(path, "wrong.example:8443", "ca", roots); err == nil {
+		t.Fatal("wrong hostname accepted")
+	}
+	if _, err := ExportServerWithTrust(path, "localhost:8443", "unknown"); err == nil {
+		t.Fatal("unknown mode accepted")
 	}
 }
 

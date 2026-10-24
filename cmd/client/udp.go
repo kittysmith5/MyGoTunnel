@@ -191,7 +191,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 		"socks_duration", socksDuration, "pool_hit", session.PoolHit,
 		"pool_fallback", session.PoolFallback, "pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
-		"tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration,
+		"tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed,
 		"control_duration", session.ControlDuration, "setup_duration", time.Since(startedAt))
 
 	stop := make(chan struct{})

@@ -25,6 +25,11 @@ type DialTimings struct {
 	TCPDuration time.Duration
 	TLSDuration time.Duration
 	Stage       string
+	TLSResumed  bool
+}
+
+type Options struct {
+	SessionCache bool
 }
 
 func Dial(ctx context.Context, remoteAddr, sni, fingerprint string) (net.Conn, error) {
@@ -33,6 +38,14 @@ func Dial(ctx context.Context, remoteAddr, sni, fingerprint string) (net.Conn, e
 }
 
 func DialWithTimings(ctx context.Context, remoteAddr, sni, fingerprint string) (net.Conn, DialTimings, error) {
+	return DialWithOptions(ctx, remoteAddr, sni, fingerprint, Options{})
+}
+
+func DialWithOptions(ctx context.Context, remoteAddr, sni, fingerprint string, options Options) (net.Conn, DialTimings, error) {
+	return dialWithOptions(ctx, remoteAddr, sni, fingerprint, options, nil, sessions)
+}
+
+func dialWithOptions(ctx context.Context, remoteAddr, sni, fingerprint string, options Options, roots *x509.CertPool, cache utls.ClientSessionCache) (net.Conn, DialTimings, error) {
 	timings := DialTimings{Stage: "config"}
 	var expected []byte
 	if fingerprint != "" {
@@ -61,22 +74,49 @@ func DialWithTimings(ctx context.Context, remoteAddr, sni, fingerprint string) (
 		InsecureSkipVerify: len(expected) != 0,
 		NextProtos:         []string{"http/1.1"},
 		MinVersion:         utls.VersionTLS12,
+		RootCAs:            roots,
+	}
+	if options.SessionCache {
+		scope := sha256.Sum256([]byte(remoteAddr + "\x00" + serverName + "\x00" + hex.EncodeToString(expected)))
+		tlsConfig.ClientSessionCache = scopedCache{cache: cache, scope: hex.EncodeToString(scope[:])}
+		tlsConfig.OmitEmptyPsk = true
 	}
 	if len(expected) != 0 {
 		// The imported certificate pin replaces public CA verification.
-		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if len(rawCerts) == 0 {
+		// VerifyConnection also runs on resumed connections.
+		tlsConfig.VerifyConnection = func(state utls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
 				return fmt.Errorf("server certificate missing")
 			}
-			actual := sha256.Sum256(rawCerts[0])
+			actual := sha256.Sum256(state.PeerCertificates[0].Raw)
 			if subtle.ConstantTimeCompare(actual[:], expected) != 1 {
 				return fmt.Errorf("server certificate fingerprint mismatch")
 			}
 			return nil
 		}
+	} else if options.SessionCache {
+		tlsConfig.VerifyConnection = func(state utls.ConnectionState) error {
+			if !state.DidResume {
+				return nil // Normal CA verification already ran on full handshakes.
+			}
+			if len(state.PeerCertificates) == 0 {
+				return fmt.Errorf("server certificate missing")
+			}
+			intermediates := x509.NewCertPool()
+			for _, c := range state.PeerCertificates[1:] {
+				intermediates.AddCert(c)
+			}
+			_, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{DNSName: serverName, Roots: roots, Intermediates: intermediates})
+			return err
+		}
 	}
 	tlsConn := utls.UClient(tcpConn, tlsConfig, utls.HelloCustom)
 	spec, err := tunnelHelloSpec()
+	if err == nil && options.SessionCache {
+		// Chrome_133's baseline has no PSK extension. It must be last and is
+		// omitted on cold connections, rather than sending a fake empty PSK.
+		spec.Extensions = append(spec.Extensions, &utls.UtlsPreSharedKeyExtension{})
+	}
 	if err == nil {
 		err = tlsConn.ApplyPreset(spec)
 	}
@@ -89,6 +129,7 @@ func DialWithTimings(ctx context.Context, remoteAddr, sni, fingerprint string) (
 	tlsStarted := time.Now()
 	err = tlsConn.HandshakeContext(ctx)
 	timings.TLSDuration = time.Since(tlsStarted)
+	timings.TLSResumed = tlsConn.ConnectionState().DidResume
 	if err != nil {
 		_ = tcpConn.Close()
 		return nil, timings, err

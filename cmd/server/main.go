@@ -39,6 +39,8 @@ func main() {
 	configPath := flag.String("config", "configs/server.json", "config file path")
 	initialize := flag.Bool("init", false, "generate config, token and certificate, output connection code and exit")
 	exportCode := flag.Bool("export", false, "output connection code for existing config and exit")
+	trustMode := flag.String("trust-mode", "pin", "connection code trust mode for export: pin or ca")
+	capabilities := flag.Bool("capabilities", false, "print supported operational capabilities and exit")
 	publicAddr := flag.String("public-addr", "", "client reachable host:port for connection code")
 	listenAddr := flag.String("listen", ":9001", "listen address for initialization")
 	maxConnections := flag.Int("max-connections", 1024, "maximum accepted connections including idle and active tunnels")
@@ -49,6 +51,12 @@ func main() {
 	metricsPath := flag.String("runtime-metrics", "", "optional exclusive private runtime JSONL output file")
 	shutdownTimeout := flag.Duration("shutdown-timeout", 15*time.Second, "maximum active connection drain time on shutdown")
 	flag.Parse()
+	if *capabilities {
+		if _, err := fmt.Printf("{\"certificate_reload\":%q}\n", certificateReloadCapability); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	if *version {
 		if buildinfo.Write(os.Stdout) != nil {
 			os.Exit(1)
@@ -77,9 +85,13 @@ func main() {
 		var code string
 		var err error
 		if *initialize {
+			if *trustMode != "pin" {
+				logger.Error("initialization requires pin trust mode")
+				os.Exit(2)
+			}
 			code, err = config.InitializeServer(*configPath, *publicAddr, *listenAddr)
 		} else {
-			code, err = config.ExportServer(*configPath, *publicAddr)
+			code, err = config.ExportServerWithTrust(*configPath, *publicAddr, *trustMode)
 		}
 		if err != nil {
 			logger.Error("connection setup failed", "error", err)
@@ -163,18 +175,20 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	authLimiter := authlimit.New(4096, 5, time.Minute, time.Minute)
 	defer resources.Close()
 
-	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	certificates, err := newCertificateManager(configPath, cfg)
 	if err != nil {
 		return fmt.Errorf("load TLS certificate: %w", err)
 	}
 
-	tlsConfig := serverTLSConfig(cert)
+	tlsConfig := certificates.tlsConfig()
 
 	ln, err := tls.Listen("tcp", cfg.ListenAddr, tlsConfig)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
 	}
 	defer ln.Close()
+	stopReload := watchCertificateReload(certificates, logger)
+	defer stopReload()
 
 	logger.Info("listening",
 		"version", buildinfo.Current().Version,

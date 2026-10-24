@@ -34,9 +34,25 @@ type connectionCode struct {
 	AuthToken   string `json:"auth_token"`
 	SNI         string `json:"sni,omitempty"`
 	Fingerprint string `json:"certificate_fingerprint"`
+	TrustMode   string `json:"trust_mode,omitempty"`
+}
+
+// EffectiveTrustMode preserves legacy configurations without an explicit mode.
+func (cfg *ClientConfig) EffectiveTrustMode() string {
+	if cfg.TrustMode != "" {
+		return cfg.TrustMode
+	}
+	if cfg.CertificateFingerprint != "" {
+		return "pin"
+	}
+	return "ca"
 }
 
 func validateClient(cfg *ClientConfig) error {
+	mode := cfg.EffectiveTrustMode()
+	if mode != "ca" && mode != "pin" || mode == "ca" && cfg.CertificateFingerprint != "" || mode == "pin" && cfg.CertificateFingerprint == "" {
+		return fmt.Errorf("invalid trust_mode and certificate_fingerprint combination")
+	}
 	if err := validateAddress(cfg.RemoteAddr); err != nil {
 		return err
 	}
@@ -66,10 +82,12 @@ func EncodeConnection(cfg *ClientConfig) (string, error) {
 	if err := validateClient(cfg); err != nil {
 		return "", err
 	}
-	if cfg.CertificateFingerprint == "" {
-		return "", fmt.Errorf("certificate_fingerprint required for connection code")
+	value := connectionCode{Version: 1, RemoteAddr: cfg.RemoteAddr, AuthToken: cfg.AuthToken, SNI: cfg.SNI, Fingerprint: cfg.CertificateFingerprint}
+	if cfg.EffectiveTrustMode() == "ca" {
+		// Old decoders reject v2 instead of silently changing certificate trust.
+		value.Version, value.TrustMode = 2, "ca"
 	}
-	data, err := json.Marshal(connectionCode{1, cfg.RemoteAddr, cfg.AuthToken, cfg.SNI, cfg.CertificateFingerprint})
+	data, err := json.Marshal(value)
 	if err != nil {
 		return "", fmt.Errorf("encode connection code failed")
 	}
@@ -93,13 +111,13 @@ func DecodeConnection(code string) (*ClientConfig, error) {
 	if err := json.Unmarshal(data, &value); err != nil {
 		return nil, fmt.Errorf("invalid connection code data")
 	}
-	if value.Version != 1 {
+	if value.Version != 1 && value.Version != 2 {
 		return nil, fmt.Errorf("unsupported connection code version")
 	}
-	cfg := &ClientConfig{LocalAddr: "127.0.0.1:1080", RemoteAddr: value.RemoteAddr, AuthToken: value.AuthToken, SNI: value.SNI, CertificateFingerprint: value.Fingerprint}
-	if cfg.CertificateFingerprint == "" {
-		return nil, fmt.Errorf("connection code missing certificate fingerprint")
+	if value.Version == 1 && (value.TrustMode != "" || value.Fingerprint == "") || value.Version == 2 && value.TrustMode != "ca" && value.TrustMode != "pin" {
+		return nil, fmt.Errorf("invalid connection code trust mode")
 	}
+	cfg := &ClientConfig{LocalAddr: "127.0.0.1:1080", RemoteAddr: value.RemoteAddr, AuthToken: value.AuthToken, SNI: value.SNI, CertificateFingerprint: value.Fingerprint, TrustMode: value.TrustMode}
 	if err := validateClient(cfg); err != nil {
 		return nil, err
 	}
@@ -145,6 +163,17 @@ func ImportClient(input io.Reader, path string) error {
 }
 
 func ExportServer(path, publicAddr string) (string, error) {
+	return ExportServerWithTrust(path, publicAddr, "pin")
+}
+
+func ExportServerWithTrust(path, publicAddr, mode string) (string, error) {
+	return exportServerWithTrust(path, publicAddr, mode, nil)
+}
+
+func exportServerWithTrust(path, publicAddr, mode string, roots *x509.CertPool) (string, error) {
+	if mode != "ca" && mode != "pin" {
+		return "", fmt.Errorf("trust mode must be ca or pin")
+	}
 	if err := validateAddress(publicAddr); err != nil {
 		return "", err
 	}
@@ -158,6 +187,24 @@ func ExportServer(path, publicAddr string) (string, error) {
 	}
 	fingerprint := sha256.Sum256(cert.Certificate[0])
 	host, _, _ := net.SplitHostPort(publicAddr)
+	if mode == "ca" {
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return "", fmt.Errorf("invalid server certificate")
+		}
+		intermediates := x509.NewCertPool()
+		for _, der := range cert.Certificate[1:] {
+			c, err := x509.ParseCertificate(der)
+			if err != nil {
+				return "", fmt.Errorf("invalid certificate chain")
+			}
+			intermediates.AddCert(c)
+		}
+		if _, err := leaf.Verify(x509.VerifyOptions{DNSName: host, Roots: roots, Intermediates: intermediates}); err != nil {
+			return "", fmt.Errorf("CA certificate verification failed")
+		}
+		return EncodeConnection(&ClientConfig{RemoteAddr: publicAddr, AuthToken: cfg.AuthToken, SNI: host, TrustMode: "ca"})
+	}
 	return EncodeConnection(&ClientConfig{RemoteAddr: publicAddr, AuthToken: cfg.AuthToken, SNI: host, CertificateFingerprint: hex.EncodeToString(fingerprint[:])})
 }
 

@@ -204,7 +204,7 @@ func (f *entryFixture) dial(t *testing.T) net.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	c, err := utlsconn.Dial(ctx, f.client.RemoteAddr, f.client.SNI, f.client.CertificateFingerprint)
+	c, _, err := utlsconn.DialWithOptions(ctx, f.client.RemoteAddr, f.client.SNI, f.client.CertificateFingerprint, utlsconn.Options{SessionCache: f.client.TLSSessionCache})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,6 +306,44 @@ func TestHTTPSEntryRealUTLSFreshPreparedAndHalfClose(t *testing.T) {
 
 func TestHTTPSEntryRealTLSUDP(t *testing.T) {
 	f := startEntryFixture(t, 4)
+	for _, mode := range []string{"fresh", "legacy", "ack"} {
+		t.Run(mode, func(t *testing.T) { testEntryUDP(t, f, mode) })
+	}
+}
+
+func TestHTTPSEntryResumedSessionsStillAuthenticateAndRelayUDP(t *testing.T) {
+	f := startEntryFixture(t, 4)
+	f.client.TLSSessionCache = true
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		e, err := preconnect.Prepare(ctx, &f.client)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e.DialTimings.TLSResumed != (i > 0) {
+			t.Fatal("prepared session did not resume")
+		}
+		e.Conn.(interface{ NetConn() net.Conn }).NetConn().Close()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	c, timings, err := utlsconn.DialWithOptions(ctx, f.client.RemoteAddr, f.client.SNI, f.client.CertificateFingerprint, utlsconn.Options{SessionCache: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if !timings.TLSResumed {
+		t.Fatal("ordinary session did not resume")
+	}
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+	io.WriteString(c, "AUTH wrong\nUDP\n")
+	response, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil || response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("resumed AUTH bypass: %v", err)
+	}
+	response.Body.Close()
+	c.Close()
 	for _, mode := range []string{"fresh", "legacy", "ack"} {
 		t.Run(mode, func(t *testing.T) { testEntryUDP(t, f, mode) })
 	}

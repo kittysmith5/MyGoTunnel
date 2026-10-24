@@ -49,7 +49,7 @@ SOCKS5 应用
 - 认证读取的 deadline 必须在结束后清除，避免影响后续连接阶段。
 - SOCKS5 支持版本 5、可选 RFC 1929 用户名密码认证、TCP `CONNECT` 和 UDP `ASSOCIATE`，地址支持 IPv4、域名及 IPv6。UDP 默认 strict 来源使用 ASSOCIATE 声明的具体地址/端口约束，全零地址回退到 TCP 对端 IP；显式 nat 模式仅允许 TCP 对端 IP，忽略声明并从合法首包学习映射端口。两种模式均先校验来源与报文再绑定，绑定后不可切换端点。
 - uTLS 客户端使用固定 `HelloChrome_133` 基线并适配 ALPN，客户端与服务端均协商 `http/1.1` ALPN。相关值属于连接兼容性的一部分。
-- 有导入指纹时，`InsecureSkipVerify` 仅用于替代公共 CA 验证，必须同时通过 `VerifyPeerCertificate` 校验固定证书指纹；没有指纹时使用系统 CA 和主机名验证。修改时同步说明证书信任、SNI 和部署迁移。
+- 有导入指纹时，`InsecureSkipVerify` 仅用于替代公共 CA 验证，必须同时通过 `VerifyConnection`（包含恢复握手）校验固定证书指纹；没有指纹时使用系统 CA 和主机名验证。修改时同步说明证书信任、SNI 和部署迁移。
 - 旧预连接协议为AUTH → OK → PREPARE → READY → CONNECT（或UDP）→ OK；新连接可协商PREPARE ACK / READY ACK，命令后先ACK再原OK/ERR。只有本连接成功协商才启用ACK，旧流程不发送额外ACK。原有普通流程继续兼容。备用连接有独立数量/闲置限制，取用后不得回池；后台读取必须在交接前停止。
 - `-max-connections` 限制接受连接总数；备用等待时释放 setup permit，CONNECT 前必须重新申请。
 - `-max-setup` 限制正在建连的请求，成功进入转发前释放，失败返回也必须释放；不要让长连接占用建连额度。
@@ -67,6 +67,8 @@ SOCKS5 应用
 - `auth_token`：必填。
 - `sni`：可选；为空时从 `remote_addr` 推导主机名。
 - `certificate_fingerprint`：可选，服务端叶证书 DER 的 SHA-256 十六进制指纹；存在时使用固定指纹验证，否则使用系统 CA 和主机名验证。
+- `trust_mode`：可选 ca/pin；省略按有无指纹推导，显式模式必须与指纹一致。ca 连接码用 v2，pin 默认保持 v1。
+- `tls_session_cache`：可选布尔，缺省 false；控制普通和后台预连接的有界 TLS 会话缓存，不进入连接码。
 - 客户端和服务端均支持 `udp_queue_max_bytes`、`udp_queue_max_age_ms`；0/缺省为 1 MiB、250ms，非零范围分别 65000～67108864、1～60000。属于本地策略，不进入连接码。
 - 两端还支持 `udp_write_timeout_ms`（默认5000，非零1～600000）、`udp_max_sockets`（默认1024，非零1～65536）、`udp_memory_limit_bytes`（默认64MiB，非零262144～1073741824）；0/缺省取默认值，均不进入连接码。生产每个run创建一个共享Resources，不能给每个关联独立创建而绕过进程预算。
 - 客户端独有 `udp_source_policy`（缺省 strict，可选 nat）及 `udp_relay_port_min/max`（同为0用系统端口，否则1～65535闭区间，最多1024端口）；不进入连接码，不自动修改防火墙。NAT 模式仅支持 TCP/UDP 共用出口 IP，不能开放任意来源。
@@ -317,7 +319,7 @@ scripts/observe.py 被动采集最多72小时，指标为成功建连耗时分�
 
 ## 认证限速与发布签名
 
-证书部署脚本 scripts/sync_certificate.py 只使用 ACME 导出的快照，不直接读 account 凭据或执行签发。证书/私钥匹配、CA链、SNI域名及有效期通过后，以不可变配对目录发布并原子更新配置；与二进制升级共用 server 锁。prepared恢复旧配置，committed仅校验/清理，外部保护项变化则停止；续期后受控重启，未变化不重启，不能宣称热加载。客户端须先迁移到系统CA+域名验证，不能在自动续期后继续固定旧叶证书指纹；SOCKS认证和其他配置保留。
+证书部署脚本 scripts/sync_certificate.py 只使用 ACME 导出的快照，不直接读 account 凭据或执行签发。证书/私钥匹配、CA链、SNI域名及有效期通过后，以不可变配对目录发布并原子更新配置；与二进制升级共用 server 锁。prepared恢复旧配置，committed仅校验/清理，外部保护项变化则停止；通过 -capabilities 确认 sighup 能力的新 Unix 服务端采用热加载并检查 PID/实际叶证书；旧版保留受控重启，未变化不重启，不向旧二进制盲发 HUP。客户端须先迁移到系统CA+域名验证，不能在自动续期后继续固定旧叶证书指纹；SOCKS认证和其他配置保留。
 
 监听与远端地址统一离线校验host:port及纯数字端口，监听允许通配host/port0，remote仍1..65535；不做DNS或bind探测。升级/回滚替换前须持久prepared intent，旧binary恢复副本预留在binary同一文件系统、旧state快照保留；state提交必须在事务回滚保护内，文件和目录均fsync。ENOSPC恢复优先rename预留文件，不得先建stage阻止无分配recover。committed只清理并验证/重启同一已提交版本，不得退版；prepared恢复旧binary/state并验证running hash/health。外部config/unit变化或校验失败保留intent且fail-safe。recover或upgrade/rollback的恢复阶段返回recovery_only，不继续第二次变更；status显示recovery_pending。set-id/filecap binary在停服务前拒绝，不悄悄丢元数据。测试覆盖写盘/目录fsync失败、各阶段子进程强制退出、恢复幂等和预检，保留签名/私有快照不变量。
 
@@ -330,3 +332,5 @@ bench CONNECT 根据字面量使用 IPv4/IPv6 ATYP，域名仍为 domain ATYP；
 SOCKS 凭据 provider 在方法选择和完整读取凭据后的实际比较前分别取值，过期旧项不能因等待握手被继续接受。DNS 重试的总预算在 Dial 入口固定，父 context、Dialer.Timeout、Dialer.Deadline 取最早期限；退避与所有尝试共享，DNSRetries 只计实际开始的重试。
 
 升级和回滚须先将普通候选文件复制到 root 管理目录中的0700暂存目录，再验证副本哈希、执行和安装同一副本；拒绝 symlink/特殊文件及大于256MiB的文件，不能验证后执行原 bundle 路径。操作结束清理暂存；禁止更改配置、unit、信任公钥保护或实际运行哈希检查。
+
+连接码 pin 保留 v1，ca 显式 v2 trust_mode，无指纹；旧版缺指纹及新版模式/指纹冲突必须 fail-closed。ca 导出验证系统链及公网主机名；客户端配置可显式 ca/pin，省略兼容推导。tls_session_cache 缺省关闭，不进入连接码；进程最多64项 LRU，按 remote/SNI/信任隔离；恢复握手仍验指纹或 CA 链/域名/有效期，不启用应用0-RTT、不省 AUTH。tls_resumed 布尔 JSON/text resumed，pool hit 前台无新握手，后台 DEBUG pool prepared 单独记录。服务端热加载仅替换证书快照，拒绝其他已识别配置变化，坏证书保留旧快照；新快照票据密钥独立并保留 Go 自动轮换，旧连接排空/半关闭语义不变。
