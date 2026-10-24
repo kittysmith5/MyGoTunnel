@@ -317,6 +317,8 @@ scripts/observe.py 被动采集最多72小时，指标为成功建连耗时分�
 
 ## 认证限速与发布签名
 
+证书部署脚本 scripts/sync_certificate.py 只使用 ACME 导出的快照，不直接读 account 凭据或执行签发。证书/私钥匹配、CA链、SNI域名及有效期通过后，以不可变配对目录发布并原子更新配置；与二进制升级共用 server 锁。prepared恢复旧配置，committed仅校验/清理，外部保护项变化则停止；续期后受控重启，未变化不重启，不能宣称热加载。客户端须先迁移到系统CA+域名验证，不能在自动续期后继续固定旧叶证书指纹；SOCKS认证和其他配置保留。
+
 监听与远端地址统一离线校验host:port及纯数字端口，监听允许通配host/port0，remote仍1..65535；不做DNS或bind探测。升级/回滚替换前须持久prepared intent，旧binary恢复副本预留在binary同一文件系统、旧state快照保留；state提交必须在事务回滚保护内，文件和目录均fsync。ENOSPC恢复优先rename预留文件，不得先建stage阻止无分配recover。committed只清理并验证/重启同一已提交版本，不得退版；prepared恢复旧binary/state并验证running hash/health。外部config/unit变化或校验失败保留intent且fail-safe。recover或upgrade/rollback的恢复阶段返回recovery_only，不继续第二次变更；status显示recovery_pending。set-id/filecap binary在停服务前拒绝，不悄悄丢元数据。测试覆盖写盘/目录fsync失败、各阶段子进程强制退出、恢复幂等和预检，保留签名/私有快照不变量。
 
 认证错误按peer IP有界计数；只计真实凭据不匹配，不把超时/截断算密码错误。锁表上限必须明确采用fail-closed策略，日志不可包含凭据。凭据过渡最多保留一个到期时间明确的旧项，constant-time比较，过期后新建会话不得授权；不要改动旧AUTH wire format。发布bundle由Ed25519签名，升级先验证root本地信任公钥、签名、平台和哈希，再停服务；不信任bundle自带公钥。

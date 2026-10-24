@@ -22,6 +22,32 @@ TLS、认证和首个 HTTP 请求头共享5秒总期限；HTTP 响应写入最�
 
 该功能是兼容原协议的 HTTPS 回退入口，认证成功后的流仍是自定义隧道。现有自签名证书仍会触发浏览器信任警告；要提供浏览器正常信任的网站，需要自己的域名与受信证书，并同步迁移现有客户端证书指纹。
 
+### 公有 CA 证书续期部署
+
+客户端无 `certificate_fingerprint` 时使用系统 CA 与 SNI 主机名验证，适合自动续期。迁移前先在独立端口验证服务端完整证书链及客户端系统信任；同步调整客户端 SNI 和信任配置，保留 SOCKS 认证。旧证书指纹不能继续用于新证书。
+
+当前默认导出的连接码仍含叶证书指纹。自动续期部署新增客户端时，需要移除该指纹并设置正确 SNI，使用系统 CA 校验；不能将默认导出的固定指纹当作跨续期的信任配置。
+
+`scripts/sync_certificate.py` 负责把 ACME 已导出的证书部署给服务端，不负责签发。安装为 root 管理的 `/usr/local/sbin/mygotunnel-cert-sync`；依赖已安装的 `/usr/local/sbin/mygotunnelctl`。使用 root 所有、0600 的策略文件，例如：
+
+```json
+{
+  "domain": "tunnel.example.com",
+  "source_cert": "/etc/acme-export/fullchain.pem",
+  "source_key": "/etc/acme-export/key.pem",
+  "state_dir": "/var/lib/mygotunnel/certificates",
+  "config": "/etc/mygotunnel/server.json",
+  "binary": "/usr/local/bin/mygotunnel-server",
+  "unit": "mygotunnel-server.service"
+}
+```
+
+运行 `mygotunnel-cert-sync --policy /etc/mygotunnel/certificate-policy.json --check` 只校验证书快照；不带 `--check` 才部署。输入拒绝 symlink/特殊文件和超限文件，私钥与配置必须私有；部署前校验密钥匹配、系统 CA 链、域名及至少24小时剩余有效期。完整证书和密钥作为不可变目录一起发布，再原子切换配置中的两条路径。只改证书路径，认证及其他配置保留。
+
+它与二进制升级共用 server 锁；持久记录准备/提交阶段，受控重启后核对运行文件、配置、unit 和实际 TLS 证书。失败恢复原配置并重启；中断后下次先恢复，不继续第二次变更。已提交事务只完成校验与清理，不退回旧证书；外部配置、程序或 unit 变化时保留记录并停止。旧证书目录与 `previous-config.json` 保留用于回滚。
+
+将该命令接入 ACME 成功安装后的 reload hook，并可加 systemd 定时检查兜底。接入时保留原导出路径和其他服务已有的 reload 动作。证书内容未变化时不重启；变化时通过现有优雅退出策略重启加载，属于受控重启，并非热加载。自动化日志只给固定结果，不输出配置、凭据或原始解析错误。
+
 ## 连接码快速配置
 
 在服务端执行（将 `example.com:9001` 替换成客户端能够访问的域名或 IP 和端口）：
