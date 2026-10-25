@@ -23,11 +23,11 @@ import (
 func (m *certificateManager) quicTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13,
-		NextProtos: []string{quicudp.ALPN},
+		NextProtos: quicudp.Protocols(),
 		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
 			snapshot := m.current.Load().Clone()
 			snapshot.MinVersion = tls.VersionTLS13
-			snapshot.NextProtos = []string{quicudp.ALPN}
+			snapshot.NextProtos = quicudp.Protocols()
 			snapshot.SessionTicketsDisabled = true
 			snapshot.WrapSession, snapshot.UnwrapSession = nil, nil
 			return snapshot, nil

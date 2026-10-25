@@ -12,6 +12,12 @@ import (
 // ALPN identifies this protocol; it does not advertise HTTP/3 or a browser.
 const ALPN = "mygotunnel-udp/1"
 
+// ALPNCompact adds complete, unfragmented packets when the discovered path MTU
+// permits them. Version 1 fragments remain valid on this protocol.
+const ALPNCompact = "mygotunnel-udp/2"
+
+func Protocols() []string { return []string{ALPNCompact, ALPN} }
+
 // ClientTLSConfig retains the existing CA-or-pin trust policy. QUIC uses the
 // standard TLS 1.3 implementation, with no session cache or application 0-RTT.
 func ClientTLSConfig(remoteAddr, sni, fingerprint string) (*tls.Config, error) {
@@ -22,7 +28,7 @@ func ClientTLSConfig(remoteAddr, sni, fingerprint string) (*tls.Config, error) {
 			return nil, fmt.Errorf("invalid QUIC server address")
 		}
 	}
-	c := &tls.Config{ServerName: sni, MinVersion: tls.VersionTLS13, NextProtos: []string{ALPN}}
+	c := &tls.Config{ServerName: sni, MinVersion: tls.VersionTLS13, NextProtos: Protocols()}
 	if fingerprint == "" {
 		return c, nil
 	}

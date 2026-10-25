@@ -58,9 +58,14 @@ type transportPair struct {
 
 func newTransportPair(t *testing.T, maxAge time.Duration, route ...func(string) string) transportPair {
 	t.Helper()
+	return newTransportPairProtocols(t, maxAge, []string{ALPN}, Protocols(), route...)
+}
+
+func newTransportPairProtocols(t *testing.T, maxAge time.Duration, serverProtocols, clientProtocols []string, route ...func(string) string) transportPair {
+	t.Helper()
 	cert, pin, _ := transportCertificate(t)
 	resources := datagram.NewResources(16, 8<<20)
-	ln, err := Listen("127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13, NextProtos: []string{ALPN}}, resources, maxAge, 8)
+	ln, err := Listen("127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13, NextProtos: serverProtocols}, resources, maxAge, 8)
 	if err != nil {
 		resources.Close()
 		t.Fatal(err)
@@ -84,6 +89,7 @@ func newTransportPair(t *testing.T, maxAge time.Duration, route ...func(string) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	cfg.NextProtos = clientProtocols
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	client, err := Dial(ctx, dialAddr, cfg, resources, maxAge)

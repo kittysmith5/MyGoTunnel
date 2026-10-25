@@ -75,7 +75,7 @@ func transportConfig() *quic.Config {
 		MaxIncomingStreams:             1,
 		MaxIncomingUniStreams:          -1,
 		InitialPacketSize:              1200,
-		DisablePathMTUDiscovery:        true,
+		DisablePathMTUDiscovery:        false,
 		EnableDatagrams:                true,
 		Allow0RTT:                      false,
 	}
@@ -100,7 +100,10 @@ type Conn struct {
 	workers            sync.WaitGroup
 	writeMu            sync.Mutex
 	id                 uint32
-	wire               [WireDatagramSize]byte
+	wire               [compactWireSize]byte
+	compact            bool
+	compactLimit       int
+	compactProbe       time.Time
 	enabled            atomic.Bool
 	monitorOnce        sync.Once
 	mu                 sync.Mutex
@@ -140,6 +143,7 @@ func newConn(q *quic.Conn, stream *quic.Stream, resources *datagram.Resources, m
 	streamCtx, streamStop := context.WithTimeout(q.Context(), handshakeTimeout)
 	c := &Conn{q: q, resources: resources, maxAge: maxAge, stream: stream,
 		streamCtx: streamCtx, streamStop: streamStop, packets: make(chan datagram.Packet, 16),
+		compact: q.ConnectionState().TLS.NegotiatedProtocol == ALPNCompact, compactLimit: compactWireSize,
 		done: make(chan struct{}), readChange: make(chan struct{}), cleanup: cleanup}
 	if stream != nil {
 		c.streamOnce.Do(func() {})
@@ -255,7 +259,7 @@ func (c *Conn) receiveWindow(r *Reassembler) error {
 			c.preAuthDrops.Add(1)
 			continue
 		}
-		packet, complete, err := r.Push(wire, time.Now())
+		packet, complete, err := c.decodePacket(r, wire)
 		c.incompleteExpired.Store(r.Stats().ExpiredPackets)
 		if err != nil {
 			switch {
@@ -282,6 +286,25 @@ func (c *Conn) receiveWindow(r *Reassembler) error {
 			packet.Release()
 		}
 	}
+}
+
+// Compact frames are only accepted after ALPN negotiation and authorization.
+// Borrowed payload storage has the same process budget as fragmented packets.
+const compactWireSize = 1415 // quic-go's conservative payload at its 1452-byte ceiling
+
+func (c *Conn) decodePacket(r *Reassembler, wire []byte) (datagram.Packet, bool, error) {
+	if c.compact && len(wire) >= 2 && wire[0] == 'P' && wire[1] == 2 {
+		if len(wire) <= 2 || len(wire) > compactWireSize {
+			return datagram.Packet{}, false, ErrMalformedFragment
+		}
+		packet, err := c.resources.Borrow(len(wire) - 2)
+		if err != nil {
+			return datagram.Packet{}, false, err
+		}
+		copy(packet.Data, wire[2:])
+		return packet, true, nil
+	}
+	return r.Push(wire, time.Now())
 }
 
 func (c *Conn) ReadPacket() (datagram.Packet, error) {
@@ -361,6 +384,29 @@ func (c *Conn) WritePacket(packet []byte) error {
 		}
 		c.mu.Unlock()
 	}()
+	if c.compact && len(packet)+2 <= compactWireSize &&
+		(len(packet)+2 <= c.compactLimit || !time.Now().Before(c.compactProbe)) {
+		c.wire[0], c.wire[1] = 'P', 2
+		copy(c.wire[2:], packet)
+		err = c.q.SendDatagram(c.wire[:len(packet)+2])
+		if err == nil {
+			c.fragmentEnqueues.Add(1)
+			return nil
+		}
+		var tooLarge *quic.DatagramTooLargeError
+		if !errors.As(err, &tooLarge) {
+			select {
+			case <-c.done:
+				return c.failure()
+			default:
+				return err
+			}
+		}
+		// SendDatagram rejects oversize frames before enqueueing. Retrying with
+		// v1 fragments therefore cannot duplicate any business packet.
+		c.compactLimit = int(tooLarge.MaxDatagramPayloadSize)
+		c.compactProbe = time.Now().Add(time.Second)
+	}
 	for i := 0; i < count; i++ {
 		fragment, buildErr := Fragment(c.wire[:0], packet, id, i)
 		if buildErr != nil {

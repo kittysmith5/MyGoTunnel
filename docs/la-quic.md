@@ -52,7 +52,10 @@ QUIC 监听启用源地址 Retry 验证；传输层连接数受 `-max-connection
 
 QUIC 自身有握手与报文特征；该入口没有复用 TCP uTLS 的 Chrome ClientHello，也不等于 HTTP/3 或浏览器伪装。TCP 入口的 HTTPS 网页回退不会自动出现在 UDP 入口。
 
-单个 QUIC DATAGRAM 受路径 MTU 和双方协商上限约束。实现使用隧道内部的分片重组保留当前最大65000字节 SOCKS UDP 数据报边界，不依赖公网 IP 分片；这与 SOCKS5 `FRAG` 不同，应用发送的 SOCKS 分片仍按原规则拒绝。每个 DATAGRAM 的应用数据最多1100字节，其中隧道头12字节、每片负载最多1088字节，最大报文最多60片。每个关联最多保留16个未完成报文、64个已处理报文 ID，接收队列最多16项；重组数据从进程共享的 `datagram.Resources` 借用缓冲，不完整报文在独立的2秒重组期限后丢弃。`udp_queue_max_age_ms` 仍只限制本地队列积压，从完整报文完成重组时计入队列年龄，不用默认250ms队列期限中断跨多轮 RTT 的大包接收。
+双方通过 TLS ALPN 优先协商 `mygotunnel-udp/2`，保留 `mygotunnel-udp/1` 兼容旧端。v2 可将完整 SOCKS UDP 帧加2字节头直接装入一个 DATAGRAM；仅在认证及 UDP setup 成功后收发，不增加控制往返。发送从1200字节 QUIC 包起步，启用库内路径 MTU 探测，不强制公网 IP 分片；路径装不下或包更大时仍使用 v1 分片。库明确拒绝超尺寸包且尚未入队时才重试原格式，不重放已发送的业务。尺寸拒绝后最多每秒重新尝试一次更大整包，其余包按已知限额处理。路径支持时1200字节 UDP 负载可减少为一份 DATAGRAM，1400字节及 IPv6/域名封装仍可能分片，不能保证任意路径均减少包数。
+
+v1 每个 DATAGRAM 应用数据最多1100字节（12字节头+1088字节负载），保留最大65000字节 SOCKS UDP 帧、最多60片；v2 整包帧最多1415字节，实际发送仍受库报告的路径上限约束。两种格式共享原有进程 payload 预算、认证、来源规则和期限。每关联最多16个未完成重组、64个去重ID、16项接收队列；不扩大队列或延长250ms默认本地队列期限。重组仍有独立2秒期限。应用 SOCKS5 `FRAG` 仍拒绝。协商旧 ALPN 时只使用原分片格式，普通 TCP 不受影响。
+
 
 每个 SOCKS UDP association 使用一条 QUIC 连接，不为每个目标分别建连接。关联随本地 SOCKS TCP 控制连接结束而终止；它没有跨关联共享已使用的 QUIC 连接或跨节点迁移已有 UDP 会话的行为。
 
@@ -72,7 +75,7 @@ QUIC 池复用原池的有界补充、失败退避与关闭清理。未命中时
 
 UDP 会话日志保留 `transport=udp`，并通过 `udp_tunnel_transport=tcp/quic` 区分实际隧道载体。`udp_quic_handshake_duration` 为完整 QUIC 拨号与握手耗时；`tcp_duration`、`tls_duration` 保持既有 TCP 路径的分阶段含义，在 QUIC 关联中为0，不把 QUIC 整体耗时塞进 TCP TLS 字段。
 
-`quic_*` 计数记录认证前拒绝、畸形分片、资源拒绝、重组上限、队列容量/过期及不完整重组到期等本地事件。计数可能分别按分片、完整报文或拒绝事件统计，不能直接相加或当作线路丢包率；`quic_received_fragments` 是收到的分片数，`quic_enqueued_fragments` 只表示分片进入本地 QUIC 发送队列，不证明对端收到或目标应用处理。
+`quic_*` 计数记录认证前拒绝、畸形分片、资源拒绝、重组上限、队列容量/过期及不完整重组到期等本地事件。计数可能分别按分片、完整报文或拒绝事件统计，不能直接相加或当作线路丢包率；`quic_received_fragments` 是收到的隧道 DATAGRAM 数（含v2整包），`quic_enqueued_fragments` 只表示隧道 DATAGRAM 进入本地 QUIC 发送队列，不证明对端收到或目标应用处理。
 
 ## 健康检查
 

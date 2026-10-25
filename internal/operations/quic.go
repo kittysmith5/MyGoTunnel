@@ -21,8 +21,16 @@ func probeQUICControl(parent context.Context, addr, sni, pin, token string) (err
 	ctx, cancel := context.WithTimeout(parent, quicHealthTimeout)
 	defer cancel()
 	defer func() {
-		if err != nil && ctx.Err() != nil {
-			err = ctx.Err()
+		if err != nil {
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			} else if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+				// A socket deadline can fire just before the context timer runs.
+				var timeout net.Error
+				if errors.As(err, &timeout) && timeout.Timeout() {
+					err = context.DeadlineExceeded
+				}
+			}
 		}
 	}()
 	tlsConfig, err := quicudp.ClientTLSConfig(addr, sni, pin)
