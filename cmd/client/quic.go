@@ -27,7 +27,9 @@ func openRemoteQUICUDP(ctx context.Context, cfg *config.ClientConfig, resources 
 	_, maxAge := cfg.QueueLimits()
 	dialCtx, cancel := context.WithTimeout(ctx, remoteDialTimeout)
 	started := time.Now()
-	conn, err := quicudp.Dial(dialCtx, cfg.UDPQUICRemote(), tlsConfig, resources, maxAge)
+	conn, err := quicudp.Dial(dialCtx, cfg.UDPQUICRemote(), tlsConfig, resources, maxAge, quicudp.DialOptions{
+		TokenCache: true, TokenTrustScope: cfg.EffectiveTrustMode() + ":" + cfg.CertificateFingerprint,
+	})
 	cancel()
 	session.QUICDuration = time.Since(started)
 	if err != nil {

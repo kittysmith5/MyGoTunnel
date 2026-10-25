@@ -524,7 +524,11 @@ func (c *Conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func Dial(ctx context.Context, addr string, tlsConfig *tls.Config, resources *datagram.Resources, maxAge time.Duration) (*Conn, error) {
+func Dial(ctx context.Context, addr string, tlsConfig *tls.Config, resources *datagram.Resources, maxAge time.Duration, options ...DialOptions) (*Conn, error) {
+	tokens, err := addressTokensFor(addr, tlsConfig, options)
+	if err != nil {
+		return nil, err
+	}
 	if resources == nil {
 		resources = datagram.DefaultResources
 	}
@@ -581,7 +585,7 @@ func Dial(ctx context.Context, addr string, tlsConfig *tls.Config, resources *da
 		}
 		remote := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(portNumber)))
 		var conn *Conn
-		conn, err = dialAddress(attemptCtx, remote, tlsConfig, resources, maxAge)
+		conn, err = dialAddress(attemptCtx, remote, tlsConfig, resources, maxAge, tokens)
 		attemptCancel()
 		if err == nil {
 			release = false
@@ -594,7 +598,7 @@ func Dial(ctx context.Context, addr string, tlsConfig *tls.Config, resources *da
 	return nil, err
 }
 
-func dialAddress(ctx context.Context, remote *net.UDPAddr, tlsConfig *tls.Config, resources *datagram.Resources, maxAge time.Duration) (*Conn, error) {
+func dialAddress(ctx context.Context, remote *net.UDPAddr, tlsConfig *tls.Config, resources *datagram.Resources, maxAge time.Duration, tokens quic.TokenStore) (*Conn, error) {
 	local := &net.UDPAddr{IP: net.IPv4zero}
 	if remote.IP.To4() == nil {
 		local.IP = net.IPv6unspecified
@@ -605,7 +609,9 @@ func dialAddress(ctx context.Context, remote *net.UDPAddr, tlsConfig *tls.Config
 	}
 	tr := &quic.Transport{Conn: udp}
 	cleanup := func() { _ = tr.Close(); _ = udp.Close(); resources.ReleaseSocket() }
-	q, err := tr.Dial(ctx, remote, tlsConfig, transportConfig())
+	quicConfig := transportConfig()
+	quicConfig.TokenStore = tokens
+	q, err := tr.Dial(ctx, remote, tlsConfig, quicConfig)
 	if err != nil {
 		_ = tr.Close()
 		_ = udp.Close()

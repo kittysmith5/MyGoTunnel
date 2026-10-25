@@ -131,6 +131,8 @@ LA QUIC UDP 需保留来源 strict/nat、SOCKS TCP 控制关闭即结束关联�
 
 QUIC 传输层先用源地址 Retry 验证，连接数受 max-connections、同时握手数受 max-setup（不超过总连接数）限制；每 IP 握手 guard 为并发8、每秒4次、突发16次。握手后共享 TCP 的应用 admission 和 authlimit。控制 ERR 未送达时，认证拒绝/超时仍可通过 QUIC 应用关闭原因跨端反馈，不能泛化成普通 EOF 或丢失认证拒绝分类。
 
+客户端可复用进程有界的地址验证 NEW_TOKEN：最多16个端点/信任范围，每范围4枚、Pop后单次提交，按remote/SNI/系统CA或具体pin隔离，非标准自定义根池不隐式共用系统信任缓存。不持久化、不进日志/连接码，不增加部署配置。有效令牌只减少后续新关联的重复Retry；不等同TLS恢复，不启0RTT，不省证书验证或AUTH。首次、过期、出口IP变化、服务端重启失效后仍需Retry。测试须验证新UDP socket下减少Retry、每连接完整AUTH、缓存有效时错误pin仍拒绝、过期恢复Retry及缓存容量/单次取用/并发隔离。
+
 QUIC 内部分片每个 DATAGRAM 应用数据最多1100字节（12字节头+1088字节负载），完整 SOCKS UDP 帧最多65000字节/60片；每关联最多16个未完成重组、64个去重ID、16项接收队列。缓冲从共享 datagram.Resources 借用，丢弃/关闭必须归还。重组使用独立固定2秒期限，不能直接套用默认250ms队列期限；完成时的 Packet.At 为完整重组时刻，本地队列年龄从此起算。应用 SOCKS FRAG 仍拒绝。测试覆盖乱序/重复/缺片/大包、认证拒绝、控制取消、跨关联预算和关闭回收。UDP 日志保留 transport=udp，并以 udp_tunnel_transport=tcp/quic 标识载体；不把成功包分位数当作完整丢包/体验指标。
 
 Conn 内嵌1100字节发送 scratch 不计 Resources，按关联连接数有界；QUIC 库/加密/协议元数据/内核缓冲亦在 managed payload 预算外，不得宣称全部应用内存或 RSS 均被 udp_memory_limit_bytes 限制。udp_quic_handshake_duration 记录完整 QUIC 拨号握手时间，tcp_duration/tls_duration 保留 TCP 阶段含义，QUIC 中为0。quic_* drops 为本地拒绝/到期事件计数，分片/完整报文维度可能不同，不能当作线路丢包率或直接相加；quic_enqueued_fragments 仅表示本地发送队列接收，不证明送达。
