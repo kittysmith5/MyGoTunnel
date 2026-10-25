@@ -17,6 +17,8 @@ import (
 type DialOptions struct {
 	TokenCache      bool
 	TokenTrustScope string
+	// SocketReserve keeps process-budget capacity for foreground relay sockets.
+	SocketReserve int
 }
 
 // The library implements mutex-protected LRU eviction and removes each token
@@ -40,7 +42,7 @@ func (s scopedAddressTokens) Put(key string, token *quic.ClientToken) {
 }
 
 func addressTokensFor(remote string, tlsConfig *tls.Config, options []DialOptions) (quic.TokenStore, error) {
-	if len(options) > 1 {
+	if len(options) > 1 || (len(options) == 1 && options[0].SocketReserve < 0) {
 		return nil, fmt.Errorf("invalid QUIC dial options")
 	}
 	if len(options) == 0 || !options[0].TokenCache {

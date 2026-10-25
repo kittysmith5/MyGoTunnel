@@ -31,6 +31,7 @@ const (
 var (
 	ErrNotAuthorized   = errors.New("QUIC UDP association is not authorized")
 	ErrAuthRejected    = errors.New("QUIC UDP authentication rejected")
+	ErrLimit           = errors.New("QUIC UDP resource limit reached")
 	errControlProtocol = errors.New("unexpected UDP control data")
 )
 
@@ -40,6 +41,7 @@ const (
 	closeTimeout      quic.ApplicationErrorCode = 0x101
 	closeProtocol     quic.ApplicationErrorCode = 0x102
 	closeFailure      quic.ApplicationErrorCode = 0x103
+	closeLimit        quic.ApplicationErrorCode = 0x104
 )
 
 func normalizeRemoteError(err error) error {
@@ -54,6 +56,8 @@ func normalizeRemoteError(err error) error {
 		return ErrAuthRejected
 	case closeTimeout:
 		return os.ErrDeadlineExceeded
+	case closeLimit:
+		return ErrLimit
 	default:
 		return err
 	}
@@ -413,6 +417,8 @@ func (c *Conn) fail(err error) {
 			code = closeNormal
 		case errors.Is(err, ErrAuthRejected):
 			code = closeAuthRejected
+		case errors.Is(err, ErrLimit):
+			code = closeLimit
 		case errors.Is(err, os.ErrDeadlineExceeded), errors.Is(err, context.DeadlineExceeded):
 			code = closeTimeout
 		case errors.As(err, &timeout) && timeout.Timeout():
@@ -428,6 +434,10 @@ func (c *Conn) fail(err error) {
 // QUIC close code. It remains observable if a preceding ERR stream write has
 // not been transmitted when the association closes.
 func (c *Conn) RejectAuthentication() { c.fail(ErrAuthRejected) }
+
+// RejectLimit preserves BUSY/LIMIT when the control stream reply has not yet
+// reached the peer at connection close. It never authorizes datagrams.
+func (c *Conn) RejectLimit() { c.fail(ErrLimit) }
 
 func (c *Conn) failure() error {
 	c.mu.Lock()
@@ -532,7 +542,11 @@ func Dial(ctx context.Context, addr string, tlsConfig *tls.Config, resources *da
 	if resources == nil {
 		resources = datagram.DefaultResources
 	}
-	if !resources.AcquireSocket() {
+	reserve := 0
+	if len(options) == 1 {
+		reserve = options[0].SocketReserve
+	}
+	if !resources.AcquireSocketWithReserve(reserve) {
 		return nil, datagram.ErrResourceLimit
 	}
 	release := true

@@ -77,9 +77,15 @@ func SelectResources(resources []*Resources) *Resources {
 }
 
 func (r *Resources) AcquireSocket() bool {
+	return r.AcquireSocketWithReserve(0)
+}
+
+// AcquireSocketWithReserve leaves reserve slots available to foreground work.
+// Admission and headroom are checked atomically with the same process budget.
+func (r *Resources) AcquireSocketWithReserve(reserve int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.closed || r.sockets >= r.maxSockets {
+	if r.closed || reserve < 0 || reserve > r.maxSockets || r.sockets >= r.maxSockets-reserve {
 		r.socketRejected++
 		return false
 	}

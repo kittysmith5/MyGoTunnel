@@ -9,17 +9,82 @@ import (
 
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/datagram"
+	"mygotunnel/internal/preconnect"
 	"mygotunnel/internal/quicudp"
 	"mygotunnel/internal/tunnel"
 )
 
-func openRemoteQUICUDP(ctx context.Context, cfg *config.ClientConfig, resources *datagram.Resources) (session *remoteSession, err error) {
+func openRemoteQUICUDP(ctx context.Context, cfg *config.ClientConfig, resources *datagram.Resources, pools ...*preconnect.Pool) (session *remoteSession, err error) {
 	session = &remoteSession{Stage: "quic"}
 	defer func() {
 		if errors.Is(err, quicudp.ErrAuthRejected) {
 			err = errAuthRejected
+		} else if errors.Is(err, quicudp.ErrLimit) {
+			err = &tunnel.TargetError{Code: "LIMIT"}
 		}
 	}()
+	if len(pools) > 0 && pools[0] != nil {
+		pool := pools[0]
+		session.Stage = "pool"
+		started := time.Now()
+		entry := pool.Take(ctx)
+		session.PoolAcquireDuration = time.Since(started)
+		if entry != nil {
+			conn, ok := entry.Conn.(*quicudp.Conn)
+			if !ok {
+				closeUnusedRemote(entry.Conn)
+				return session, fmt.Errorf("invalid QUIC prepared connection")
+			}
+			session.PoolHit = true
+			interrupted := make(chan struct{})
+			stop := context.AfterFunc(ctx, func() {
+				_ = conn.Close()
+				close(interrupted)
+			})
+			started = time.Now()
+			response, exchangeErr := exchangePrepared(ctx, entry, "", true, session)
+			session.ControlDuration = time.Since(started)
+			if !stop() {
+				<-interrupted
+			}
+			if ctx.Err() != nil {
+				_ = conn.Close()
+				return session, ctx.Err()
+			}
+			if exchangeErr == nil && response == "OK" {
+				if entry.Reader.Buffered() != 0 {
+					_ = conn.Close()
+					return session, fmt.Errorf("unexpected UDP QUIC control payload")
+				}
+				if err = conn.SetDeadline(time.Time{}); err != nil {
+					_ = conn.Close()
+					return session, err
+				}
+				conn.EnableDatagrams()
+				session.Conn, session.Reader = conn, entry.Reader
+				return session, nil
+			}
+			_ = conn.Close()
+			if exchangeErr == nil {
+				return session, tunnel.ParseConnectResponse(response)
+			}
+			if ctx.Err() != nil {
+				return session, ctx.Err()
+			}
+			if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+				return session, context.DeadlineExceeded
+			}
+			if !preparedTransportFailure(exchangeErr) {
+				return session, exchangeErr
+			}
+			// Only retry an unused prepared transport. No business datagram has
+			// been sent, and the fallback retains QUIC and the same trust policy.
+			session.PoolHit = false
+			session.PoolFallback = true
+			pool.RecordFallback()
+		}
+	}
+	session.Stage = "quic"
 	tlsConfig, err := quicudp.ClientTLSConfig(cfg.UDPQUICRemote(), cfg.SNI, cfg.CertificateFingerprint)
 	if err != nil {
 		return session, err
@@ -40,14 +105,26 @@ func openRemoteQUICUDP(ctx context.Context, cfg *config.ClientConfig, resources 
 			_ = conn.Close()
 		}
 	}()
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		close(interrupted)
+	})
+	defer func() {
+		if !stop() {
+			<-interrupted
+			if err == nil {
+				err = ctx.Err()
+				session.Conn, session.Reader = nil, nil
+			}
+		}
+	}()
 	if err = conn.SetDeadline(controlDeadline(ctx)); err != nil {
 		return session, err
 	}
 	session.Stage = "auth"
 	started = time.Now()
-	defer func() { session.ControlDuration = time.Since(started) }()
+	defer func() { session.ControlDuration += time.Since(started) }()
 	if err = tunnel.SendUDPSetup(conn, cfg.AuthToken); err != nil {
 		return session, err
 	}

@@ -36,6 +36,10 @@ func (m *certificateManager) quicTLSConfig() *tls.Config {
 }
 
 func handleQUICUDPTunnel(conn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, permit *admission.Permit, limiter *authlimit.Limiter, resources *datagram.Resources) {
+	handleQUICUDPTunnelWithPool(conn, cfg, logger, permit, nil, limiter, resources)
+}
+
+func handleQUICUDPTunnelWithPool(conn net.Conn, cfg *config.ServerConfig, logger *slog.Logger, permit *admission.Permit, poolOptions *serverPoolOptions, limiter *authlimit.Limiter, resources *datagram.Resources) {
 	defer conn.Close()
 	logger = logging.Connection(logger, conn.RemoteAddr().String()).With("udp_tunnel_transport", "quic")
 	started := time.Now()
@@ -59,9 +63,32 @@ func handleQUICUDPTunnel(conn net.Conn, cfg *config.ServerConfig, logger *slog.L
 		logging.Failure(logger, "control", err)
 		return
 	}
+	if (command == "PREPARE" || command == "PREPARE ACK") && (poolOptions == nil || cap(poolOptions.idleSlots) == 0) {
+		_ = tunnel.SendBusy(conn)
+		rejectQUICPreparedLimit(conn)
+		return
+	}
+	prepared, ok := awaitPreparedCommand(conn, reader, command, permit.Release, poolOptions, logger)
+	if !ok {
+		return
+	}
+	command = prepared.line
 	if command != "UDP" || reader.Buffered() != 0 {
 		logging.Failure(logger, "control", fmt.Errorf("invalid QUIC UDP command"))
 		return
 	}
-	handleUDPTunnel(conn, reader, logger, started, 0, permit.Release, cfg.UDPQueueConfig, resources)
+	if prepared.pooled {
+		deadline := time.Now().Add(tunnel.ControlTimeout)
+		if err := conn.SetDeadline(deadline); err != nil {
+			logging.Failure(logger, "control", err)
+			return
+		}
+		if prepared.commandACK {
+			if err := acknowledgePrepared(conn, deadline); err != nil {
+				logging.Failure(logger, "ack", err)
+				return
+			}
+		}
+	}
+	handleUDPTunnel(conn, reader, logger.With("pool_connection", prepared.pooled, "idle_duration", prepared.idleDuration), started, prepared.idleDuration, permit.Release, cfg.UDPQueueConfig, resources)
 }

@@ -210,3 +210,12 @@ func TestRunRejectsInvalidSetupLimit(t *testing.T) {
 		t.Fatal("invalid max-setup accepted")
 	}
 }
+
+func TestRunRejectsInvalidQUICPoolSize(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, size := range []int{-1, 33} {
+		if err := run("unused", logger, 1, clientOptions{maxConnections: 1, quicPoolSize: size}); err == nil || !strings.Contains(err.Error(), "quic-pool-size") {
+			t.Fatalf("invalid QUIC pool size %d accepted: %v", size, err)
+		}
+	}
+}

@@ -74,6 +74,10 @@ func handleUDPAssociate(parent context.Context, clientConn net.Conn, request soc
 }
 
 func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time, releaseSetup func(), pool *preconnect.Pool, lookup udpSourceLookup, limits ...*datagram.Resources) {
+	handleUDPAssociateWithPools(parent, clientConn, request, cfg, logger, startedAt, releaseSetup, pool, nil, lookup, limits...)
+}
+
+func handleUDPAssociateWithPools(parent context.Context, clientConn net.Conn, request socks5.Request, cfg *config.ClientConfig, logger *slog.Logger, startedAt time.Time, releaseSetup func(), pool, quicPool *preconnect.Pool, lookup udpSourceLookup, limits ...*datagram.Resources) {
 	const udpFrameQueueSize = 256
 	resources := datagram.SelectResources(limits)
 	tcpPeer, ok := clientConn.RemoteAddr().(*net.TCPAddr)
@@ -147,7 +151,12 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	defer scratch.Release()
 
 	socksDuration := time.Since(startedAt)
-	session, err := openRemoteUDP(ctx, cfg, pool, resources)
+	var session *remoteSession
+	if cfg.UDPTransportMode() == "quic" {
+		session, err = openRemoteQUICUDP(ctx, cfg, resources, quicPool)
+	} else {
+		session, err = openRemoteUDP(ctx, cfg, pool, resources)
+	}
 	cancel()
 	if err != nil {
 		logging.Failure(logger, session.Stage, err)

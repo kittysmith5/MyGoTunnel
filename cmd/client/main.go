@@ -42,6 +42,7 @@ func main() {
 	importCode := flag.Bool("import", false, "import connection code from stdin and exit")
 	poolMax := flag.Int("pool-max", 16, "maximum adaptive preconnections, size must not exceed this; 0 fixes pool at pool-size")
 	poolSize := flag.Int("pool-size", 4, "authenticated preconnections, 0 disables, maximum 32")
+	quicPoolSize := flag.Int("quic-pool-size", 2, "authenticated QUIC UDP preconnections, 0 disables, maximum 32")
 	poolIdleSize := flag.Int("pool-idle-size", 0, "optional idle pool floor, 1..pool-size; 0 keeps normal floor")
 	poolIdleAfter := flag.Duration("pool-idle-after", 2*time.Minute, "no-demand interval before shrinking toward pool-idle-size")
 	maxConnections := flag.Int("max-connections", 1024, "maximum accepted local connections")
@@ -87,7 +88,7 @@ func main() {
 	defer stopMetrics()
 	ctx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
-	if err := runContext(ctx, *shutdownTimeout, *configPath, logger, *maxSetup, clientOptions{poolSize: *poolSize, maxConnections: *maxConnections, poolMax: *poolMax, poolIdleSize: *poolIdleSize, poolIdleAfter: *poolIdleAfter}); err != nil {
+	if err := runContext(ctx, *shutdownTimeout, *configPath, logger, *maxSetup, clientOptions{poolSize: *poolSize, quicPoolSize: *quicPoolSize, maxConnections: *maxConnections, poolMax: *poolMax, poolIdleSize: *poolIdleSize, poolIdleAfter: *poolIdleAfter}); err != nil {
 		logger.Error("stopped", "error", err)
 		stopMetrics()
 		os.Exit(1)
@@ -96,6 +97,7 @@ func main() {
 
 type clientOptions struct {
 	poolSize, maxConnections, poolMax, poolIdleSize int
+	quicPoolSize                                    int
 	poolIdleAfter                                   time.Duration
 }
 
@@ -107,7 +109,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	if grace < 0 {
 		return fmt.Errorf("shutdown-timeout must not be negative")
 	}
-	opts := clientOptions{poolSize: 4, maxConnections: 1024, poolMax: 16}
+	opts := clientOptions{poolSize: 4, quicPoolSize: 2, maxConnections: 1024, poolMax: 16}
 	if len(options) > 0 {
 		opts = options[0]
 	}
@@ -116,6 +118,9 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	}
 	if maxSetup <= 0 {
 		return fmt.Errorf("max-setup must be positive")
+	}
+	if opts.quicPoolSize < 0 || opts.quicPoolSize > 32 {
+		return fmt.Errorf("quic-pool-size must be between 0 and 32")
 	}
 	if opts.poolIdleSize < 0 || opts.poolIdleSize > opts.poolSize || opts.poolIdleAfter < 0 {
 		return fmt.Errorf("invalid idle pool limits")
@@ -141,6 +146,11 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	if opts.poolSize == 0 {
 		poolLimit = 0
 	}
+	quicPoolLimit := 0
+	if cfg.UDPTransportMode() == "quic" {
+		maxSockets, _ := cfg.ProcessLimits()
+		quicPoolLimit = min(opts.quicPoolSize, max(0, maxSockets-1))
+	}
 	logger.Info("listening",
 		"version", buildinfo.Current().Version,
 		"commit", buildinfo.Current().Commit,
@@ -155,6 +165,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"max_setup", maxSetup,
 		"max_idle", poolLimit,
 		"pool_idle_size", opts.poolIdleSize,
+		"quic_pool_max", quicPoolLimit,
 	)
 
 	var pool *preconnect.Pool
@@ -167,6 +178,16 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		stopPool := context.AfterFunc(ctx, pool.Close)
 		defer stopPool()
 	}
+	var quicPool *preconnect.Pool
+	if quicPoolLimit > 0 {
+		quicPool, err = preconnect.New(preconnect.Options{Size: quicPoolLimit, MaxSize: quicPoolLimit}, preconnect.NewQUICPreparer(cfg, resources), logger.With("udp_tunnel_transport", "quic"))
+		if err != nil {
+			return err
+		}
+		defer quicPool.Close()
+		stopPool := context.AfterFunc(ctx, quicPool.Close)
+		defer stopPool()
+	}
 	metrics := &admission.Counters{}
 	stopStats := logging.StartStats(logger, 30*time.Second, func() []any {
 		idle := 0
@@ -175,11 +196,19 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 			ps = pool.Stats()
 			idle = ps.Idle
 		}
-		return append([]any{"auth_rate_limited", authLimiter.Limited(), "active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", ps.Max, "rejected", metrics.Rejected.Load(), "pool_hits", ps.Hits, "pool_misses", ps.Misses, "pool_fallbacks", ps.Fallbacks, "pool_hit_rate", ps.HitRate, "pool_target", ps.Target, "pool_filling", ps.Filling, "pool_renewed", ps.Renewed, "pool_retry", ps.Retry}, logging.UDPResourceAttrs(resources)...)
+		attrs := []any{"auth_rate_limited", authLimiter.Limited(), "active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", ps.Max, "rejected", metrics.Rejected.Load(), "pool_hits", ps.Hits, "pool_misses", ps.Misses, "pool_fallbacks", ps.Fallbacks, "pool_hit_rate", ps.HitRate, "pool_target", ps.Target, "pool_filling", ps.Filling, "pool_renewed", ps.Renewed, "pool_retry", ps.Retry}
+		var qs preconnect.Stats
+		if quicPool != nil {
+			qs = quicPool.Stats()
+		}
+		attrs = append(attrs, "quic_pool_idle", qs.Idle, "quic_pool_max", qs.Max, "quic_pool_filling", qs.Filling,
+			"quic_pool_hits", qs.Hits, "quic_pool_misses", qs.Misses, "quic_pool_fallbacks", qs.Fallbacks,
+			"quic_pool_hit_rate", qs.HitRate, "quic_pool_renewed", qs.Renewed, "quic_pool_retry", qs.Retry)
+		return append(attrs, logging.UDPResourceAttrs(resources)...)
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleClientWithResourcesAndAuthLimiter(ctx, conn, cfg, logger, permit.Release, pool, resources, authLimiter, permit.AbortContext())
+		handleClientWithPools(ctx, conn, cfg, logger, permit.Release, pool, quicPool, resources, authLimiter, permit.AbortContext())
 	}, nil, metrics)
 }
 
@@ -200,6 +229,10 @@ func handleClientWithResources(parent context.Context, clientConn net.Conn, cfg 
 }
 
 func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pool *preconnect.Pool, resources *datagram.Resources, authLimiter *authlimit.Limiter, abortContexts ...context.Context) {
+	handleClientWithPools(parent, clientConn, cfg, logger, releaseSetup, pool, nil, resources, authLimiter, abortContexts...)
+}
+
+func handleClientWithPools(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pool, quicPool *preconnect.Pool, resources *datagram.Resources, authLimiter *authlimit.Limiter, abortContexts ...context.Context) {
 	defer clientConn.Close()
 
 	clientAddr := clientConn.RemoteAddr().String()
@@ -247,7 +280,7 @@ func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn 
 			logging.Failure(connectionLogger, "socks", err)
 			return
 		}
-		handleUDPAssociate(parent, clientConn, request, cfg, connectionLogger, startedAt, releaseSetup, pool, resources)
+		handleUDPAssociateWithPools(parent, clientConn, request, cfg, connectionLogger, startedAt, releaseSetup, pool, quicPool, net.DefaultResolver.LookupIPAddr, resources)
 		return
 	}
 	targetAddr := net.JoinHostPort(request.Address, fmt.Sprint(request.Port))

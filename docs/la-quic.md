@@ -54,7 +54,19 @@ QUIC 自身有握手与报文特征；该入口没有复用 TCP uTLS 的 Chrome 
 
 单个 QUIC DATAGRAM 受路径 MTU 和双方协商上限约束。实现使用隧道内部的分片重组保留当前最大65000字节 SOCKS UDP 数据报边界，不依赖公网 IP 分片；这与 SOCKS5 `FRAG` 不同，应用发送的 SOCKS 分片仍按原规则拒绝。每个 DATAGRAM 的应用数据最多1100字节，其中隧道头12字节、每片负载最多1088字节，最大报文最多60片。每个关联最多保留16个未完成报文、64个已处理报文 ID，接收队列最多16项；重组数据从进程共享的 `datagram.Resources` 借用缓冲，不完整报文在独立的2秒重组期限后丢弃。`udp_queue_max_age_ms` 仍只限制本地队列积压，从完整报文完成重组时计入队列年龄，不用默认250ms队列期限中断跨多轮 RTT 的大包接收。
 
-初版每个 SOCKS UDP association 使用一条 QUIC 连接，不为每个目标分别建连接。关联随本地 SOCKS TCP 控制连接结束而终止；它没有跨关联共享 QUIC 连接或跨节点迁移已有 UDP 会话的行为。
+每个 SOCKS UDP association 使用一条 QUIC 连接，不为每个目标分别建连接。关联随本地 SOCKS TCP 控制连接结束而终止；它没有跨关联共享已使用的 QUIC 连接或跨节点迁移已有 UDP 会话的行为。
+
+## QUIC 预连接
+
+客户端在选择 `udp_transport=quic` 时默认通过 `-quic-pool-size 2` 保留两条已完成完整 TLS、证书验证和 AUTH 的备用 QUIC 控制连接；0 关闭，范围0～32，容量固定且不随既有 TCP 自适应池扩容。普通 TCP 的 `-pool-size` / `-pool-max` 仍独立生效，没有新增 JSON 配置或连接码字段。两类备用连接在服务端共用 `-max-idle`，仍占总连接名额；客户端 QUIC socket 使用同一进程 Resources 预算。
+
+实际备用上限不超过 `udp_max_sockets-1`；后台 QUIC socket 申请在同一资源锁内至少留一个名额给本地 SOCKS UDP relay，避免低预算时空闲池先占满全部 socket。此为进程进度余量，不保证任意并发关联都能获准；已有活跃业务仍按进程总预算限制。日志 `quic_pool_max` 显示实际容量。
+
+备用通过 `AUTH` 与 `PREPARE ACK` 协商，服务端返回 `OK` / `READY ACK` 后释放 setup 名额；客户端取用时发送 `UDP`，服务端重新申请 setup 后返回 `ACK` 及原 UDP 成功响应。准备和等待期间不启用业务 DATAGRAM，不拨号目标。服务端空闲期限仍为60秒，客户端备用默认在36～45秒内到期、提前错峰补充；后台守护读在移交前停止并 join，同一个 Reader 继续用于控制响应。已取用连接不再回池，池关闭或替换不得关闭它。
+
+QUIC 池复用原池的有界补充、失败退避与关闭清理。未命中时前台立即走普通 QUIC，不等待后台；取用后仅在没有发送业务数据且发生传输故障时，允许同一远端/同一证书策略的一次普通 QUIC 重建。明确认证拒绝、资源上限、协议错误和请求取消不重试，不改为 TCP。旧 QUIC 服务端不支持 PREPARE 时后台退避，普通 QUIC UDP 仍可用。QUIC 资源拒绝同时使用独立应用关闭码，避免立即关闭连接时控制行尚未送达而被误认为普通 EOF。
+
+该优化将握手及认证移至后台，目的是减少新 SOCKS 关联等待，不改变线路基础 RTT，也不启用 TLS 恢复或0-RTT。命中时前台 `udp_quic_handshake_duration=0`，后台 Debug 的同名字段记录实际握手成本。每30秒独立输出 `quic_pool_idle/max/filling`、`quic_pool_hits/misses/fallbacks/hit_rate`、`quic_pool_renewed/retry`；原 `pool_*` stats 只统计 TCP 池，单会话 `pool_hit/fallback` 根据实际传输解释。需同时看命中率、失败数和逐包 RTT，不能将建立时间改善当成每个数据报都提速。
 
 应用侧进程 UDP 缓冲预算、socket 预算、目标回收、公平响应队列和过期丢弃继续有效。每条 QUIC 连接另内嵌1100字节发送暂存区，不计入 `datagram.Resources`，其数量受关联连接数限制；QUIC 库、加密、协议元数据及内核 socket 的内存也不等于原 `udp_memory_limit_bytes` 管理的缓冲容量，不能把该配置当成全部应用内存或整个进程 RSS 上限。
 

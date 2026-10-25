@@ -233,11 +233,12 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, listener, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
+		poolOptions := &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire, abortContext: permit.AbortContext(), entrance: entrance, releasePreAuth: permit.ReleasePreAuth, acceptedAt: permit.StartedAt()}
 		if _, ok := conn.(*quicudp.Conn); ok {
-			handleQUICUDPTunnel(conn, cfg, logger, permit, authLimiter, resources)
+			handleQUICUDPTunnelWithPool(conn, cfg, logger, permit, poolOptions, authLimiter, resources)
 			return
 		}
-		handleTunnelContextWithLimiter(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire, abortContext: permit.AbortContext(), entrance: entrance, releasePreAuth: permit.ReleasePreAuth, acceptedAt: permit.StartedAt()}, authLimiter, resources)
+		handleTunnelContextWithLimiter(ctx, conn, cfg, logger, permit.Release, poolOptions, authLimiter, resources)
 	}, nil, metrics, gate)
 }
 
@@ -316,58 +317,12 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 		return
 	}
 
-	var idleDuration time.Duration
-	pooled := false
-	commandACK := line == "PREPARE ACK"
-	if line == "PREPARE" || commandACK {
-		if poolOptions == nil || cap(poolOptions.idleSlots) == 0 {
-			_ = tunnel.SendERR(tunnelConn)
-			return
-		}
-		select {
-		case poolOptions.idleSlots <- struct{}{}:
-		default:
-			_ = tunnel.SendBusy(tunnelConn)
-			return
-		}
-		idleHeld := true
-		releaseIdle := func() {
-			if idleHeld {
-				<-poolOptions.idleSlots
-				idleHeld = false
-			}
-		}
-		defer releaseIdle()
-		releaseSetup()
-		if err := tunnelConn.SetDeadline(time.Now().Add(tunnel.PreparedIdleTimeout)); err != nil {
-			logging.Failure(connectionLogger, "prepare", err)
-			return
-		}
-		idleStarted := time.Now()
-		var readyErr error
-		if commandACK {
-			readyErr = tunnel.SendReadyWithAck(tunnelConn)
-		} else {
-			readyErr = tunnel.SendReady(tunnelConn)
-		}
-		if readyErr != nil {
-			logging.Failure(connectionLogger, "prepare", readyErr)
-			return
-		}
-		line, err = tunnel.ReadLine(reader)
-		idleDuration = time.Since(idleStarted)
-		releaseIdle()
-		if err != nil {
-			connectionLogger.Debug("idle closed", "error", err)
-			return
-		}
-		if !poolOptions.resumeSetup() {
-			if err := tunnel.SendTargetResult(tunnelConn, syscall.ENOBUFS); err != nil {
-				logging.Failure(connectionLogger, "reply", err)
-			}
-			return
-		}
-		pooled = true
+	prepared, ok := awaitPreparedCommand(tunnelConn, reader, line, releaseSetup, poolOptions, connectionLogger)
+	if !ok {
+		return
+	}
+	line, idleDuration, pooled, commandACK := prepared.line, prepared.idleDuration, prepared.pooled, prepared.commandACK
+	if pooled {
 		connectStarted = time.Now()
 		connectDeadline = connectStarted.Add(tunnel.ControlTimeout)
 		if err := tunnelConn.SetDeadline(connectDeadline); err != nil {
@@ -459,6 +414,80 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 	}
 	result := relay.CopyBidirectionalContext(abortContext, tunnelConn, reader, targetConn, targetConn)
 	logging.LogTunnelResult(requestLogger, result, startedAt, "tunnel", "target")
+}
+
+type preparedCommand struct {
+	line         string
+	idleDuration time.Duration
+	pooled       bool
+	commandACK   bool
+}
+
+// awaitPreparedCommand applies the same authenticated idle and setup budgets to
+// TCP and QUIC. It never starts a target or enables QUIC business datagrams.
+func awaitPreparedCommand(conn net.Conn, reader *bufio.Reader, line string, releaseSetup func(), options *serverPoolOptions, logger *slog.Logger) (preparedCommand, bool) {
+	result := preparedCommand{line: line, commandACK: line == "PREPARE ACK"}
+	if line != "PREPARE" && !result.commandACK {
+		return result, true
+	}
+	if options == nil || cap(options.idleSlots) == 0 {
+		_ = tunnel.SendERR(conn)
+		return result, false
+	}
+	select {
+	case options.idleSlots <- struct{}{}:
+	default:
+		_ = tunnel.SendBusy(conn)
+		rejectQUICPreparedLimit(conn)
+		return result, false
+	}
+	idleHeld := true
+	releaseIdle := func() {
+		if idleHeld {
+			<-options.idleSlots
+			idleHeld = false
+		}
+	}
+	defer releaseIdle()
+	releaseSetup()
+	if err := conn.SetDeadline(time.Now().Add(tunnel.PreparedIdleTimeout)); err != nil {
+		logging.Failure(logger, "prepare", err)
+		return result, false
+	}
+	idleStarted := time.Now()
+	var readyErr error
+	if result.commandACK {
+		readyErr = tunnel.SendReadyWithAck(conn)
+	} else {
+		readyErr = tunnel.SendReady(conn)
+	}
+	if readyErr != nil {
+		logging.Failure(logger, "prepare", readyErr)
+		return result, false
+	}
+	var err error
+	result.line, err = tunnel.ReadLine(reader)
+	result.idleDuration = time.Since(idleStarted)
+	releaseIdle()
+	if err != nil {
+		logger.Debug("idle closed", "error", err)
+		return result, false
+	}
+	if options.resumeSetup == nil || !options.resumeSetup() {
+		if err := tunnel.SendTargetResult(conn, syscall.ENOBUFS); err != nil {
+			logging.Failure(logger, "reply", err)
+		}
+		rejectQUICPreparedLimit(conn)
+		return result, false
+	}
+	result.pooled = true
+	return result, true
+}
+
+func rejectQUICPreparedLimit(conn net.Conn) {
+	if quicConn, ok := conn.(*quicudp.Conn); ok {
+		quicConn.RejectLimit()
+	}
 }
 
 func acknowledgePrepared(conn net.Conn, controlDeadline time.Time) error {

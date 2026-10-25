@@ -283,6 +283,8 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 
 客户端默认 `-pool-size 4 -pool-max 16`，按需在 4～16 条备用容量间调整；pool-size 范围 0～32；设为 0 使用原来的 TCP/TLS + AUTH/CONNECT 流水建连。后台完成 TLS 和 AUTH 后协商PREPARE，连接只用于一次后续CONNECT或UDP；不会复用已转发过数据的连接，也没有多路复用。备用连接用完就补充，池为空时立即走普通建连，不等待补充。
 
+LA 分支选择 QUIC UDP 时另外使用 `-quic-pool-size 2`（0关闭，最大32）的固定备用池，后台完成完整握手和认证，取用时再确认 UDP 关联；不使用0-RTT，不复用已有业务会话。TCP 和 QUIC 在服务端共享 `-max-idle`；客户端分别统计 `pool_*` 与 `quic_pool_*`，命中只表示取到备用。配置、回退与计时细节见 [LA QUIC 说明](docs/la-quic.md#quic-预连接)。
+
 新客户端先发送 `AUTH → PREPARE ACK`；支持的新服务端回复 `OK → READY ACK`，交接后收到CONNECT/UDP即先回复ACK，再继续目标拨号或UDP建立，最后回复原OK/ERR。命令发送与即时ACK共用独立2秒期限；ACK后恢复目标响应等待，正常慢目标不会因2秒期限被提前回退。服务端发送ACK后直接继续处理，不等待客户端确认，不强制增加一次控制往返。
 
 只有本次连接明确协商READY ACK才启用2秒期限。旧客户端仍用PREPARE/READY且不会收到ACK；旧服务端在AUTH成功后对新探测返回EOF/ERR时，新客户端最多换一条连接重试旧PREPARE。仅有效旧READY会缓存旧能力，缓存按池隔离5分钟后可重新探测；并行首次填充可能各探测一次。AUTH失败、BUSY、超时、取消或畸形协商响应不触发旧协议重试。未协商旧连接保留原控制等待行为，不能承诺其静默失效也在2秒内恢复。

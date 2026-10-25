@@ -23,11 +23,13 @@ type Entry struct {
 	Conn        net.Conn
 	Reader      *bufio.Reader
 	DialTimings utlsconn.DialTimings
-	CommandACK  bool
-	done        chan struct{}
-	guardErr    error
-	expires     time.Time
-	refreshAt   time.Time
+	// QUICDuration is background dial/handshake time, not foreground setup time.
+	QUICDuration time.Duration
+	CommandACK   bool
+	done         chan struct{}
+	guardErr     error
+	expires      time.Time
+	refreshAt    time.Time
 }
 
 func Prepare(ctx context.Context, cfg *config.ClientConfig) (entry *Entry, err error) {

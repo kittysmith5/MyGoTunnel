@@ -129,6 +129,10 @@ go run ./cmd/client -config configs/client.json -log-level debug -log-format jso
 
 LA QUIC UDP 需保留来源 strict/nat、SOCKS TCP 控制关闭即结束关联、CA/指纹验证、认证轮换与限速及进程资源预算；不用应用0-RTT，不在认证前转发。QUIC TLS 不等于 uTLS Chrome 或 HTTP/3 伪装。初版每个关联一条 QUIC 连接，TCP 与 QUIC 通过合并 listener 共享 admission 总连接/setup 限制；任一子 listener 致命失败必须终止合并入口，关闭时回收尚未交付的连接并 join 接受 worker。
 
+QUIC客户端独立固定备用池 `-quic-pool-size` 默认2、0关闭、最大32，只在QUIC配置启用；既有TCP池参数不控制该池。后台完整TLS/证书/AUTH并协商PREPARE ACK/READY ACK，服务端共用TCP idleSlots与60秒期限，等待释放setup，UDP命令前重取setup。池guard/TTL/退避/所有权复用preconnect.Pool；DATA仅在UDP最终OK后启用，前台取用后同一Reader且未消费业务才允许一次同端QUIC传输故障回退。明确LIMIT、认证拒绝、协议错误和取消不重试、不降级TCP。旧服务端不支持PREPARE则后台退避，前台普通QUIC保留。QUIC LIMIT行未送达时用独立应用关闭码0x104映射ErrLimit，factory归ErrBusy，前台归TargetError LIMIT；不得变成正常EOF引发重试。前台命中handshake=0，后台Debug记录真实QUICDuration，stats独立quic_pool_idle/max/filling/hits/misses/fallbacks/hit_rate/renewed/retry，原pool_* stats继续只指TCP。测试覆盖真实QUIC池guard交接、关闭已交接所有权、完整认证/错误pin、同端fallback与明确错误不重试、共享idle/setup/socket限制及退出回收。
+
+有效QUIC备用容量不超过udp_max_sockets-1；后台socket用Resources原子AcquireSocketWithReserve(1)为本地relay留一名额，前台正常申请仍可使用该余量。仅后台使用DialOptions.SocketReserve，不进JSON/连接码；低预算2名额时必须能取一条备用并成功建立本地relay。回退计时ControlDuration累加旧ACK等待与新控制阶段，不能覆盖导致小于AckDuration。
+
 QUIC 传输层先用源地址 Retry 验证，连接数受 max-connections、同时握手数受 max-setup（不超过总连接数）限制；每 IP 握手 guard 为并发8、每秒4次、突发16次。握手后共享 TCP 的应用 admission 和 authlimit。控制 ERR 未送达时，认证拒绝/超时仍可通过 QUIC 应用关闭原因跨端反馈，不能泛化成普通 EOF 或丢失认证拒绝分类。
 
 客户端可复用进程有界的地址验证 NEW_TOKEN：最多16个端点/信任范围，每范围4枚、Pop后单次提交，按remote/SNI/系统CA或具体pin隔离，非标准自定义根池不隐式共用系统信任缓存。不持久化、不进日志/连接码，不增加部署配置。有效令牌只减少后续新关联的重复Retry；不等同TLS恢复，不启0RTT，不省证书验证或AUTH。首次、过期、出口IP变化、服务端重启失效后仍需Retry。测试须验证新UDP socket下减少Retry、每连接完整AUTH、缓存有效时错误pin仍拒绝、过期恢复Retry及缓存容量/单次取用/并发隔离。
