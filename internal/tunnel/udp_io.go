@@ -24,6 +24,81 @@ func NewDatagramReader(reader *bufio.Reader, resources *datagram.Resources) *Dat
 	return &DatagramReader{reader: reader, resources: resources}
 }
 
+// PacketReader preserves packet ownership for transports that already provide
+// message boundaries. The TCP path retains its existing buffered framing.
+type PacketReader interface {
+	ReadPacket() (datagram.Packet, error)
+}
+
+func NewPacketReader(conn net.Conn, reader *bufio.Reader, resources *datagram.Resources) PacketReader {
+	if packets, ok := conn.(PacketReader); ok {
+		return packets
+	}
+	return NewDatagramReader(reader, resources)
+}
+
+// EnableDatagrams is called only after authentication and the UDP command have
+// succeeded. The optional control-stream monitor then owns subsequent reads.
+func EnableDatagrams(conn net.Conn) {
+	if packets, ok := conn.(interface{ EnableDatagrams() }); ok {
+		packets.EnableDatagrams()
+	}
+}
+
+// DatagramTransportAttrs supplements the shared UDP counters with bounded
+// transport-specific drops. Call after the association's workers have stopped.
+func DatagramTransportAttrs(conn net.Conn) []any {
+	if packets, ok := conn.(interface{ DatagramAttrs() []any }); ok {
+		return packets.DatagramAttrs()
+	}
+	return nil
+}
+
+// DatagramQueueWriter keeps TCP batching intact and sends each queued packet
+// separately when the transport provides unreliable datagrams.
+type DatagramQueueWriter struct {
+	*DatagramWriter
+	buffered *bufio.Writer
+	packets  interface{ WritePacket([]byte) error }
+}
+
+func NewDatagramQueueWriter(conn net.Conn, timeout time.Duration) *DatagramQueueWriter {
+	w := &DatagramQueueWriter{DatagramWriter: NewDatagramWriter(conn, timeout)}
+	w.packets, _ = conn.(interface{ WritePacket([]byte) error })
+	if w.packets == nil {
+		w.buffered = bufio.NewWriterSize(w.DatagramWriter, 32*1024)
+	}
+	return w
+}
+
+func (w *DatagramQueueWriter) WriteQueue(queue interface {
+	TryPop() (datagram.Packet, bool)
+}) error {
+	if w.packets == nil {
+		return WriteDatagramQueue(w.buffered, queue)
+	}
+	for i := 0; i < 32; i++ {
+		packet, ok := queue.TryPop()
+		if !ok {
+			return nil
+		}
+		started := time.Now()
+		err := w.conn.SetWriteDeadline(started.Add(w.timeout))
+		if err == nil {
+			err = w.packets.WritePacket(packet.Data)
+		}
+		packet.Release()
+		if err == nil {
+			err = w.conn.SetWriteDeadline(time.Time{})
+		}
+		w.record(started, err)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *DatagramReader) ReadPacket() (datagram.Packet, error) {
 	if _, err := io.ReadFull(r.reader, r.size[:]); err != nil {
 		return datagram.Packet{}, err
@@ -87,6 +162,11 @@ func (w *DatagramWriter) Write(p []byte) (int, error) {
 		// Do not leave an expired write deadline behind while the stream is idle.
 		err = w.conn.SetWriteDeadline(time.Time{})
 	}
+	w.record(started, err)
+	return n, err
+}
+
+func (w *DatagramWriter) record(started time.Time, err error) {
 	w.stats.Calls++
 	w.stats.MaxDuration = max(w.stats.MaxDuration, time.Since(started))
 	if err != nil {
@@ -96,7 +176,6 @@ func (w *DatagramWriter) Write(p []byte) (int, error) {
 			w.stats.Timeouts++
 		}
 	}
-	return n, err
 }
 
 // Stats is read after the writer worker has exited.

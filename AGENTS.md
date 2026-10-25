@@ -4,7 +4,7 @@
 
 ## 项目概览
 
-MyGoTunnel 是一个小型 Go TCP 隧道项目，模块名为 `mygotunnel`，`go.mod` 声明 Go 1.24。
+MyGoTunnel 是一个小型 Go TCP/UDP 隧道项目，模块名为 `mygotunnel`。LA 专用分支 `feat/la-quic-udp` 引入 quic-go v0.64.1，`go.mod` 声明最低 Go 1.26；原功能分支的工具链要求不因此改变。
 
 数据链路如下：
 
@@ -18,6 +18,8 @@ SOCKS5 应用
 
 客户端和服务端在 TLS 连接内使用简单的逐行文本控制协议；认证及建连成功后，连接切换为透明的双向字节转发。
 
+LA 分支另有可选的 UDP over QUIC DATAGRAM：可靠控制流认证，业务数据报使用 DATAGRAM；普通 TCP 保留上面的 TLS/TCP 路径。配置缺省仍使用原 TLS/TCP UDP 隧道，不自动按线路、地区或节点切换。
+
 ## 目录职责
 
 - `cmd/client`：加载客户端配置、接受本地 SOCKS5 连接、建立远端 uTLS 连接并组织隧道流程。
@@ -27,6 +29,7 @@ SOCKS5 应用
 - `internal/socks5`：SOCKS5 可选用户名密码握手、支持 TCP `CONNECT` 和 UDP `ASSOCIATE` 的请求解析、数据报及响应。
 - `internal/tunnel`：`AUTH`、`CONNECT`、`OK`、`ERR` 控制消息的读写。
 - `internal/utlsconn`：使用 Chrome ClientHello 指纹建立 uTLS 客户端连接。
+- `internal/quicudp`：LA 可选 QUIC UDP 传输、证书信任、内部有界分片重组与数据报生命周期。
 - `internal/relay`：保留缓冲数据并执行带半关闭语义的双向复制。
 - `configs`：本地 JSON 配置；实际配置被 `.gitignore` 忽略。
 - `certs`：本地 PEM 证书和私钥；实际证书文件被 `.gitignore` 忽略。
@@ -72,6 +75,7 @@ SOCKS5 应用
 - 客户端和服务端均支持 `udp_queue_max_bytes`、`udp_queue_max_age_ms`；0/缺省为 1 MiB、250ms，非零范围分别 65000～67108864、1～60000。属于本地策略，不进入连接码。
 - 两端还支持 `udp_write_timeout_ms`（默认5000，非零1～600000）、`udp_max_sockets`（默认1024，非零1～65536）、`udp_memory_limit_bytes`（默认64MiB，非零262144～1073741824）；0/缺省取默认值，均不进入连接码。生产每个run创建一个共享Resources，不能给每个关联独立创建而绕过进程预算。
 - 客户端独有 `udp_source_policy`（缺省 strict，可选 nat）及 `udp_relay_port_min/max`（同为0用系统端口，否则1～65535闭区间，最多1024端口）；不进入连接码，不自动修改防火墙。NAT 模式仅支持 TCP/UDP 共用出口 IP，不能开放任意来源。
+- LA 分支客户端独有 `udp_transport`（空值/缺省 tcp，可选 quic）与 `udp_quic_remote_addr`（空值/缺省使用 remote_addr，经 UDP 连接；显式远端仍需主机与1～65535数字端口），均不进入连接码。初版无自动回退；证书/认证错误不得降级绕过，不能跨节点重放已有业务数据。
 
 服务端实际读取的字段只有：
 
@@ -80,6 +84,7 @@ SOCKS5 应用
 - `cert_file`：可选，默认 `certs/cert.pem`。
 - `key_file`：可选，默认 `certs/key.pem`。
 - `https_entry`：可选同端口 HTTPS 网页回退，缺省关闭。启用时增加认证前单 IP 并发/速率与 HTTP 容量保护；字段、默认值和边界见 README 与 `docs/https-entry-design.md`。
+- LA 分支 `udp_quic_listen_addr`：可选独立 UDP 监听，空值/缺省关闭，沿用监听地址离线校验；程序不自动修改防火墙。
 
 JSON 中的未知字段目前会被忽略，不能仅凭某个本地配置中存在额外字段就认为功能已经实现。新增或重命名配置项时，应同步更新结构体、JSON 标签、默认值/校验、示例或说明，以及配置加载测试。
 
@@ -121,6 +126,14 @@ go run ./cmd/client -config configs/client.json -log-level debug -log-format jso
 - `README.md` 当前内容很少。若改动用户可见的启动方式、配置格式或协议能力，应在任务范围允许时同步补充文档。
 
 ## 测试要求
+
+LA QUIC UDP 需保留来源 strict/nat、SOCKS TCP 控制关闭即结束关联、CA/指纹验证、认证轮换与限速及进程资源预算；不用应用0-RTT，不在认证前转发。QUIC TLS 不等于 uTLS Chrome 或 HTTP/3 伪装。初版每个关联一条 QUIC 连接，TCP 与 QUIC 通过合并 listener 共享 admission 总连接/setup 限制；任一子 listener 致命失败必须终止合并入口，关闭时回收尚未交付的连接并 join 接受 worker。
+
+QUIC 传输层先用源地址 Retry 验证，连接数受 max-connections、同时握手数受 max-setup（不超过总连接数）限制；每 IP 握手 guard 为并发8、每秒4次、突发16次。握手后共享 TCP 的应用 admission 和 authlimit。控制 ERR 未送达时，认证拒绝/超时仍可通过 QUIC 应用关闭原因跨端反馈，不能泛化成普通 EOF 或丢失认证拒绝分类。
+
+QUIC 内部分片每个 DATAGRAM 应用数据最多1100字节（12字节头+1088字节负载），完整 SOCKS UDP 帧最多65000字节/60片；每关联最多16个未完成重组、64个去重ID、16项接收队列。缓冲从共享 datagram.Resources 借用，丢弃/关闭必须归还。重组使用独立固定2秒期限，不能直接套用默认250ms队列期限；完成时的 Packet.At 为完整重组时刻，本地队列年龄从此起算。应用 SOCKS FRAG 仍拒绝。测试覆盖乱序/重复/缺片/大包、认证拒绝、控制取消、跨关联预算和关闭回收。UDP 日志保留 transport=udp，并以 udp_tunnel_transport=tcp/quic 标识载体；不把成功包分位数当作完整丢包/体验指标。
+
+Conn 内嵌1100字节发送 scratch 不计 Resources，按关联连接数有界；QUIC 库/加密/协议元数据/内核缓冲亦在 managed payload 预算外，不得宣称全部应用内存或 RSS 均被 udp_memory_limit_bytes 限制。udp_quic_handshake_duration 记录完整 QUIC 拨号握手时间，tcp_duration/tls_duration 保留 TCP 阶段含义，QUIC 中为0。quic_* drops 为本地拒绝/到期事件计数，分片/完整报文维度可能不同，不能当作线路丢包率或直接相加；quic_enqueued_fragments 仅表示本地发送队列接收，不证明送达。
 
 新增测试放在被测包旁的 `*_test.go` 文件中，优先使用表驱动测试。单元测试应可离线、可重复，不依赖公网地址、真实证书或固定端口；协议和连接测试优先使用 `net.Pipe`、本地临时 listener、临时目录及测试证书。
 
@@ -310,6 +323,7 @@ NewPreparer按pool探测ACK，仅AUTH OK后的纯EOF/ERR可在新连接重试一
 
 两端 `-version` 在读取配置前输出 buildinfo JSON；`-check-config` 只离线检查，
 `-health` 为显式有界探测。诊断不得输出原始解析错误（可能含凭据）。
+LA 客户端配置 quic 后，health 在 TCP 控制检查成功后补 QUIC AUTH/UDP 两 OK 探测；服务端启用 QUIC 后，在 TCP 监听检查成功后用配置证书 SHA-256 pin 和当前 token 探测本机入口。每次 QUIC 探测最多3秒且受父 context 约束，使用独立小资源预算，取消须关闭并等待回收，不发送业务 UDP/拨号目标。失败仅输出 REMOTE_UDP_QUIC_UNHEALTHY 或 UDP_QUIC_LISTENER_UNHEALTHY；通配监听需转同地址族回环，IPv6 :: 必须使用 ::1。不能仅凭 TCP 健康就声称配置的 QUIC 入口健康，也不能把控制探测成功当作目标 UDP 可达。
 发布用 scripts/release.sh 从已提交 Git archive 构建，通过 ldflags 写入 version/commit/built。
 运维升级仅使用可信本地 bundle，校验 manifest、版本与运行文件，保留原配置和 unit；失败自动回滚。
 scripts/observe.py 被动采集最多72小时，指标为成功建连耗时分位数而非应用RTT；

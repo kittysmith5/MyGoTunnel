@@ -27,6 +27,7 @@ import (
 	"mygotunnel/internal/ingress"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/operations"
+	"mygotunnel/internal/quicudp"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/setupwatch"
 	"mygotunnel/internal/tunnel"
@@ -187,6 +188,20 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		return fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err)
 	}
 	defer ln.Close()
+	var listener net.Listener = ln
+	if cfg.UDPQUICListenAddr != "" {
+		_, maxAge := cfg.QueueLimits()
+		udpListener, err := quicudp.Listen(cfg.UDPQUICListenAddr, certificates.quicTLSConfig(), resources, maxAge, opts.maxConnections, maxSetup)
+		if err != nil {
+			return fmt.Errorf("listen for UDP QUIC: %w", err)
+		}
+		defer udpListener.Close()
+		listener, err = admission.MergeListeners(ln, udpListener)
+		if err != nil {
+			return err
+		}
+		defer listener.Close()
+	}
 	stopReload := watchCertificateReload(certificates, logger)
 	defer stopReload()
 
@@ -194,6 +209,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"version", buildinfo.Current().Version,
 		"commit", buildinfo.Current().Commit,
 		"listen_addr", cfg.ListenAddr,
+		"udp_quic_listen_addr", cfg.UDPQUICListenAddr,
 		"alpn", "http/1.1",
 		"timezone", "UTC",
 		"max_connections", opts.maxConnections,
@@ -216,7 +232,11 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		return attrs
 	})
 	defer stopStats()
-	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
+	return admission.ServeContext(ctx, grace, listener, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
+		if _, ok := conn.(*quicudp.Conn); ok {
+			handleQUICUDPTunnel(conn, cfg, logger, permit, authLimiter, resources)
+			return
+		}
 		handleTunnelContextWithLimiter(ctx, conn, cfg, logger, permit.Release, &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire, abortContext: permit.AbortContext(), entrance: entrance, releasePreAuth: permit.ReleasePreAuth, acceptedAt: permit.StartedAt()}, authLimiter, resources)
 	}, nil, metrics, gate)
 }
@@ -364,6 +384,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 			}
 		}
 		handleUDPTunnel(tunnelConn, reader, connectionLogger.With(
+			"udp_tunnel_transport", "tcp",
 			"pool_connection", pooled, "auth_duration", authDuration, "idle_duration", idleDuration,
 			"wait_duration", time.Since(connectStarted)), startedAt, idleDuration, releaseSetup, cfg.UDPQueueConfig, resources...)
 		return
@@ -488,6 +509,8 @@ func checkAuthTokenProvider(conn net.Conn, reader *bufio.Reader, tokenProvider f
 
 // authenticateTokenLine does not write: HTTPS fallback must own the first byte
 // of any rejection response. Both entrances share the same credential decision.
+var errAuthenticationTokenMismatch = errors.New("authentication token mismatch")
+
 func authenticateTokenLine(line string, tokenProvider func() []string, limiter *authlimit.Limiter, peerKey string) error {
 	if !strings.HasPrefix(line, "AUTH ") {
 		return errors.New("invalid authentication command")
@@ -508,7 +531,7 @@ func authenticateTokenLine(line string, tokenProvider func() []string, limiter *
 		}
 	}
 	if matched != 1 {
-		return errors.New("authentication token mismatch")
+		return errAuthenticationTokenMismatch
 	}
 
 	return nil

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -148,7 +147,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	defer scratch.Release()
 
 	socksDuration := time.Since(startedAt)
-	session, err := openRemoteUDP(ctx, cfg, pool)
+	session, err := openRemoteUDP(ctx, cfg, pool, resources)
 	cancel()
 	if err != nil {
 		logging.Failure(logger, session.Stage, err)
@@ -183,6 +182,10 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 		return
 	}
 	releaseSetup()
+	logger = logger.With("udp_tunnel_transport", cfg.UDPTransportMode())
+	if cfg.UDPTransportMode() == "quic" {
+		logger = logger.With("udp_quic_remote_addr", cfg.UDPQUICRemote())
+	}
 	logger.Info("ready", "transport", "udp", "remote_addr", cfg.RemoteAddr,
 		"udp_source_policy", cfg.UDPSourceMode(), "udp_relay_port", bound.Port,
 		"udp_source_declared_addr", net.JoinHostPort(request.Address, strconv.Itoa(int(request.Port))),
@@ -192,6 +195,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 		"pool_fallback", session.PoolFallback, "pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
 		"tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed,
+		"udp_quic_handshake_duration", session.QUICDuration,
 		"control_duration", session.ControlDuration, "setup_duration", time.Since(startedAt))
 
 	stop := make(chan struct{})
@@ -214,7 +218,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	maxBytes, maxAge := cfg.QueueLimits()
 	responses := datagram.NewQueue(128, maxBytes, maxAge, nil, resources)
 	requests := datagram.NewQueue(udpFrameQueueSize, maxBytes, maxAge, nil, resources)
-	tunnelWriter := tunnel.NewDatagramWriter(remoteConn, cfg.WriteTimeout())
+	tunnelWriter := tunnel.NewDatagramQueueWriter(remoteConn, cfg.WriteTimeout())
 	var uploaded atomic.Uint64
 	var downloaded atomic.Uint64
 	var dropped atomic.Uint64
@@ -247,7 +251,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 				"udp_source_rejected_matches_tcp_peer", sameIP,
 				"udp_source_nat_candidate", cfg.UDPSourceMode() == "strict" && sameIP && (firstRejectedReason == "ip" || firstRejectedReason == "port")}
 		}
-		endLogger := logger.With(sourceAttrs...)
+		endLogger := logger.With(sourceAttrs...).With(tunnel.DatagramTransportAttrs(remoteConn)...)
 		logging.LogUDPResult(endLogger, resources, closeStage, closeErr, tunnelWriter.Stats(), "upload_datagrams", uploaded.Load(), "download_datagrams", downloaded.Load(),
 			"received_datagrams", received, "source_ip_drops", sourceIPDrops, "source_port_drops", sourcePortDrops,
 			"source_binding_drops", bindingDrops, "invalid_datagrams", invalidDrops, "oversized_datagrams", oversizedDrops,
@@ -267,11 +271,10 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	}()
 	go func() {
 		defer workers.Done()
-		writer := bufio.NewWriterSize(tunnelWriter, 32*1024)
 		for {
 			select {
 			case <-requests.Ready():
-				if err := tunnel.WriteDatagramQueue(writer, requests); err != nil {
+				if err := tunnelWriter.WriteQueue(requests); err != nil {
 					logger.Debug("send UDP datagram through tunnel failed", "error", err)
 					stopSession("udp_tunnel_write", err)
 					return
@@ -283,7 +286,7 @@ func handleUDPAssociateWithResolver(parent context.Context, clientConn net.Conn,
 	}()
 	go func() {
 		defer workers.Done()
-		frames := tunnel.NewDatagramReader(reader, resources)
+		frames := tunnel.NewPacketReader(remoteConn, reader, resources)
 		for {
 			response, err := frames.ReadPacket()
 			if err != nil {

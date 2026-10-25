@@ -16,6 +16,7 @@ type PreviousToken struct {
 type ServerConfig struct {
 	UDPQueueConfig
 	ListenAddr         string          `json:"listen_addr"`
+	UDPQUICListenAddr  string          `json:"udp_quic_listen_addr,omitempty"`
 	AuthToken          string          `json:"auth_token"`
 	PreviousAuthTokens []PreviousToken `json:"previous_auth_tokens,omitempty"`
 	CertFile           string          `json:"cert_file"`
@@ -39,6 +40,11 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 	}
 	if err := validateListenAddress(cfg.ListenAddr); err != nil {
 		return nil, fmt.Errorf("invalid listen_addr: %w", err)
+	}
+	if cfg.UDPQUICListenAddr != "" {
+		if err := validateListenAddress(cfg.UDPQUICListenAddr); err != nil {
+			return nil, fmt.Errorf("invalid udp_quic_listen_addr: %w", err)
+		}
 	}
 
 	if !validToken(cfg.AuthToken) {

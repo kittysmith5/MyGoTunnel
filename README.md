@@ -2,6 +2,8 @@
 
 HTTPS 入口与认证前失败处理见 [设计文档](docs/https-entry-design.md)。
 
+LA 分支增加可选的 UDP over QUIC DATAGRAM，配置与边界见 [LA QUIC UDP 文档](docs/la-quic.md)；缺省仍使用原 TLS/TCP UDP 隧道。
+
 ## 可选 HTTPS 网页入口
 
 服务端配置增加以下字段即可启用同端口网页回退，无需更改客户端或连接码：

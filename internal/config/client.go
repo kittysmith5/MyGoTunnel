@@ -30,6 +30,8 @@ type ClientConfig struct {
 	CertificateFingerprint string              `json:"certificate_fingerprint,omitempty"`
 	TrustMode              string              `json:"trust_mode,omitempty"`
 	TLSSessionCache        bool                `json:"tls_session_cache,omitempty"`
+	UDPTransport           string              `json:"udp_transport,omitempty"`
+	UDPQUICRemoteAddr      string              `json:"udp_quic_remote_addr,omitempty"`
 	UDPSourcePolicy        string              `json:"udp_source_policy,omitempty"`
 	UDPRelayPortMin        int                 `json:"udp_relay_port_min,omitempty"`
 	UDPRelayPortMax        int                 `json:"udp_relay_port_max,omitempty"`
@@ -87,6 +89,9 @@ func LoadClientConfig(path string) (*ClientConfig, error) {
 		return nil, err
 	}
 	if err := cfg.validateUDPRelay(); err != nil {
+		return nil, err
+	}
+	if err := cfg.validateUDPTransport(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil

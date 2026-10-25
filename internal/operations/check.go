@@ -3,8 +3,10 @@ package operations
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"net"
 	"os"
@@ -23,8 +25,9 @@ type Result struct {
 }
 
 // Check prints fixed diagnostic codes only: parser errors can contain credentials.
-// Health verifies the remote authenticated TLS control channel for clients;
-// server health checks its configured TCP listener, not a complete proxy request.
+// Health verifies the remote authenticated TLS control channel for clients and
+// the configured TCP listener for servers. Configured QUIC UDP transport also
+// requires an authenticated QUIC UDP setup; no business packets are sent.
 func Check(role, path string, health bool) int {
 	r := Result{Role: role, Check: "config", Code: "CONFIG_INVALID"}
 	if health {
@@ -45,13 +48,19 @@ func Check(role, path string, health bool) int {
 				if health {
 					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					entry, e := preconnect.Prepare(ctx, cfg)
-					cancel()
 					if e != nil {
 						r.OK = false
 						r.Code = "REMOTE_CONTROL_UNHEALTHY"
 					} else {
-						entry.Conn.Close()
+						_ = entry.Conn.Close()
+						if cfg.UDPTransportMode() == "quic" {
+							if e := probeQUICControl(ctx, cfg.UDPQUICRemote(), cfg.SNI, cfg.CertificateFingerprint, cfg.AuthToken); e != nil {
+								r.OK = false
+								r.Code = "REMOTE_UDP_QUIC_UNHEALTHY"
+							}
+						}
 					}
+					cancel()
 				}
 			}
 		}
@@ -69,16 +78,24 @@ func Check(role, path string, health bool) int {
 							r.Warnings = append(r.Warnings, "CERT_EXPIRES_WITHIN_30_DAYS")
 						}
 						if health {
-							host, port, _ := net.SplitHostPort(cfg.ListenAddr)
-							if host == "" || host == "0.0.0.0" || host == "::" {
-								host = "127.0.0.1"
-							}
-							c, e := net.DialTimeout("tcp", net.JoinHostPort(host, port), 3*time.Second)
+							localAddr, _ := localListenerAddress(cfg.ListenAddr)
+							c, e := net.DialTimeout("tcp", localAddr, 3*time.Second)
 							if e != nil {
 								r.OK = false
 								r.Code = "LISTENER_UNHEALTHY"
 							} else {
-								c.Close()
+								_ = c.Close()
+								if cfg.UDPQUICListenAddr != "" {
+									localAddr, _ := localListenerAddress(cfg.UDPQUICListenAddr)
+									pin := sha256.Sum256(cert.Certificate[0])
+									ctx, cancel := context.WithTimeout(context.Background(), quicHealthTimeout)
+									e := probeQUICControl(ctx, localAddr, "", hex.EncodeToString(pin[:]), cfg.AuthToken)
+									cancel()
+									if e != nil {
+										r.OK = false
+										r.Code = "UDP_QUIC_LISTENER_UNHEALTHY"
+									}
+								}
 							}
 						}
 					} else {

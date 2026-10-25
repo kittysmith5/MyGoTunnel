@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/preconnect"
 	"mygotunnel/internal/tunnel"
 	"mygotunnel/internal/utlsconn"
@@ -22,6 +23,7 @@ type remoteSession struct {
 	Reader                *bufio.Reader
 	Dial                  utlsconn.DialTimings
 	ControlDuration       time.Duration
+	QUICDuration          time.Duration
 	PoolAcquireDuration   time.Duration
 	AckDuration           time.Duration
 	PoolHit, PoolFallback bool
@@ -39,7 +41,10 @@ func openRemote(ctx context.Context, cfg *config.ClientConfig, target string, po
 	return openRemoteCommand(ctx, cfg, target, pool, false)
 }
 
-func openRemoteUDP(ctx context.Context, cfg *config.ClientConfig, pool *preconnect.Pool) (*remoteSession, error) {
+func openRemoteUDP(ctx context.Context, cfg *config.ClientConfig, pool *preconnect.Pool, limits ...*datagram.Resources) (*remoteSession, error) {
+	if cfg.UDPTransportMode() == "quic" {
+		return openRemoteQUICUDP(ctx, cfg, datagram.SelectResources(limits))
+	}
 	return openRemoteCommand(ctx, cfg, "", pool, true)
 }
 
