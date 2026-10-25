@@ -139,7 +139,7 @@ QUIC 传输层先用源地址 Retry 验证，连接数受 max-connections、同�
 
 QUIC 内部分片每个 DATAGRAM 应用数据最多1100字节（12字节头+1088字节负载），完整 SOCKS UDP 帧最多65000字节/60片；每关联最多16个未完成重组、64个去重ID、16项接收队列。缓冲从共享 datagram.Resources 借用，丢弃/关闭必须归还。重组使用独立固定2秒期限，不能直接套用默认250ms队列期限；完成时的 Packet.At 为完整重组时刻，本地队列年龄从此起算。应用 SOCKS FRAG 仍拒绝。测试覆盖乱序/重复/缺片/大包、认证拒绝、控制取消、跨关联预算和关闭回收。UDP 日志保留 transport=udp，并以 udp_tunnel_transport=tcp/quic 标识载体；不把成功包分位数当作完整丢包/体验指标。
 
-v2 通过 ALPN mygotunnel-udp/2 协商（双方同时支持），保留旧 ALPN /1 和原 v1 分片。v2 整包 P/2+完整SOCKS帧最多1415字节，受SendDatagram尺寸验证约束；DatagramTooLargeError表示未入队才允许回退v1，每秒最多一次重探较大整包；其余错误仍原期限/关闭语义，不重发已入队业务。开启库内PMTUD，初始1200，不承诺1400负载一定合包，不启0RTT。整包接收也必须先认证并计共享Resources，旧ALPN不得接收整包。测试覆盖双向整包、老服务端/老客户端、MTU不够的无重复回退、大包v1、畸形整包及资源释放。
+v2 通过 ALPN mygotunnel-udp/2 协商（双方同时支持），保留旧 ALPN /1 和原 v1 分片。v2 整包 P/2+完整SOCKS帧最多1415字节，受SendDatagram尺寸验证约束；DatagramTooLargeError表示未入队才允许回退v1，每秒最多一次重探较大整包；其余错误仍原期限/关闭语义，不重发已入队业务。开启库内PMTUD，初始1200，不承诺1400负载一定合包，不启0RTT。大包突发首次/空闲1秒后3个SRTT内沿用v1（50ms..1s），不暂停业务、不扩大队列；完整包每8项且队列非空时让出调度以保护小队列消费者。整包接收也必须先认证并计共享Resources，旧ALPN不得接收整包。测试覆盖双向整包、老服务端/老客户端、MTU不够的无重复回退、大包v1、畸形整包及资源释放。
 
 Conn 内嵌1415字节发送 scratch 不计 Resources，按关联连接数有界；QUIC 库/加密/协议元数据/内核缓冲亦在 managed payload 预算外，不得宣称全部应用内存或 RSS 均被 udp_memory_limit_bytes 限制。udp_quic_handshake_duration 记录完整 QUIC 拨号握手时间，tcp_duration/tls_duration 保留 TCP 阶段含义，QUIC 中为0。quic_* drops 为本地拒绝/到期事件计数，分片/完整报文维度可能不同，不能当作线路丢包率或直接相加；quic_enqueued_fragments 仅表示本地发送队列接收，不证明送达。
 

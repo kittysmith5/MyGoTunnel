@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -104,6 +105,8 @@ type Conn struct {
 	compact            bool
 	compactLimit       int
 	compactProbe       time.Time
+	bulkUntil          time.Time
+	lastBulk           time.Time
 	enabled            atomic.Bool
 	monitorOnce        sync.Once
 	mu                 sync.Mutex
@@ -249,6 +252,7 @@ func (c *Conn) receivePackets() {
 func (c *Conn) receiveWindow(r *Reassembler) error {
 	ctx, cancel := context.WithTimeout(c.q.Context(), 100*time.Millisecond)
 	defer cancel()
+	delivered := 0
 	for {
 		wire, err := c.q.ReceiveDatagram(ctx)
 		if err != nil {
@@ -284,6 +288,12 @@ func (c *Conn) receiveWindow(r *Reassembler) error {
 		default:
 			c.queueFullDrops.Add(1)
 			packet.Release()
+		}
+		delivered++
+		if delivered%8 == 0 && len(c.packets) > 0 {
+			// A coalesced QUIC receive batch can otherwise fill the small
+			// complete-packet channel before its runnable consumer gets CPU.
+			runtime.Gosched()
 		}
 	}
 }
@@ -384,7 +394,7 @@ func (c *Conn) WritePacket(packet []byte) error {
 		}
 		c.mu.Unlock()
 	}()
-	if c.compact && len(packet)+2 <= compactWireSize &&
+	if c.compact && c.compactReady(len(packet), time.Now()) && len(packet)+2 <= compactWireSize &&
 		(len(packet)+2 <= c.compactLimit || !time.Now().Before(c.compactProbe)) {
 		c.wire[0], c.wire[1] = 'P', 2
 		copy(c.wire[2:], packet)
@@ -423,6 +433,23 @@ func (c *Conn) WritePacket(packet []byte) error {
 		c.fragmentEnqueues.Add(1)
 	}
 	return nil
+}
+
+// Keep the original packetization during the start of a large-packet burst.
+// The high-RTT burst comparison regressed when packetization switched at
+// once. Give congestion startup three RTTs before switching. This never waits
+// or buffers: v1 sends now.
+// Called under writeMu; small packets do not need this transition.
+func (c *Conn) compactReady(size int, now time.Time) bool {
+	if size <= fragmentPayload {
+		return true
+	}
+	if c.bulkUntil.IsZero() || now.Sub(c.lastBulk) >= time.Second {
+		ramp := min(time.Second, max(50*time.Millisecond, 3*c.q.ConnectionStats().SmoothedRTT))
+		c.bulkUntil = now.Add(ramp)
+	}
+	c.lastBulk = now
+	return !now.Before(c.bulkUntil)
 }
 
 func (c *Conn) armWriteTimerLocked() {
