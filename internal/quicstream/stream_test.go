@@ -88,11 +88,19 @@ func TestStreamsMultiplexHalfCloseAndCancellation(t *testing.T) {
 		t.Fatal(e)
 	}
 	defer first.Close()
+	spare, _, e := pool.Open(ctx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer spare.Close()
 	second, _, e := pool.Open(ctx)
 	if e != nil {
 		t.Fatal(e)
 	}
 	defer second.Close()
+	if first.(*Stream).q != second.(*Stream).q {
+		t.Fatal("cancellation test did not share a physical connection")
+	}
 	// A canceled/blocked read must not close the shared physical connection.
 	first.SetReadDeadline(time.Now().Add(time.Millisecond))
 	var x [1]byte
