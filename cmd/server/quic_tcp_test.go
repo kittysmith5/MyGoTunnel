@@ -18,6 +18,7 @@ import (
 	"mygotunnel/internal/tunnel"
 	"net"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -136,4 +137,46 @@ func TestTCPQUICRunsExistingAuthConnectAndHalfClose(t *testing.T) {
 	if e = <-done; e != nil {
 		t.Fatal(e)
 	}
+}
+
+func TestTCPQUICCertificateSnapshotKeepsStreamALPN(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.json")
+	code, e := config.InitializeServer(path, "localhost:8443", ":8443")
+	if e != nil {
+		t.Fatal(e)
+	}
+	cfg, e := config.LoadServerConfig(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	cc, e := config.DecodeConnection(code)
+	if e != nil {
+		t.Fatal(e)
+	}
+	manager, e := newCertificateManager(path, cfg)
+	if e != nil {
+		t.Fatal(e)
+	}
+	tlsConfig := manager.quicTLSConfigProtocols([]string{quicstream.ALPN})
+	snapshot, e := tlsConfig.GetConfigForClient(&tls.ClientHelloInfo{})
+	if e != nil || len(snapshot.NextProtos) != 1 || snapshot.NextProtos[0] != quicstream.ALPN {
+		t.Fatal("snapshot changed ALPN", e)
+	}
+	r := datagram.NewResources(4, 262144)
+	defer r.Close()
+	ln, e := quicstream.Listen("127.0.0.1:0", tlsConfig, r, 4, 4)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer ln.Shutdown(0)
+	tc, _ := quicudp.ClientTLSConfig(ln.Addr().String(), "localhost", cc.CertificateFingerprint)
+	pool := quicstream.NewPool(ln.Addr().String(), tc, r)
+	defer pool.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	c, _, e := pool.Open(ctx)
+	if e != nil {
+		t.Fatal("real snapshot handshake failed", e)
+	}
+	c.Close()
 }

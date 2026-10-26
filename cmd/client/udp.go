@@ -266,7 +266,7 @@ func handleUDPAssociateWithPools(parent context.Context, clientConn net.Conn, re
 			"source_binding_drops", bindingDrops, "invalid_datagrams", invalidDrops, "oversized_datagrams", oversizedDrops,
 			"first_datagram_seen", !firstDatagramAt.IsZero(), "first_datagram_duration", firstDuration,
 			"first_accepted_datagram_seen", !firstAcceptedAt.IsZero(), "first_accepted_datagram_duration", acceptedDuration,
-			"dropped_datagrams", dropped.Load()+in.ExpiredDrops+out.ExpiredDrops,
+			"dropped_datagrams", dropped.Load()+in.ExpiredDrops+out.ExpiredDrops+in.EvictedDrops,
 			"queue_full_drops", in.FullDrops+out.FullDrops, "queue_expired_drops", in.ExpiredDrops+out.ExpiredDrops,
 			"queue_resource_drops", in.ResourceDrops+out.ResourceDrops,
 			"request_fair_evictions", in.EvictedDrops, "request_peak_flows", in.PeakFlows,

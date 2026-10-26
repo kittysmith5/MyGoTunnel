@@ -32,8 +32,16 @@ func openRemoteTCPStream(ctx context.Context, cfg *config.ClientConfig, target s
 			_ = conn.Close()
 		}
 	}()
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close(); close(interrupted) })
+	defer func() {
+		if !stop() {
+			<-interrupted
+		}
+		if ctx.Err() != nil {
+			err = ctx.Err()
+		}
+	}()
 	session.Stage = "control"
 	if err = conn.SetDeadline(controlDeadline(ctx)); err != nil {
 		return session, err
