@@ -97,7 +97,11 @@ func (l *Listener) acceptConnections() {
 		q, err := l.ln.Accept(l.ctx)
 		if err != nil {
 			l.mu.Lock()
-			l.err = err
+			if l.closedAt.IsZero() {
+				l.err = err
+			} else if l.err == nil {
+				l.err = net.ErrClosed
+			}
 			l.mu.Unlock()
 			l.Close()
 			return
