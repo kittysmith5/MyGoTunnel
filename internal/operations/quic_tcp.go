@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"io"
 	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/quicstream"
 	"mygotunnel/internal/quicudp"
@@ -49,12 +50,23 @@ func probeTCPStreamControl(parent context.Context, addr, sni, pin, token string)
 	if err = tunnel.SendAuth(c, token); err != nil {
 		return err
 	}
-	line, err := tunnel.ReadLine(bufio.NewReader(c))
+	if _, err = io.WriteString(c, "HEALTH\n"); err != nil {
+		return err
+	}
+	reader := bufio.NewReader(c)
+	line, err := tunnel.ReadLine(reader)
 	if err != nil {
 		return err
 	}
 	if line != "OK" {
 		return errors.New("QUIC TCP control rejected")
+	}
+	line, err = tunnel.ReadLine(reader)
+	if err != nil {
+		return err
+	}
+	if line != "OK" {
+		return errors.New("QUIC TCP health rejected")
 	}
 	return nil
 }

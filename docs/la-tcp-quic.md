@@ -29,6 +29,6 @@ Stream窗口从256KiB起步，最大8MiB；连接窗口从1MiB起步，最大32M
 
 `tcp_quic_reused` 表示该请求使用已有QUIC连接，不等于原TCP预连接池命中；`tcp_quic_handshake_duration` 只记录新QUIC握手。原 `pool_*` 继续描述TLS/TCP预连接，`quic_pool_*` 继续描述UDP预连接；`tcp_quic_connections/streams` 为TCP QUIC当前资源快照。`tcp_tunnel_transport=tcp/quic` 区分载体。
 
-健康检查对所选TCP载体做证书和AUTH验证，不拨业务目标；QUIC失败使用 `REMOTE_TCP_QUIC_UNHEALTHY` / `TCP_QUIC_LISTENER_UNHEALTHY`。若同时启用UDP QUIC，还需通过其原有探测。
+健康检查对所选TCP载体做证书、AUTH与专用HEALTH确认，不拨业务目标，成功探测不记为代理建连失败；QUIC失败使用 `REMOTE_TCP_QUIC_UNHEALTHY` / `TCP_QUIC_LISTENER_UNHEALTHY`。若同时启用UDP QUIC，还需通过其原有探测。
 
 性能结论必须分别比较冷连接、已预热的建连、单流/多流吞吐、并发下载下小请求P95/P99、CPU及失败率。不能把QUIC连接复用和TLS冷握手比较后就宣称QUIC全面更快；Reno与内核BBR的差异也可能影响结果。正式切换需要独立端口验证，实验不改现有生产配置。

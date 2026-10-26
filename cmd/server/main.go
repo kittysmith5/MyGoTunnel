@@ -340,6 +340,15 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 		return
 	}
 
+	if line == "HEALTH" {
+		if _, ok := tunnelConn.(*quicstream.Stream); ok {
+			if e := tunnel.SendTargetResult(tunnelConn, nil); e != nil {
+				logging.Failure(connectionLogger, "reply", e)
+			}
+			return
+		}
+	}
+
 	prepared, ok := awaitPreparedCommand(tunnelConn, reader, line, releaseSetup, poolOptions, connectionLogger)
 	if !ok {
 		return

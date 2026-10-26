@@ -364,3 +364,5 @@ SOCKS 凭据 provider 在方法选择和完整读取凭据后的实际比较前�
 节点node_dns_duration/node_tcp_duration为新子阶段，tcp_duration仍含DNS；不能重复相加。first_up/down_duration以relay进入为起点，只在观察到该方向字节时输出，预读已经可用不等于新接收，非HTTP TTFB或送达。DEBUG first_data每方向最多1条，INFO仅结束汇总，不能增加逐包计时/日志或破坏io.Copy的WriterTo/ReaderFrom选择。TCP QUIC复用单列tcp_quic_reused，不混入TLS pool_*或UDP quic_pool_*。
 
 客户端KeyedQueue复用FairQueue，payload容量仍256包/原字节年龄/共享预算；目标索引<=256，仅压力时回收空项，不能保留借用域名切片。req_evictions属于full拒绝事件，不重复计数。QUIC batch最多32完整包，每8大包分片允许其他目标队头<=1413字节的完整小包插入；最多一个大包加一个小包在途，发送scratch由同一writeMu保护，每新完整包起算独立write timeout，插入小包不得延长大包期限；部分失败关闭关联，所有Packet归还。无界writer goroutine、扩大队列或修改TLS帧边界均禁止。验证混发时小包先完成、大包完整、同目标顺序、过期/预算/关闭、TCP/QUIC半关闭、错误认证/证书/取消隔离及资源回收。
+
+TCP QUIC健康探测在AUTH后发专用HEALTH，双OK后结束，不拨目标、不制造connect/EOF失败；仅独立TCP QUIC ALPN入口支持，旧TLS wire不变。

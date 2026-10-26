@@ -66,6 +66,24 @@ func TestTCPQUICRunsExistingAuthConnectAndHalfClose(t *testing.T) {
 			c.Write(append([]byte("reply-after-fin:"), body...))
 		}
 	}()
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), time.Second)
+	probe, _, e := pool.Open(probeCtx)
+	if e != nil {
+		t.Fatal(e)
+	}
+	probe.SetDeadline(time.Now().Add(time.Second))
+	tunnel.SendAuth(probe, cfg.AuthToken)
+	io.WriteString(probe, "HEALTH\n")
+	probeReader := bufio.NewReader(probe)
+	for range 2 {
+		line, e := tunnel.ReadLine(probeReader)
+		if e != nil || line != "OK" {
+			t.Fatal("health", line, e)
+		}
+	}
+	probe.Close()
+	probeCancel()
+
 	for _, token := range []string{"wrong-token", cfg.AuthToken} {
 		requestCtx, stop := context.WithTimeout(context.Background(), 3*time.Second)
 		c, _, e := pool.Open(requestCtx)
