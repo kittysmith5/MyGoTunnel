@@ -27,6 +27,7 @@ type remoteSession struct {
 	PoolAcquireDuration   time.Duration
 	AckDuration           time.Duration
 	PoolHit, PoolFallback bool
+	StreamReused          bool
 	Stage                 string
 }
 

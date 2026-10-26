@@ -367,17 +367,58 @@ func (c *Conn) ReadPacket() (datagram.Packet, error) {
 // write deadline aborts this association, interrupting SendDatagram without a
 // per-packet goroutine or an unbounded application send queue.
 func (c *Conn) WritePacket(packet []byte) error {
+	return c.writeSession(func() error { return c.writePacketLocked(packet, nil) })
+}
+
+// WritePacketQueue keeps at most one large and one small payload in flight.
+// Existing v1 packet IDs allow fragments of different packets to interleave.
+// A small packet can run after eight large fragments, without splitting TLS
+// frames, adding an unbounded queue, or extending the large packet's deadline.
+func (c *Conn) WritePacketQueue(queue interface {
+	TryPop() (datagram.Packet, bool)
+}, timeout time.Duration) (int, error) {
+	sent := 0
+	err := c.writeSession(func() error {
+		interleave := func() error {
+			small, ok := queue.(interface {
+				TryPopSmall(int) (datagram.Packet, bool)
+			})
+			if !ok || sent >= 32 {
+				return nil
+			}
+			packet, ok := small.TryPopSmall(compactWireSize - 2)
+			if !ok {
+				return nil
+			}
+			defer packet.Release()
+			sent++
+			return c.writePacketLocked(packet.Data, nil)
+		}
+		for sent < 32 {
+			packet, ok := queue.TryPop()
+			if !ok {
+				return nil
+			}
+			sent++
+			e := c.SetWriteDeadline(time.Now().Add(timeout))
+			if e == nil {
+				e = c.writePacketLocked(packet.Data, interleave)
+			}
+			packet.Release()
+			if e != nil {
+				return e
+			}
+		}
+		return nil
+	})
+	return sent, err
+}
+func (c *Conn) writeSession(write func() error) error {
 	if !c.enabled.Load() {
 		return ErrNotAuthorized
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	count, err := FragmentCount(len(packet))
-	if err != nil {
-		return err
-	}
-	id := c.id
-	c.id++
 	c.mu.Lock()
 	if !c.writeUntil.IsZero() && !time.Now().Before(c.writeUntil) {
 		c.mu.Unlock()
@@ -394,6 +435,15 @@ func (c *Conn) WritePacket(packet []byte) error {
 		}
 		c.mu.Unlock()
 	}()
+	return write()
+}
+func (c *Conn) writePacketLocked(packet []byte, interleave func() error) error {
+	count, err := FragmentCount(len(packet))
+	if err != nil {
+		return err
+	}
+	id := c.id
+	c.id++
 	if c.compact && c.compactReady(len(packet), time.Now()) && len(packet)+2 <= compactWireSize &&
 		(len(packet)+2 <= c.compactLimit || !time.Now().Before(c.compactProbe)) {
 		c.wire[0], c.wire[1] = 'P', 2
@@ -431,15 +481,16 @@ func (c *Conn) WritePacket(packet []byte) error {
 			}
 		}
 		c.fragmentEnqueues.Add(1)
+		if (i+1)%8 == 0 && i+1 < count && interleave != nil {
+			if e := interleave(); e != nil {
+				return e
+			}
+		}
 	}
 	return nil
 }
 
-// Keep the original packetization during the start of a large-packet burst.
-// The high-RTT burst comparison regressed when packetization switched at
-// once. Give congestion startup three RTTs before switching. This never waits
-// or buffers: v1 sends now.
-// Called under writeMu; small packets do not need this transition.
+// Keep original packetization during the bounded start of a large-packet burst.
 func (c *Conn) compactReady(size int, now time.Time) bool {
 	if size <= fragmentPayload {
 		return true

@@ -47,19 +47,36 @@ func Check(role, path string, health bool) int {
 				}
 				if health {
 					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					entry, e := preconnect.Prepare(ctx, cfg)
-					if e != nil {
-						r.OK = false
-						r.Code = "REMOTE_CONTROL_UNHEALTHY"
+					if cfg.TCPTransportMode() == "quic" {
+						if e := probeTCPStreamControl(ctx, cfg.TCPQUICRemote(), cfg.SNI, cfg.CertificateFingerprint, cfg.AuthToken); e != nil {
+							r.OK = false
+							r.Code = "REMOTE_TCP_QUIC_UNHEALTHY"
+						}
 					} else {
-						_ = entry.Conn.Close()
-						if cfg.UDPTransportMode() == "quic" {
-							if e := probeQUICControl(ctx, cfg.UDPQUICRemote(), cfg.SNI, cfg.CertificateFingerprint, cfg.AuthToken); e != nil {
-								r.OK = false
-								r.Code = "REMOTE_UDP_QUIC_UNHEALTHY"
-							}
+						entry, e := preconnect.Prepare(ctx, cfg)
+						if e != nil {
+							r.OK = false
+							r.Code = "REMOTE_CONTROL_UNHEALTHY"
+						} else {
+							_ = entry.Conn.Close()
 						}
 					}
+					if r.OK && cfg.TCPTransportMode() == "quic" && cfg.UDPTransportMode() == "tcp" {
+						entry, e := preconnect.Prepare(ctx, cfg)
+						if e != nil {
+							r.OK = false
+							r.Code = "REMOTE_CONTROL_UNHEALTHY"
+						} else {
+							_ = entry.Conn.Close()
+						}
+					}
+					if r.OK && cfg.UDPTransportMode() == "quic" {
+						if e := probeQUICControl(ctx, cfg.UDPQUICRemote(), cfg.SNI, cfg.CertificateFingerprint, cfg.AuthToken); e != nil {
+							r.OK = false
+							r.Code = "REMOTE_UDP_QUIC_UNHEALTHY"
+						}
+					}
+
 					cancel()
 				}
 			}
@@ -107,6 +124,32 @@ func Check(role, path string, health bool) int {
 			}
 		}
 	}
+	if role == "server" && health && r.OK {
+		cfg, e := config.LoadServerConfig(path)
+		if e == nil && cfg.TCPQUICListenAddr != "" {
+			cert, e := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+			if e != nil {
+				r.OK = false
+				r.Code = "CERT_KEY_INVALID"
+			} else {
+				address, e := localListenerAddress(cfg.TCPQUICListenAddr)
+				if e != nil {
+					r.OK = false
+					r.Code = "TCP_QUIC_LISTENER_UNHEALTHY"
+				} else {
+					pin := sha256.Sum256(cert.Certificate[0])
+					ctx, cancel := context.WithTimeout(context.Background(), quicHealthTimeout)
+					e = probeTCPStreamControl(ctx, address, "", hex.EncodeToString(pin[:]), cfg.AuthToken)
+					cancel()
+					if e != nil {
+						r.OK = false
+						r.Code = "TCP_QUIC_LISTENER_UNHEALTHY"
+					}
+				}
+			}
+		}
+	}
+
 	if json.NewEncoder(os.Stdout).Encode(r) != nil {
 		return 1
 	}

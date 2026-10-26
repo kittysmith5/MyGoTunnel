@@ -15,9 +15,11 @@ var ErrHalfCloseUnsupported = errors.New("connection does not support CloseWrite
 
 // DirectionResult describes one direction of a bidirectional relay.
 type DirectionResult struct {
-	Bytes int64
-	Err   error
-	Phase string
+	Bytes             int64
+	Err               error
+	Phase             string
+	FirstByteSeen     bool
+	FirstByteDuration time.Duration
 }
 
 // Result contains transfer statistics for both directions and the error that
@@ -60,10 +62,20 @@ func CopyBidirectional(a net.Conn, aReader io.Reader, b net.Conn, bReader io.Rea
 // is canceled. Cancellation force-closes BOTH transports and waits for workers;
 // callers should supply a grace-expiry context rather than process cancellation.
 func CopyBidirectionalContext(ctx context.Context, a net.Conn, aReader io.Reader, b net.Conn, bReader io.Reader) Result {
+	return copyObserved(ctx, a, aReader, b, bReader, nil)
+}
+
+// CopyBidirectionalObservedContext emits at most one first-data observation in
+// each direction, relative to relay entry. Prebuffered data is already available.
+func CopyBidirectionalObservedContext(ctx context.Context, a net.Conn, aReader io.Reader, b net.Conn, bReader io.Reader, observe func(string, time.Duration)) Result {
+	return copyObserved(ctx, a, aReader, b, bReader, observe)
+}
+func copyObserved(ctx context.Context, a net.Conn, aReader io.Reader, b net.Conn, bReader io.Reader, observe func(string, time.Duration)) Result {
 	resultCh := make(chan copyResult, 2)
 
-	go copyDirection(resultCh, directionAToB, b, aReader)
-	go copyDirection(resultCh, directionBToA, a, bReader)
+	started := time.Now()
+	go copyDirectionObserved(resultCh, directionAToB, b, aReader, started, observe)
+	go copyDirectionObserved(resultCh, directionBToA, a, bReader, started, observe)
 
 	aborted := false
 	var abortErr error
@@ -128,6 +140,14 @@ func abortTransports(conns ...net.Conn) error {
 }
 
 func copyDirection(resultCh chan<- copyResult, direction direction, dst net.Conn, src io.Reader) {
+	copyDirectionObserved(resultCh, direction, dst, src, time.Now(), nil)
+}
+func copyDirectionObserved(resultCh chan<- copyResult, direction direction, dst net.Conn, src io.Reader, started time.Time, observe func(string, time.Duration)) {
+	first := firstCopy{started: started}
+	if observe != nil {
+		first.notify = func(d time.Duration) { observe(directionName(direction), d) }
+		src = firstReader{src, &first}
+	}
 	written, copyErr := io.Copy(dst, src)
 	var shutdownErr error
 	if copyErr == nil {
@@ -143,7 +163,8 @@ func copyDirection(resultCh chan<- copyResult, direction direction, dst net.Conn
 	resultCh <- copyResult{
 		direction: direction,
 		result: DirectionResult{
-			Bytes: written,
+			Bytes:         written,
+			FirstByteSeen: first.seen, FirstByteDuration: first.elapsed,
 			Phase: phase,
 			Err: errors.Join(
 				wrapError("copy stream", copyErr),

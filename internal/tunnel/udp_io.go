@@ -77,6 +77,22 @@ func (w *DatagramQueueWriter) WriteQueue(queue interface {
 	if w.packets == nil {
 		return WriteDatagramQueue(w.buffered, queue)
 	}
+	if batch, ok := w.conn.(interface {
+		WritePacketQueue(interface {
+			TryPop() (datagram.Packet, bool)
+		}, time.Duration) (int, error)
+	}); ok {
+		started := time.Now()
+		count, err := batch.WritePacketQueue(queue, w.timeout)
+		if count > 0 && err == nil {
+			err = w.conn.SetWriteDeadline(time.Time{})
+		}
+		if count > 0 || err != nil {
+			w.record(started, err)
+		}
+		return err
+	}
+
 	for i := 0; i < 32; i++ {
 		packet, ok := queue.TryPop()
 		if !ok {

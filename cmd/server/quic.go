@@ -21,9 +21,12 @@ import (
 // QUIC uses its own ALPN and TLS 1.3, with the same atomically published
 // certificate snapshots as TCP. Tickets and application 0-RTT are disabled.
 func (m *certificateManager) quicTLSConfig() *tls.Config {
+	return m.quicTLSConfigProtocols(quicudp.Protocols())
+}
+func (m *certificateManager) quicTLSConfigProtocols(protocols []string) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13,
-		NextProtos: quicudp.Protocols(),
+		NextProtos: protocols,
 		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
 			snapshot := m.current.Load().Clone()
 			snapshot.MinVersion = tls.VersionTLS13

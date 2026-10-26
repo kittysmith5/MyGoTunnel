@@ -500,3 +500,13 @@ TLS 握手在 AUTH 前完成，来源限速无法避免所有握手 CPU 消耗�
 版本包清单由 Ed25519 私钥签名，升级器从 `/etc/mygotunnel/release-keys/<key-id>.pub.pem` 的 root 管理信任目录选择公钥，并在停服务前验证签名、平台二进制哈希、构建版本和提交。发布私钥用 `scripts/generate-release-key.sh` 生成，离线保存；`scripts/release.sh VERSION OUTPUT PRIVATE_KEY.pem` 要求私钥 mode 0600，生成已签名 bundle。公钥需经可信渠道预装到两台机器的 root 信任目录；不能从待验证 bundle 自动建立信任。加入新公钥后先用新钥发布并验证，再移除旧公钥。签名只验证发布者和文件完整性，不替代 root 权限保护、配置权限或回滚备份保护。
 
 升级和回滚的候选二进制先复制到 root 管理目录中的0700临时目录；拒绝符号链接、特殊文件及超过256MiB的候选文件。升级只执行、检查和安装完成哈希验证的私有副本，避免校验后原 bundle 文件被替换；回滚也对备份副本校验后执行。该暂存目录在操作完成后清理。
+
+LA 分支另有默认关闭的 [TCP-over-QUIC Stream 实验](docs/la-tcp-quic.md)。通过 `tcp_transport=quic` 与独立 `tcp_quic_remote_addr` 选择，服务端使用 `tcp_quic_listen_addr`；不自动降级或重放业务。
+
+TCP 计时新增 `node_dns_duration`、`node_tcp_duration`，分别观察客户端解析节点与建立TCP连接；旧 `tcp_duration` 仍包含DNS，保持原含义，不能再与新子阶段相加。TLS预连接命中时前台这些新拨号阶段为0，后台准备日志保留实际值。QUIC TCP新物理连接也报告节点DNS，握手单列 `tcp_quic_handshake_duration`。
+
+TCP关闭/失败日志新增 `first_up_duration/first_down_duration`，仅在对应方向观察到业务字节时出现，以进入relay为起点。预读数据视为进入时已可用；计时包含应用等待，不表示HTTP TTFB、成功送达或线路RTT。DEBUG `first_data` 最多每方向一次，可在长连接未结束时查看；默认INFO不额外输出两条事件。不解密或记录业务内容，继续保留ReaderFrom/WriterTo与半关闭语义。
+
+UDP客户端上行按目标公平调度，总容量仍256包、原配置字节/年龄和共享payload预算。最多256个目标索引，空目标在压力时回收；键只在新流成功准入时复制，元数据额外有界、不冒充payload预算。新增 `request_fair_evictions/request_peak_flows`。单目标容量不缩减，低积压目标可淘汰最大积压目标的包；evictions属于queue_full_drops，不能重复相加。
+
+QUIC发送保留一个大包，每8片允许另一个目标的队头小包先发，不重排同目标队头，不修改v1分片wire。最多一个大包和一个小包在途，仍受共享Resources计费、每批最多32个完整包。小包不延长正在发送的大包写期限；新完整包重新起算独立udp_write_timeout_ms，部分失败仍终止关联并回收所有所有权。TLS/TCP载体不交错其帧内容。QUIC的udp_tunnel_write_calls/max_duration现在以一次有界batch调用统计，不是每片或每包耗时，不能直接跨版本按调用数比较。

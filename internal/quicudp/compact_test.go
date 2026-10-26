@@ -121,3 +121,39 @@ func TestCompactReceiveBudgetAndValidation(t *testing.T) {
 		t.Fatal("payload leaked")
 	}
 }
+
+func TestFragmentQuantumLetsAnotherTargetSmallPacketFinishFirst(t *testing.T) {
+	p := newTransportPair(t, time.Second)
+	authorizePair(t, p)
+	q := datagram.NewKeyedQueue(8, 1<<20, time.Second, p.resources)
+	defer q.Close()
+	big := bytes.Repeat([]byte{3}, 65000)
+	small := bytes.Repeat([]byte{7}, 64)
+	if !q.PushKeyCopy([]byte("bulk"), big) || !q.PushKeyCopy([]byte("interactive"), small) {
+		t.Fatal("admission failed")
+	}
+	sent := make(chan error, 1)
+	go func() { _, e := p.client.WritePacketQueue(q, time.Second); sent <- e }()
+	p.server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	first, e := p.server.ReadPacket()
+	if e != nil {
+		t.Fatal(e)
+	}
+	ok := bytes.Equal(first.Data, small)
+	first.Release()
+	if !ok {
+		t.Fatal("small packet waited for all large fragments")
+	}
+	second, e := p.server.ReadPacket()
+	if e != nil {
+		t.Fatal(e)
+	}
+	ok = bytes.Equal(second.Data, big)
+	second.Release()
+	if !ok {
+		t.Fatal("interleaving corrupted large packet")
+	}
+	if e = <-sent; e != nil {
+		t.Fatal(e)
+	}
+}

@@ -203,7 +203,7 @@ func handleUDPAssociateWithPools(parent context.Context, clientConn net.Conn, re
 		"socks_duration", socksDuration, "pool_hit", session.PoolHit,
 		"pool_fallback", session.PoolFallback, "pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
-		"tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed,
+		"tcp_duration", session.Dial.TCPDuration, "node_dns_duration", session.Dial.NodeDNSDuration, "node_tcp_duration", session.Dial.NodeTCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed,
 		"udp_quic_handshake_duration", session.QUICDuration,
 		"control_duration", session.ControlDuration, "setup_duration", time.Since(startedAt))
 
@@ -226,7 +226,7 @@ func handleUDPAssociateWithPools(parent context.Context, clientConn net.Conn, re
 	var clientUDPmu sync.Mutex
 	maxBytes, maxAge := cfg.QueueLimits()
 	responses := datagram.NewQueue(128, maxBytes, maxAge, nil, resources)
-	requests := datagram.NewQueue(udpFrameQueueSize, maxBytes, maxAge, nil, resources)
+	requests := datagram.NewKeyedQueue(udpFrameQueueSize, maxBytes, maxAge, resources)
 	tunnelWriter := tunnel.NewDatagramQueueWriter(remoteConn, cfg.WriteTimeout())
 	var uploaded atomic.Uint64
 	var downloaded atomic.Uint64
@@ -269,6 +269,7 @@ func handleUDPAssociateWithPools(parent context.Context, clientConn net.Conn, re
 			"dropped_datagrams", dropped.Load()+in.ExpiredDrops+out.ExpiredDrops,
 			"queue_full_drops", in.FullDrops+out.FullDrops, "queue_expired_drops", in.ExpiredDrops+out.ExpiredDrops,
 			"queue_resource_drops", in.ResourceDrops+out.ResourceDrops,
+			"request_fair_evictions", in.EvictedDrops, "request_peak_flows", in.PeakFlows,
 			"request_queue_peak_bytes", in.PeakBytes, "response_queue_peak_bytes", out.PeakBytes,
 			"udp_write_errors", writeErrors.Load(), "duration", time.Since(startedAt))
 	}()
@@ -382,7 +383,8 @@ func handleUDPAssociateWithPools(parent context.Context, clientConn net.Conn, re
 			dropped.Add(1)
 			continue
 		}
-		if err := socks5.ValidateUDPDatagram(packet[:n]); err != nil {
+		header, _, parseErr := socks5.ParseUDPHeader(packet[:n])
+		if err := parseErr; err != nil {
 			invalidDrops++
 			dropped.Add(1)
 			logger.Debug("drop malformed SOCKS5 UDP datagram", "error", err)
@@ -402,7 +404,7 @@ func handleUDPAssociateWithPools(parent context.Context, clientConn net.Conn, re
 			return
 		default:
 		}
-		if requests.PushCopy(packet[:n]) {
+		if requests.PushKeyCopy(packet[3:header.Size], packet[:n]) {
 			uploaded.Add(1)
 		} else {
 			dropped.Add(1)

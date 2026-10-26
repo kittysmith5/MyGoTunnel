@@ -72,7 +72,7 @@ var shortKeys = map[string]string{
 	"error_operation": "op", "error_endpoint": "endpoint", "error_errno": "errno", "error_local_addr": "error_local", "error_remote_addr": "error_remote",
 	"failure_phase":             "phase",
 	"socks_first_byte_duration": "sfirst", "socks_method_duration": "smethod", "socks_auth_duration": "sauth", "socks_request_duration": "sreq",
-	"pool_renewed": "renewed", "pool_retry": "retry", "dns_duration": "dns", "target_tcp_duration": "target_tcp", "dns_retry_count": "dns_retry", "pool_hits": "hit", "pool_misses": "miss", "pool_fallbacks": "fallbacks", "pool_hit_rate": "hit_pct", "pool_target": "pool_target", "pool_filling": "filling",
+	"pool_renewed": "renewed", "pool_retry": "retry", "tcp_quic_handshake_duration": "qstream", "tcp_quic_reused": "stream_reused", "tcp_tunnel_transport": "carrier", "request_fair_evictions": "req_evictions", "request_peak_flows": "req_flows", "node_dns_duration": "node_dns", "node_tcp_duration": "node_tcp", "first_data_duration": "first", "first_up_duration": "first_up", "first_down_duration": "first_down", "dns_duration": "dns", "target_tcp_duration": "target_tcp", "dns_retry_count": "dns_retry", "pool_hits": "hit", "pool_misses": "miss", "pool_fallbacks": "fallbacks", "pool_hit_rate": "hit_pct", "pool_target": "pool_target", "pool_filling": "filling",
 	"connection_id": "id", "client_addr": "peer", "remote_addr": "server", "listen_addr": "listen",
 	"config_path": "config", "socks_duration": "socks", "tcp_duration": "tcp", "tls_duration": "tls",
 	"pool_ack_duration": "ack", "tls_resumed": "resumed",

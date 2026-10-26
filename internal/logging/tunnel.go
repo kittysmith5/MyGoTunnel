@@ -16,6 +16,13 @@ func LogTunnelResult(logger *slog.Logger, result relay.Result, startedAt time.Ti
 		"duration", time.Since(startedAt),
 	}
 
+	if result.AToB.FirstByteSeen {
+		attributes = append(attributes, "first_up_duration", result.AToB.FirstByteDuration)
+	}
+	if result.BToA.FirstByteSeen {
+		attributes = append(attributes, "first_down_duration", result.BToA.FirstByteDuration)
+	}
+
 	if result.Err != nil {
 		phase := result.FailurePhase
 		if phase == "" {
@@ -47,4 +54,11 @@ func LogTunnelResult(logger *slog.Logger, result relay.Result, startedAt time.Ti
 	}
 
 	logger.Info("closed", append(attributes, "close_reason", "eof")...)
+}
+
+// FirstDataObserver logs at most two events per TCP relay, without payloads.
+func FirstDataObserver(logger *slog.Logger) func(string, time.Duration) {
+	return func(direction string, elapsed time.Duration) {
+		logger.Debug("first_data", "direction", direction, "first_data_duration", elapsed)
+	}
 }

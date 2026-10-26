@@ -36,6 +36,11 @@ func Dial(ctx context.Context, dialer *net.Dialer, network, address string) (net
 	return dialWith(ctx, dialer.DialContext, network, address)
 }
 
+// DialOnce observes DNS and TCP without adding retries or changing dialer policy.
+func DialOnce(ctx context.Context, dialer *net.Dialer, network, address string) (net.Conn, Timings, error) {
+	return dialOnce(ctx, dialer.DialContext, network, address)
+}
+
 type dialFunc func(context.Context, string, string) (net.Conn, error)
 
 func dialWith(ctx context.Context, dial dialFunc, network, address string) (net.Conn, Timings, error) {

@@ -250,7 +250,7 @@ func (p *Pool) fill(old *Entry) {
 		if entry.QUICDuration > 0 {
 			p.logger.Debug("pool prepared", "udp_tunnel_transport", "quic", "udp_quic_handshake_duration", entry.QUICDuration)
 		} else {
-			p.logger.Debug("pool prepared", "tls_duration", entry.DialTimings.TLSDuration, "tls_resumed", entry.DialTimings.TLSResumed)
+			p.logger.Debug("pool prepared", "node_dns_duration", entry.DialTimings.NodeDNSDuration, "node_tcp_duration", entry.DialTimings.NodeTCPDuration, "tls_duration", entry.DialTimings.TLSDuration, "tls_resumed", entry.DialTimings.TLSResumed)
 		}
 	}
 	if retired != nil {

@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
+	"mygotunnel/internal/dialmetrics"
 	"net"
 	"strings"
 	"time"
@@ -22,10 +23,12 @@ var _ closeWriter = (*utls.UConn)(nil)
 
 // DialTimings separates TCP connection establishment (including DNS) from TLS.
 type DialTimings struct {
-	TCPDuration time.Duration
-	TLSDuration time.Duration
-	Stage       string
-	TLSResumed  bool
+	TCPDuration     time.Duration
+	NodeDNSDuration time.Duration
+	NodeTCPDuration time.Duration
+	TLSDuration     time.Duration
+	Stage           string
+	TLSResumed      bool
 }
 
 type Options struct {
@@ -58,7 +61,8 @@ func dialWithOptions(ctx context.Context, remoteAddr, sni, fingerprint string, o
 	dialer := &net.Dialer{}
 	timings.Stage = "tcp"
 	tcpStarted := time.Now()
-	tcpConn, err := dialer.DialContext(ctx, "tcp", remoteAddr)
+	tcpConn, phases, err := dialmetrics.DialOnce(ctx, dialer, "tcp", remoteAddr)
+	timings.NodeDNSDuration, timings.NodeTCPDuration = phases.DNS, phases.TCP
 	timings.TCPDuration = time.Since(tcpStarted)
 	if err != nil {
 		return nil, timings, err

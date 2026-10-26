@@ -27,6 +27,7 @@ import (
 	"mygotunnel/internal/ingress"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/operations"
+	"mygotunnel/internal/quicstream"
 	"mygotunnel/internal/quicudp"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/setupwatch"
@@ -202,6 +203,18 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		}
 		defer listener.Close()
 	}
+	if cfg.TCPQUICListenAddr != "" {
+		streams, e := quicstream.Listen(cfg.TCPQUICListenAddr, certificates.quicTLSConfigProtocols([]string{quicstream.ALPN}), resources, opts.maxConnections, maxSetup)
+		if e != nil {
+			return fmt.Errorf("listen for TCP QUIC: %w", e)
+		}
+		defer streams.Shutdown(grace)
+		listener, e = admission.MergeListeners(listener, streams)
+		if e != nil {
+			return e
+		}
+		defer listener.Close()
+	}
 	stopReload := watchCertificateReload(certificates, logger)
 	defer stopReload()
 
@@ -209,7 +222,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"version", buildinfo.Current().Version,
 		"commit", buildinfo.Current().Commit,
 		"listen_addr", cfg.ListenAddr,
-		"udp_quic_listen_addr", cfg.UDPQUICListenAddr,
+		"udp_quic_listen_addr", cfg.UDPQUICListenAddr, "tcp_quic_listen_addr", cfg.TCPQUICListenAddr,
 		"alpn", "http/1.1",
 		"timezone", "UTC",
 		"max_connections", opts.maxConnections,
@@ -237,6 +250,9 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		if _, ok := conn.(*quicudp.Conn); ok {
 			handleQUICUDPTunnelWithPool(conn, cfg, logger, permit, poolOptions, authLimiter, resources)
 			return
+		}
+		if _, ok := conn.(*quicstream.Stream); ok {
+			poolOptions.entrance = nil
 		}
 		handleTunnelContextWithLimiter(ctx, conn, cfg, logger, permit.Release, poolOptions, authLimiter, resources)
 	}, nil, metrics, gate)
@@ -304,6 +320,13 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 		}
 	}
 
+	if stream, ok := tunnelConn.(*quicstream.Stream); ok {
+		stream.MarkAuthenticated()
+		if poolOptions != nil && poolOptions.releasePreAuth != nil {
+			poolOptions.releasePreAuth()
+		}
+		connectionLogger = connectionLogger.With("tcp_tunnel_transport", "quic")
+	}
 	authDuration := time.Since(authStarted)
 	connectStarted := time.Now()
 	connectDeadline := time.Now().Add(tunnel.ControlTimeout)
@@ -332,6 +355,10 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 	}
 
 	if line == "UDP" {
+		if _, ok := tunnelConn.(*quicstream.Stream); ok {
+			logging.Failure(connectionLogger, "connect", fmt.Errorf("UDP is not supported on TCP QUIC streams"))
+			return
+		}
 		if commandACK {
 			if err := acknowledgePrepared(tunnelConn, connectDeadline); err != nil {
 				logging.Failure(connectionLogger, "ack", err)
@@ -412,7 +439,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 	if poolOptions != nil && poolOptions.abortContext != nil {
 		abortContext = poolOptions.abortContext
 	}
-	result := relay.CopyBidirectionalContext(abortContext, tunnelConn, reader, targetConn, targetConn)
+	result := relay.CopyBidirectionalObservedContext(abortContext, tunnelConn, reader, targetConn, targetConn, logging.FirstDataObserver(requestLogger))
 	logging.LogTunnelResult(requestLogger, result, startedAt, "tunnel", "target")
 }
 

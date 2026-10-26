@@ -356,3 +356,11 @@ SOCKS 凭据 provider 在方法选择和完整读取凭据后的实际比较前�
 升级和回滚须先将普通候选文件复制到 root 管理目录中的0700暂存目录，再验证副本哈希、执行和安装同一副本；拒绝 symlink/特殊文件及大于256MiB的文件，不能验证后执行原 bundle 路径。操作结束清理暂存；禁止更改配置、unit、信任公钥保护或实际运行哈希检查。
 
 连接码 pin 保留 v1，ca 显式 v2 trust_mode，无指纹；旧版缺指纹及新版模式/指纹冲突必须 fail-closed。ca 导出验证系统链及公网主机名；客户端配置可显式 ca/pin，省略兼容推导。tls_session_cache 缺省关闭，不进入连接码；进程最多64项 LRU，按 remote/SNI/信任隔离；恢复握手仍验指纹或 CA 链/域名/有效期，不启用应用0-RTT、不省 AUTH。tls_resumed 布尔 JSON/text resumed，pool hit 前台无新握手，后台 DEBUG pool prepared 单独记录。服务端热加载仅替换证书快照，拒绝其他已识别配置变化，坏证书保留旧快照；新快照票据密钥独立并保留 Go 自动轮换，旧连接排空/半关闭语义不变。
+
+## LA 本轮计时、公平上行与 TCP QUIC 实验
+
+`tcp_transport`缺省tcp，可选quic；`tcp_quic_remote_addr`缺省remote_addr；服务端`tcp_quic_listen_addr`独立UDP socket，不能与UDP QUIC相同监听端点。TCP QUIC默认关闭，不进连接码。独立ALPN mygotunnel-tcp/1，最多2条客户端物理连接、每条64流；服务端额外硬限32物理连接，逐流共用应用admission/authlimit，逐流AUTH检查轮换，不在首认证前拨目标。首成功AUTH上限5秒；CA/pin、无0RTT、无业务重放或静默回退、Stream半关闭与reader预读不变量必须保留。listener.Close只停接单；Shutdown保留transport到配置grace到期再回收，不能在最后handler返回时立即丢掉尚待发送的FIN/数据。socket受共享Resources计数，QUIC流控/库内存不计managed UDP payload。文档docs/la-tcp-quic.md。
+
+节点node_dns_duration/node_tcp_duration为新子阶段，tcp_duration仍含DNS；不能重复相加。first_up/down_duration以relay进入为起点，只在观察到该方向字节时输出，预读已经可用不等于新接收，非HTTP TTFB或送达。DEBUG first_data每方向最多1条，INFO仅结束汇总，不能增加逐包计时/日志或破坏io.Copy的WriterTo/ReaderFrom选择。TCP QUIC复用单列tcp_quic_reused，不混入TLS pool_*或UDP quic_pool_*。
+
+客户端KeyedQueue复用FairQueue，payload容量仍256包/原字节年龄/共享预算；目标索引<=256，仅压力时回收空项，不能保留借用域名切片。req_evictions属于full拒绝事件，不重复计数。QUIC batch最多32完整包，每8大包分片允许其他目标队头<=1413字节的完整小包插入；最多一个大包加一个小包在途，发送scratch由同一writeMu保护，每新完整包起算独立write timeout，插入小包不得延长大包期限；部分失败关闭关联，所有Packet归还。无界writer goroutine、扩大队列或修改TLS帧边界均禁止。验证混发时小包先完成、大包完整、同目标顺序、过期/预算/关闭、TCP/QUIC半关闭、错误认证/证书/取消隔离及资源回收。

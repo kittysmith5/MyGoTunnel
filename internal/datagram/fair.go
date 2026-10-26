@@ -286,3 +286,30 @@ func (q *FairQueue) Stats() Stats {
 	s.Flows = len(q.largest)
 	return s
 }
+
+// TryPopSmall selects only a flow's head, never reordering one destination.
+// A QUIC fragment sender uses it between bounded quanta while retaining one
+// large packet. The scan is bounded by packet capacity and adds no metadata.
+func (q *FairQueue) TryPopSmall(maxSize int) (Packet, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := time.Now()
+	f := q.first
+	remaining := len(q.largest)
+	for i := 0; i < remaining && f != nil; i++ {
+		next := f.next
+		q.expireFlow(f, now)
+		if f.packets > 0 && len(q.nodes[f.head].packet.Data) <= maxSize {
+			p := q.removeHead(f)
+			if f.packets > 0 {
+				q.first = f.next
+			}
+			if q.size > 0 {
+				q.notify()
+			}
+			return p, true
+		}
+		f = next
+	}
+	return Packet{}, false
+}

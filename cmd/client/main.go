@@ -22,6 +22,8 @@ import (
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/operations"
 	"mygotunnel/internal/preconnect"
+	"mygotunnel/internal/quicstream"
+	"mygotunnel/internal/quicudp"
 	"mygotunnel/internal/relay"
 	"mygotunnel/internal/setupwatch"
 	"mygotunnel/internal/socks5"
@@ -155,7 +157,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"version", buildinfo.Current().Version,
 		"commit", buildinfo.Current().Commit,
 		"listen_addr", cfg.LocalAddr,
-		"remote_addr", cfg.RemoteAddr,
+		"remote_addr", cfg.RemoteAddr, "tcp_transport", cfg.TCPTransportMode(), "tcp_quic_remote_addr", cfg.TCPQUICRemoteAddr,
 		"sni", cfg.SNI,
 		"trust_mode", cfg.EffectiveTrustMode(),
 		"tls_session_cache", cfg.TLSSessionCache,
@@ -169,7 +171,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	)
 
 	var pool *preconnect.Pool
-	if opts.poolSize > 0 {
+	if opts.poolSize > 0 && (cfg.TCPTransportMode() == "tcp" || cfg.UDPTransportMode() == "tcp") {
 		pool, err = preconnect.New(preconnect.Options{Size: opts.poolSize, MaxSize: opts.poolMax, IdleSize: opts.poolIdleSize, IdleAfter: opts.poolIdleAfter}, preconnect.NewPreparer(cfg), logger)
 		if err != nil {
 			return err
@@ -188,6 +190,23 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		stopPool := context.AfterFunc(ctx, quicPool.Close)
 		defer stopPool()
 	}
+	var streamPool *quicstream.Pool
+	if cfg.TCPTransportMode() == "quic" {
+		tc, e := quicudp.ClientTLSConfig(cfg.TCPQUICRemote(), cfg.SNI, cfg.CertificateFingerprint)
+		if e != nil {
+			return e
+		}
+		streamPool = quicstream.NewPool(cfg.TCPQUICRemote(), tc, resources)
+		defer streamPool.CloseAfterGrace(grace)
+		done := make(chan struct{})
+		stop := context.AfterFunc(ctx, func() { streamPool.Drain(); close(done) })
+		defer func() {
+			if stop() {
+				close(done)
+			}
+			<-done
+		}()
+	}
 	metrics := &admission.Counters{}
 	stopStats := logging.StartStats(logger, 30*time.Second, func() []any {
 		idle := 0
@@ -204,11 +223,15 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		attrs = append(attrs, "quic_pool_idle", qs.Idle, "quic_pool_max", qs.Max, "quic_pool_filling", qs.Filling,
 			"quic_pool_hits", qs.Hits, "quic_pool_misses", qs.Misses, "quic_pool_fallbacks", qs.Fallbacks,
 			"quic_pool_hit_rate", qs.HitRate, "quic_pool_renewed", qs.Renewed, "quic_pool_retry", qs.Retry)
+		if streamPool != nil {
+			connections, streams := streamPool.Stats()
+			attrs = append(attrs, "tcp_quic_connections", connections, "tcp_quic_streams", streams)
+		}
 		return append(attrs, logging.UDPResourceAttrs(resources)...)
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, ln, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		handleClientWithPools(ctx, conn, cfg, logger, permit.Release, pool, quicPool, resources, authLimiter, permit.AbortContext())
+		handleClientWithTransports(ctx, conn, cfg, logger, permit.Release, pool, quicPool, streamPool, resources, authLimiter, permit.AbortContext())
 	}, nil, metrics)
 }
 
@@ -233,6 +256,10 @@ func handleClientWithResourcesAndAuthLimiter(parent context.Context, clientConn 
 }
 
 func handleClientWithPools(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pool, quicPool *preconnect.Pool, resources *datagram.Resources, authLimiter *authlimit.Limiter, abortContexts ...context.Context) {
+	handleClientWithTransports(parent, clientConn, cfg, logger, releaseSetup, pool, quicPool, nil, resources, authLimiter, abortContexts...)
+}
+func handleClientWithTransports(parent context.Context, clientConn net.Conn, cfg *config.ClientConfig, logger *slog.Logger, releaseSetup func(), pool, quicPool *preconnect.Pool, streamPool *quicstream.Pool, resources *datagram.Resources, authLimiter *authlimit.Limiter, abortContexts ...context.Context) {
+
 	defer clientConn.Close()
 
 	clientAddr := clientConn.RemoteAddr().String()
@@ -285,7 +312,7 @@ func handleClientWithPools(parent context.Context, clientConn net.Conn, cfg *con
 	}
 	targetAddr := net.JoinHostPort(request.Address, fmt.Sprint(request.Port))
 
-	requestLogger := connectionLogger.With("target_addr", targetAddr)
+	requestLogger := connectionLogger.With("target_addr", targetAddr, "tcp_tunnel_transport", cfg.TCPTransportMode())
 	requestLogger.Debug("connect")
 
 	// Bound the eventual SOCKS5 reply while remote setup runs.
@@ -298,7 +325,12 @@ func handleClientWithPools(parent context.Context, clientConn net.Conn, cfg *con
 	ctx, cancel := context.WithTimeout(parent, remoteSetupTimeout)
 	clientReader := bufio.NewReader(clientConn)
 	watch := setupwatch.Start(clientConn, clientReader, cancel)
-	session, err := openRemote(ctx, cfg, targetAddr, pool)
+	var session *remoteSession
+	if cfg.TCPTransportMode() == "quic" {
+		session, err = openRemoteTCPStream(ctx, cfg, targetAddr, streamPool)
+	} else {
+		session, err = openRemote(ctx, cfg, targetAddr, pool)
+	}
 	if watchErr := watch.Stop(setupDeadline); watchErr != nil {
 		if session.Conn != nil {
 			closeUnusedRemote(session.Conn)
@@ -307,7 +339,7 @@ func handleClientWithPools(parent context.Context, clientConn net.Conn, cfg *con
 	}
 	cancel()
 	if err != nil {
-		logging.Failure(requestLogger, session.Stage, err, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "pool_ack_duration", session.AckDuration, "tcp_duration", session.Dial.TCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed, "setup_duration", time.Since(startedAt))
+		logging.Failure(requestLogger, session.Stage, err, "tcp_quic_handshake_duration", session.QUICDuration, "tcp_quic_reused", session.StreamReused, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "pool_ack_duration", session.AckDuration, "tcp_duration", session.Dial.TCPDuration, "node_dns_duration", session.Dial.NodeDNSDuration, "node_tcp_duration", session.Dial.NodeTCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed, "setup_duration", time.Since(startedAt))
 		code := socks5.ReplyCode(err)
 		var typed *tunnel.TargetError
 		if !errors.As(err, &typed) && errors.Is(err, errTargetRejected) {
@@ -333,12 +365,12 @@ func handleClientWithPools(parent context.Context, clientConn net.Conn, cfg *con
 		return
 	}
 	releaseSetup()
-	requestLogger.Info("ready", "remote_addr", cfg.RemoteAddr,
+	requestLogger.Info("ready", "remote_addr", cfg.RemoteAddr, "tcp_transport", cfg.TCPTransportMode(), "tcp_quic_remote_addr", cfg.TCPQUICRemoteAddr,
 		"socks_duration", socksDuration,
-		"tcp_duration", session.Dial.TCPDuration,
+		"tcp_duration", session.Dial.TCPDuration, "node_dns_duration", session.Dial.NodeDNSDuration, "node_tcp_duration", session.Dial.NodeTCPDuration,
 		"tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed,
 		"control_duration", session.ControlDuration,
-		"pool_hit", session.PoolHit,
+		"tcp_quic_handshake_duration", session.QUICDuration, "tcp_quic_reused", session.StreamReused, "pool_hit", session.PoolHit,
 		"pool_fallback", session.PoolFallback,
 		"pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
@@ -347,6 +379,6 @@ func handleClientWithPools(parent context.Context, clientConn net.Conn, cfg *con
 	if len(abortContexts) > 0 && abortContexts[0] != nil {
 		abortContext = abortContexts[0]
 	}
-	result := relay.CopyBidirectionalContext(abortContext, clientConn, clientReader, remoteConn, remoteReader)
+	result := relay.CopyBidirectionalObservedContext(abortContext, clientConn, clientReader, remoteConn, remoteReader, logging.FirstDataObserver(requestLogger))
 	logging.LogTunnelResult(requestLogger, result, startedAt, "application", "tunnel")
 }
