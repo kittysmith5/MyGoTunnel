@@ -129,7 +129,7 @@ go run ./cmd/client -config configs/client.json -log-level debug -log-format jso
 
 LA QUIC UDP 需保留来源 strict/nat、SOCKS TCP 控制关闭即结束关联、CA/指纹验证、认证轮换与限速及进程资源预算；不用应用0-RTT，不在认证前转发。QUIC TLS 不等于 uTLS Chrome 或 HTTP/3 伪装。初版每个关联一条 QUIC 连接，TCP 与 QUIC 通过合并 listener 共享 admission 总连接/setup 限制；任一子 listener 致命失败必须终止合并入口，关闭时回收尚未交付的连接并 join 接受 worker。
 
-QUIC客户端独立固定备用池 `-quic-pool-size` 默认2、0关闭、最大32，只在QUIC配置启用；既有TCP池参数不控制该池。后台完整TLS/证书/AUTH并协商PREPARE ACK/READY ACK，服务端共用TCP idleSlots与60秒期限，等待释放setup，UDP命令前重取setup。池guard/TTL/退避/所有权复用preconnect.Pool；DATA仅在UDP最终OK后启用，前台取用后同一Reader且未消费业务才允许一次同端QUIC传输故障回退。明确LIMIT、认证拒绝、协议错误和取消不重试、不降级TCP。旧服务端不支持PREPARE则后台退避，前台普通QUIC保留。QUIC LIMIT行未送达时用独立应用关闭码0x104映射ErrLimit，factory归ErrBusy，前台归TargetError LIMIT；不得变成正常EOF引发重试。前台命中handshake=0，后台Debug记录真实QUICDuration，stats独立quic_pool_idle/max/filling/hits/misses/fallbacks/hit_rate/renewed/retry，原pool_* stats继续只指TCP。测试覆盖真实QUIC池guard交接、关闭已交接所有权、完整认证/错误pin、同端fallback与明确错误不重试、共享idle/setup/socket限制及退出回收。
+QUIC客户端独立有界备用池 `-quic-pool-size` 默认2、0关闭、最大32，只在QUIC配置启用；既有TCP池参数不控制该池。后台完整TLS/证书/AUTH并协商PREPARE ACK/READY ACK，服务端共用TCP idleSlots与60秒期限，等待释放setup，UDP命令前重取setup。池guard/TTL/退避/所有权复用preconnect.Pool；DATA仅在UDP最终OK后启用，前台取用后同一Reader且未消费业务才允许一次同端QUIC传输故障回退。明确LIMIT、认证拒绝、协议错误和取消不重试、不降级TCP。旧服务端不支持PREPARE则后台退避，前台普通QUIC保留。QUIC LIMIT行未送达时用独立应用关闭码0x104映射ErrLimit，factory归ErrBusy，前台归TargetError LIMIT；不得变成正常EOF引发重试。前台命中handshake=0，后台Debug记录真实QUICDuration，stats独立quic_pool_idle/max/filling/hits/misses/fallbacks/hit_rate/renewed/retry，原pool_* stats继续只指TCP。测试覆盖真实QUIC池guard交接、关闭已交接所有权、完整认证/错误pin、同端fallback与明确错误不重试、共享idle/setup/socket限制及退出回收。
 
 有效QUIC备用容量不超过udp_max_sockets-1；后台socket用Resources原子AcquireSocketWithReserve(1)为本地relay留一名额，前台正常申请仍可使用该余量。仅后台使用DialOptions.SocketReserve，不进JSON/连接码；低预算2名额时必须能取一条备用并成功建立本地relay。回退计时ControlDuration累加旧ACK等待与新控制阶段，不能覆盖导致小于AckDuration。
 
@@ -200,7 +200,7 @@ go build ./cmd/...
 
 可选-pool-idle-size（默认0关闭，启用为1..pool-size）与-pool-idle-after（默认2分钟）允许长期无需求后每30秒向更低空闲容量缩减；默认保持原floor。启动记录pool_idle_size；取用立即恢复正常size，交接连接不归池、不因收缩关闭；超出目标的备用自然到期。默认自适应及显式idle收缩都须保护一条fresh keeper：所有就绪都进入续期窗口时允许串行准备一条，完成时即使仍有surplus也可保留新连接；已有fresh keeper则不续建其他surplus，仍受hard max/共享退避约束。Take优先最近入池连接，旧连接继续guard/TTL，失效仍有ACK与fallback兜底；未使用TLS关闭走NetConn避免close_notify阻塞。测试覆盖默认/非法配置、空闲门槛与节奏、首个就绪连接、恢复与交接所有权、受控续期工作量对照；不以实验次数变化承诺线上P95提升。
 
-客户端 `-pool-size 4 -pool-max 16`：size 是备用容量下限，max 是自适应上限（均不含已经转发的连接）。当请求取用时就绪数不超过 1，目标容量增加 1，最多达到 max；取用、失效立即触发补充。连续 30 秒无取用后，每 30 秒目标容量减 1，最低回到 size。已有多余空闲连接自然到期释放，不中断正在使用的连接。此为需求耗尽驱动的保守自适应，不是基于 QPS/补充时长的预测算法。后台补充与 ready 总量受目标限制；收缩后已经启动的补充可能短暂超过新目标，但不超过 max。`-pool-max 0` 或等于 size 使用固定容量；`-pool-size 0` 禁用池。非零 max 必须不小于 size，最大 32；例如 size=32 时须同时指定 max=32。服务端 `-max-idle` 为所有客户端共享，扩容仍可能被 BUSY 拒绝，沿用有界退避。
+客户端 `-pool-size 4 -pool-max 16`：size 是正常需求下的备用容量下限（低需求策略可向1收缩），max 是自适应上限（均不含已经转发的连接）。当请求取用时就绪数不超过 1，目标容量增加 1，最多达到 max；取用、失效立即触发补充。连续 30 秒无取用后，每 30 秒目标容量减 1，最低回到 size。已有多余空闲连接自然到期释放，不中断正在使用的连接。此为需求耗尽驱动的保守自适应，不是基于 QPS/补充时长的预测算法。后台补充与 ready 总量受目标限制；收缩后已经启动的补充可能短暂超过新目标，但不超过 max。`-pool-max 0` 或等于 size 限制正常容量不扩容；同时关闭pool-adaptive-idle且IdleSize=0时使用固定容量；`-pool-size 0` 禁用池。非零 max 必须不小于 size，最大 32；例如 size=32 时须同时指定 max=32。服务端 `-max-idle` 为所有客户端共享，扩容仍可能被 BUSY 拒绝，沿用有界退避。
 
 每 30 秒 stats 新增：JSON `pool_hits/pool_misses/pool_fallbacks/pool_hit_rate/pool_target/pool_filling`，文本 `hit/miss/fallbacks/hit_pct/pool_target/filling`。hit/miss 统计启动以来的 Take 调用结果；命中指有效备用连接成功交接，不代表目标拨号成功；命中后传输错误转普通建连时同时增加 fallback。百分比为 100*hit/(hit+miss)，无请求为 0；禁用池时这些计数为 0，不将普通连接计为 miss。计数快照加锁，不改变流量和重试语义。
 
@@ -366,3 +366,11 @@ SOCKS 凭据 provider 在方法选择和完整读取凭据后的实际比较前�
 客户端KeyedQueue复用FairQueue，payload容量仍256包/原字节年龄/共享预算；目标索引<=256，仅压力时回收空项，不能保留借用域名切片。req_evictions属于full拒绝事件，不重复计数。QUIC batch最多32完整包，每8大包分片允许其他目标队头<=1413字节的完整小包插入；最多一个大包加一个小包在途，发送scratch由同一writeMu保护，每新完整包起算独立write timeout，插入小包不得延长大包期限；部分失败关闭关联，所有Packet归还。无界writer goroutine、扩大队列或修改TLS帧边界均禁止。验证混发时小包先完成、大包完整、同目标顺序、过期/预算/关闭、TCP/QUIC半关闭、错误认证/证书/取消隔离及资源回收。
 
 TCP QUIC健康探测在AUTH后发专用HEALTH，双OK后结束，不拨目标、不制造connect/EOF失败；仅独立TCP QUIC ALPN入口支持，旧TLS wire不变。
+
+## LA 突发握手与低需求、DNS负缓存
+
+客户端TLS新握手按run共用handshake.Scheduler，默认16/s、突发8、并发8、后台2、等待256/10秒；前台优先/FIFO，取消必须出队，AUTH OK后释放，不能跨目标拨号/relay占名额，命中池不排队，背景兼容重试每个新socket重新申请。TLS UDP同预算，QUIC独立边界不改。handshake_queue_duration/hwait与节点DNS/TCP/TLS和ACK分开，stats只计新握手调度，不输出凭据。入口Guard固定reason rate/concurrency/table计数与原IPLimited语义一致，不放宽防护。
+
+客户端pool-adaptive-idle默认true，两个池独立30秒窗口，<=2次取用视作低需求并每30秒下调1至max(1,显式IdleSize)，第3次恢复正常floor；不以零星探测永久保持full pool，不解析应用内容。保留45秒期限、容量、失败退避、guard交接及已取用所有权。原连续空闲策略与flag=false保持兼容，启动和stats显示策略状态。
+
+服务端每run NegativeCache共享TCP/UDP，1024项/10秒，只缓存明确IsNotFound且非temporary/timeout/canceled，resolver实例/地址族/主机名（保留末尾点）隔离，不缓存连接或成功地址；容量满旁路，过期惰性回收，首负结果期限不得被同批失败顺延。原标准resolver合并、Happy Eyeballs、临时DNS重试和最早拨号期限保留；不将整个Dial做singleflight而共享连接或阻塞其他目标拨号。缓存命中仍可errors.As(*net.DNSError)、返回原DNS代码，取消/期限优先。测试用本地DNS响应器验证并发合并、负缓存、过期恢复、策略隔离及暂时错误不缓存。

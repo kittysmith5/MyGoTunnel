@@ -481,3 +481,15 @@ func (target *udpTarget) recordFailure(err error) {
 		target.retries.failureAttempt(target, time.Now())
 	}
 }
+
+// Share the process DNS negative cache across TCP, TLS UDP and QUIC UDP targets.
+func targetUDPDial(options *serverPoolOptions) udpDialFunc {
+	d := &net.Dialer{}
+	if options == nil || options.dnsCache == nil {
+		return d.DialContext
+	}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		conn, _, err := options.dnsCache.Dial(ctx, d, network, address)
+		return conn, err
+	}
+}

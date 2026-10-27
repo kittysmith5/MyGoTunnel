@@ -173,6 +173,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 			<-shutdownDone
 		}()
 	}
+	dnsCache := dialmetrics.NewNegativeCache(1024, 10*time.Second)
 	resources := datagram.NewResources(cfg.ProcessLimits())
 	authLimiter := authlimit.New(4096, 5, time.Minute, time.Minute)
 	defer resources.Close()
@@ -239,6 +240,8 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	metrics := &admission.Counters{}
 	stopStats := logging.StartStats(logger, 30*time.Second, func() []any {
 		attrs := append([]any{"auth_rate_limited", authLimiter.Limited(), "active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", len(idleSlots), "max_idle", opts.maxIdle, "rejected", metrics.Rejected.Load()}, logging.UDPResourceAttrs(resources)...)
+		ns := dnsCache.Stats()
+		attrs = append(attrs, "dns_negative_cache_hits", ns.Hits, "dns_negative_cache_stored", ns.Stored, "dns_negative_cache_entries", ns.Entries)
 		if entrance != nil {
 			attrs = append(attrs, entrance.Metrics.Attrs()...)
 		}
@@ -246,7 +249,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	})
 	defer stopStats()
 	return admission.ServeContext(ctx, grace, listener, maxSetup, opts.maxConnections, func(conn net.Conn, permit *admission.Permit) {
-		poolOptions := &serverPoolOptions{idleSlots: idleSlots, resumeSetup: permit.TryAcquire, abortContext: permit.AbortContext(), entrance: entrance, releasePreAuth: permit.ReleasePreAuth, acceptedAt: permit.StartedAt()}
+		poolOptions := &serverPoolOptions{dnsCache: dnsCache, idleSlots: idleSlots, resumeSetup: permit.TryAcquire, abortContext: permit.AbortContext(), entrance: entrance, releasePreAuth: permit.ReleasePreAuth, acceptedAt: permit.StartedAt()}
 		if _, ok := conn.(*quicudp.Conn); ok {
 			handleQUICUDPTunnelWithPool(conn, cfg, logger, permit, poolOptions, authLimiter, resources)
 			return
@@ -259,6 +262,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 }
 
 type serverPoolOptions struct {
+	dnsCache       *dialmetrics.NegativeCache
 	idleSlots      chan struct{}
 	resumeSetup    func() bool
 	abortContext   context.Context
@@ -374,10 +378,10 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 				return
 			}
 		}
-		handleUDPTunnel(tunnelConn, reader, connectionLogger.With(
+		handleUDPTunnelWithDial(tunnelConn, reader, connectionLogger.With(
 			"udp_tunnel_transport", "tcp",
 			"pool_connection", pooled, "auth_duration", authDuration, "idle_duration", idleDuration,
-			"wait_duration", time.Since(connectStarted)), startedAt, idleDuration, releaseSetup, cfg.UDPQueueConfig, resources...)
+			"wait_duration", time.Since(connectStarted)), startedAt, idleDuration, releaseSetup, cfg.UDPQueueConfig, targetUDPDial(poolOptions), resources...)
 		return
 	}
 
@@ -406,7 +410,11 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 	watch := setupwatch.Start(tunnelConn, reader, cancel)
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	targetStarted := time.Now()
-	targetConn, dialTimings, err := dialmetrics.Dial(ctx, dialer, "tcp", targetAddr)
+	var cache *dialmetrics.NegativeCache
+	if poolOptions != nil {
+		cache = poolOptions.dnsCache
+	}
+	targetConn, dialTimings, err := cache.Dial(ctx, dialer, "tcp", targetAddr)
 	if watchErr := watch.Stop(connectDeadline); watchErr != nil {
 		if targetConn != nil {
 			_ = targetConn.Close()
@@ -416,7 +424,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 	targetDuration := time.Since(targetStarted)
 	cancel()
 	if err != nil {
-		logging.Failure(requestLogger, "dial", err, "dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "dns_retry_count", dialTimings.DNSRetries, "setup_duration", time.Since(startedAt)-idleDuration)
+		logging.Failure(requestLogger, "dial", err, "dns_negative_cache_hit", dialTimings.DNSNegativeHit, "dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "dns_retry_count", dialTimings.DNSRetries, "setup_duration", time.Since(startedAt)-idleDuration)
 		if replyErr := tunnel.SendTargetResult(tunnelConn, err); replyErr != nil {
 			logging.Failure(requestLogger, "reply", replyErr)
 		}
@@ -440,7 +448,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 		"auth_duration", authDuration,
 		"idle_duration", idleDuration,
 		"wait_duration", waitDuration,
-		"dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "dns_retry_count", dialTimings.DNSRetries,
+		"dns_negative_cache_hit", dialTimings.DNSNegativeHit, "dns_duration", dialTimings.DNS, "target_tcp_duration", dialTimings.TCP, "target_dial_duration", targetDuration, "dns_retry_count", dialTimings.DNSRetries,
 		"reply_duration", time.Since(replyStarted),
 		"connect_duration", time.Since(connectStarted),
 		"setup_duration", time.Since(startedAt)-idleDuration)

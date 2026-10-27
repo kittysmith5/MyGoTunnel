@@ -22,13 +22,14 @@ import (
 const EntryTimeout = 5 * time.Second
 
 type Counters struct {
+	IPRateLimited, IPConcurrentLimited, IPTableLimited                            atomic.Uint64
 	TLSFailed, PreAuthTimeout, IPLimited, HTTPCapacityRejected                    atomic.Uint64
 	HTTPRequests, HTTPUnparsed, HTTPInternalErrors, HTTPWriteFailed, AuthRejected atomic.Uint64
 	HTTPActive, PreAuthActive                                                     atomic.Int64
 }
 
 func (m *Counters) Attrs() []any {
-	return []any{"ingress_tls_failed", m.TLSFailed.Load(), "ingress_pre_auth_timeout", m.PreAuthTimeout.Load(), "ingress_ip_limited", m.IPLimited.Load(), "ingress_http_capacity_rejected", m.HTTPCapacityRejected.Load(), "ingress_http_requests", m.HTTPRequests.Load(), "ingress_http_unparsed", m.HTTPUnparsed.Load(), "ingress_http_internal_errors", m.HTTPInternalErrors.Load(), "ingress_http_write_failed", m.HTTPWriteFailed.Load(), "ingress_auth_rejected", m.AuthRejected.Load(), "ingress_http_active", m.HTTPActive.Load(), "ingress_pre_auth_active", m.PreAuthActive.Load()}
+	return []any{"ingress_ip_rate_limited", m.IPRateLimited.Load(), "ingress_ip_concurrent_limited", m.IPConcurrentLimited.Load(), "ingress_ip_table_limited", m.IPTableLimited.Load(), "ingress_tls_failed", m.TLSFailed.Load(), "ingress_pre_auth_timeout", m.PreAuthTimeout.Load(), "ingress_ip_limited", m.IPLimited.Load(), "ingress_http_capacity_rejected", m.HTTPCapacityRejected.Load(), "ingress_http_requests", m.HTTPRequests.Load(), "ingress_http_unparsed", m.HTTPUnparsed.Load(), "ingress_http_internal_errors", m.HTTPInternalErrors.Load(), "ingress_http_write_failed", m.HTTPWriteFailed.Load(), "ingress_auth_rejected", m.AuthRejected.Load(), "ingress_http_active", m.HTTPActive.Load(), "ingress_pre_auth_active", m.PreAuthActive.Load()}
 }
 
 type Server struct {
@@ -83,9 +84,17 @@ func New(index []byte, maxHTTP, perIP, rate, burst int) (*Server, error) {
 
 // Accept is suitable for admission.AcceptGate and runs before TLS and global slots.
 func (s *Server) Accept(c net.Conn) (func(), bool) {
-	release, ok := s.guard.Acquire(c.RemoteAddr())
-	if !ok {
+	release, reason := s.guard.AcquireReason(c.RemoteAddr())
+	if reason != "" {
 		s.Metrics.IPLimited.Add(1)
+		switch reason {
+		case "rate":
+			s.Metrics.IPRateLimited.Add(1)
+		case "concurrency":
+			s.Metrics.IPConcurrentLimited.Add(1)
+		case "table":
+			s.Metrics.IPTableLimited.Add(1)
+		}
 		return nil, false
 	}
 	s.Metrics.PreAuthActive.Add(1)

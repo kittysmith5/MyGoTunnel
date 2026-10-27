@@ -201,7 +201,7 @@ func handleUDPAssociateWithPools(parent context.Context, clientConn net.Conn, re
 		"udp_source_allowed_ips", udpSourceIPSummary(allowedSources), "udp_source_allowed_count", len(allowedSources),
 		"udp_source_allowed_port", port,
 		"socks_duration", socksDuration, "pool_hit", session.PoolHit,
-		"pool_fallback", session.PoolFallback, "pool_acquire_duration", session.PoolAcquireDuration,
+		"pool_fallback", session.PoolFallback, "handshake_queue_duration", session.HandshakeWait, "pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
 		"tcp_duration", session.Dial.TCPDuration, "node_dns_duration", session.Dial.NodeDNSDuration, "node_tcp_duration", session.Dial.NodeTCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed,
 		"udp_quic_handshake_duration", session.QUICDuration,

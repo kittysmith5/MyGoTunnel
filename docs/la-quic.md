@@ -61,7 +61,7 @@ v1 每个 DATAGRAM 应用数据最多1100字节（12字节头+1088字节负载�
 
 ## QUIC 预连接
 
-客户端在选择 `udp_transport=quic` 时默认通过 `-quic-pool-size 2` 保留两条已完成完整 TLS、证书验证和 AUTH 的备用 QUIC 控制连接；0 关闭，范围0～32，容量固定且不随既有 TCP 自适应池扩容。普通 TCP 的 `-pool-size` / `-pool-max` 仍独立生效，没有新增 JSON 配置或连接码字段。两类备用连接在服务端共用 `-max-idle`，仍占总连接名额；客户端 QUIC socket 使用同一进程 Resources 预算。
+客户端在选择 `udp_transport=quic` 时默认通过 `-quic-pool-size 2` 初始准备最多两条已完成完整 TLS、证书验证和 AUTH 的备用 QUIC 控制连接；0 关闭，范围0～32，硬上限固定且不随既有 TCP 池扩容；默认取用量策略可将低需求目标降至1，窗口规则见README的突发握手/低需求章节。普通 TCP 的 `-pool-size` / `-pool-max` 仍独立生效，没有新增 JSON 配置或连接码字段。两类备用连接在服务端共用 `-max-idle`，仍占总连接名额；客户端 QUIC socket 使用同一进程 Resources 预算。
 
 实际备用上限不超过 `udp_max_sockets-1`；后台 QUIC socket 申请在同一资源锁内至少留一个名额给本地 SOCKS UDP relay，避免低预算时空闲池先占满全部 socket。此为进程进度余量，不保证任意并发关联都能获准；已有活跃业务仍按进程总预算限制。日志 `quic_pool_max` 显示实际容量。
 

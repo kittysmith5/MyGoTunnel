@@ -29,6 +29,12 @@ func NewGuard(concurrent, rate, burst int) *Guard {
 }
 
 func (g *Guard) Acquire(addr net.Addr) (func(), bool) {
+	release, reason := g.AcquireReason(addr)
+	return release, reason == ""
+}
+
+// AcquireReason reports a fixed, bounded reason without logging peer identity.
+func (g *Guard) AcquireReason(addr net.Addr) (func(), string) {
 	key := authlimit.PeerKey(addr)
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -44,7 +50,7 @@ func (g *Guard) Acquire(addr net.Addr) (func(), bool) {
 			g.nextSweep = now.Add(time.Second)
 		}
 		if len(g.peers) >= g.maxPeers {
-			return nil, false
+			return nil, "table"
 		}
 		p = &peer{tokens: float64(g.burst), last: now}
 		g.peers[key] = p
@@ -52,16 +58,16 @@ func (g *Guard) Acquire(addr net.Addr) (func(), bool) {
 	p.tokens = min(float64(g.burst), p.tokens+max(0, now.Sub(p.last).Seconds())*float64(g.rate))
 	p.last = now
 	if p.tokens < 1 {
-		return nil, false
+		return nil, "rate"
 	}
 	p.tokens-- // Charge accepted TCP attempts even when the concurrency cap rejects.
 	if p.active >= g.concurrent {
-		return nil, false
+		return nil, "concurrency"
 	}
 	p.active++
 	return sync.OnceFunc(func() {
 		g.mu.Lock()
 		p.active--
 		g.mu.Unlock()
-	}), true
+	}), ""
 }

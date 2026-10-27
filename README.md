@@ -281,9 +281,9 @@ JSON 保留标准 time/level/msg/component 和现有长字段名，例如 client
 
 ## 预连接池
 
-客户端默认 `-pool-size 4 -pool-max 16`，按需在 4～16 条备用容量间调整；pool-size 范围 0～32；设为 0 使用原来的 TCP/TLS + AUTH/CONNECT 流水建连。后台完成 TLS 和 AUTH 后协商PREPARE，连接只用于一次后续CONNECT或UDP；不会复用已转发过数据的连接，也没有多路复用。备用连接用完就补充，池为空时立即走普通建连，不等待补充。
+客户端默认 `-pool-size 4 -pool-max 16`，正常需求时在 4～16 条备用容量间调整，默认低需求策略另可缩至1条；pool-size 范围 0～32；设为 0 使用原来的 TCP/TLS + AUTH/CONNECT 流水建连。后台完成 TLS 和 AUTH 后协商PREPARE，连接只用于一次后续CONNECT或UDP；不会复用已转发过数据的连接，也没有多路复用。备用连接用完就补充，池为空时走普通建连，不等待补充；新TLS握手仍受下文的共享调度预算约束。
 
-LA 分支选择 QUIC UDP 时另外使用 `-quic-pool-size 2`（0关闭，最大32）的固定备用池，后台完成完整握手和认证，取用时再确认 UDP 关联；不使用0-RTT，不复用已有业务会话。TCP 和 QUIC 在服务端共享 `-max-idle`；客户端分别统计 `pool_*` 与 `quic_pool_*`，命中只表示取到备用。配置、回退与计时细节见 [LA QUIC 说明](docs/la-quic.md#quic-预连接)。
+LA 分支选择 QUIC UDP 时另外使用 `-quic-pool-size 2`（0关闭，最大32）的有界备用池，后台完成完整握手和认证，取用时再确认 UDP 关联；不使用0-RTT，不复用已有业务会话。TCP 和 QUIC 在服务端共享 `-max-idle`；客户端分别统计 `pool_*` 与 `quic_pool_*`，命中只表示取到备用。配置、回退与计时细节见 [LA QUIC 说明](docs/la-quic.md#quic-预连接)。
 
 新客户端先发送 `AUTH → PREPARE ACK`；支持的新服务端回复 `OK → READY ACK`，交接后收到CONNECT/UDP即先回复ACK，再继续目标拨号或UDP建立，最后回复原OK/ERR。命令发送与即时ACK共用独立2秒期限；ACK后恢复目标响应等待，正常慢目标不会因2秒期限被提前回退。服务端发送ACK后直接继续处理，不等待客户端确认，不强制增加一次控制往返。
 
@@ -307,13 +307,13 @@ LA 分支选择 QUIC UDP 时另外使用 `-quic-pool-size 2`（0关闭，最大3
 
 ## 自适应预连接与拨号测量
 
-可选 `-pool-idle-size 1 -pool-idle-after 2m`：连续无取用达到 idle-after 后，每30秒向指定空闲下限缩减1条；范围1～pool-size，至少保留一条目标备用。默认 idle-size=0 禁用此功能，维持原有容量下限；pool-size=0 时不能启用。多余连接自然到期；收缩时如果所有就绪连接都进入续期窗口，仍逐条准备一条新备用，避免仅因存在多余连接而推迟最后备用的续建。已有新鲜备用时不续建其余多余连接，硬容量和失败退避仍生效，准备过慢或断网时仍可能暂时空池。新请求立即将目标恢复到正常 pool-size，再按既有规则扩容；取用不等待补充，突发请求可能直接建连。TTL、证书、协议和已交接连接保持原语义。该选项需要以实际命中率/P95验证，不保证吞吐或时延提升；`pool-max=0` 仍固定正常容量，但显式启用 idle-size 可在空闲时缩减。
+可选 `-pool-idle-size 1 -pool-idle-after 2m`：连续无取用达到 idle-after 后，每30秒向指定空闲下限缩减1条；范围1～pool-size，至少保留一条目标备用。idle-size=0 不启用连续空闲策略；默认启用的取用量策略仍可降低容量下限（见下文）。使用 `-pool-adaptive-idle=false` 可恢复旧的固定下限；pool-size=0 时不能启用。多余连接自然到期；收缩时如果所有就绪连接都进入续期窗口，仍逐条准备一条新备用，避免仅因存在多余连接而推迟最后备用的续建。已有新鲜备用时不续建其余多余连接，硬容量和失败退避仍生效，准备过慢或断网时仍可能暂时空池。新请求立即将目标恢复到正常 pool-size，再按既有规则扩容；取用不等待补充，突发请求可能直接建连。TTL、证书、协议和已交接连接保持原语义。该选项需要以实际命中率/P95验证，不保证吞吐或时延提升；`pool-max=0` 仍固定正常容量，但显式启用 idle-size 可在空闲时缩减。
 
 客户端 `-pool-size 4 -pool-max 16`：size 是备用容量下限，max 是自适应上限（均不含已经转发的连接）。当请求取用时就绪数不超过 1，目标容量增加 1，最多达到 max；取用、失效立即触发补充。连续 30 秒无取用后，每 30 秒目标容量减 1，最低回到 size。已有多余空闲连接自然到期释放，不中断正在使用的连接。此为需求耗尽驱动的保守自适应，不是基于 QPS/补充时长的预测算法。后台补充与 ready 总量受目标限制；收缩后已经启动的补充可能短暂超过新目标，但不超过 max。`-pool-max 0` 或等于 size 使用固定容量；`-pool-size 0` 禁用池。非零 max 必须不小于 size，最大 32；例如 size=32 时须同时指定 max=32。服务端 `-max-idle` 为所有客户端共享，扩容仍可能被 BUSY 拒绝，沿用有界退避。
 
 每 30 秒 stats 新增：JSON `pool_hits/pool_misses/pool_fallbacks/pool_hit_rate/pool_target/pool_filling`，文本 `hit/miss/fallbacks/hit_pct/pool_target/filling`。hit/miss 统计启动以来的 Take 调用结果；命中指有效备用连接成功交接，不代表目标拨号成功；命中后传输错误转普通建连时同时增加 fallback。百分比为 100*hit/(hit+miss)，无请求为 0；禁用池时这些计数为 0，不将普通连接计为 miss。计数快照加锁，不改变流量和重试语义。
 
-服务端 ready 与拨号失败日志增加 `dns_duration`（text: dns）、`target_tcp_duration`（text: target_tcp）及 `dns_retry_count`（text: dns_retry）；`target_dial_duration`（dial）继续表示 DNS+TCP 总拨号墙钟耗时。通过标准库 httptrace 观察 net.Dialer，不自行解析再顺序拨 IP，保留系统解析器、IPv4/IPv6 并行回退和原连接期限。临时 DNS 错误或 DNS 超时最多重试一次，等待100ms；所有尝试和退避共享进入拨号时确定的总期限，取父 context、Dialer.Timeout 与 Dialer.Deadline 的最早值，不为重试重新起算10秒。`dns_retry_count` 只计实际开始的重试，期限耗尽而未启动的不计；NXDOMAIN 不重试。DNS 失败日志区分 `dns_not_found`、`dns_timeout`、`dns_temporary` 和其他 `dns`。各次尝试的 DNS/TCP 时间累加；IP 字面量 dns=0。TCP 时间覆盖拨号地址尝试及双栈回退，不把并发尝试分别相加。DNS 时间包括系统解析器处理，不代表纯公网 DNS RTT；分项之和与总时间可能有调度开销差异。不引入 DNS 缓存。
+服务端 ready 与拨号失败日志增加 `dns_duration`（text: dns）、`target_tcp_duration`（text: target_tcp）及 `dns_retry_count`（text: dns_retry）；`target_dial_duration`（dial）继续表示 DNS+TCP 总拨号墙钟耗时。通过标准库 httptrace 观察 net.Dialer，不自行解析再顺序拨 IP，保留系统解析器、IPv4/IPv6 并行回退和原连接期限。临时 DNS 错误或 DNS 超时最多重试一次，等待100ms；所有尝试和退避共享进入拨号时确定的总期限，取父 context、Dialer.Timeout 与 Dialer.Deadline 的最早值，不为重试重新起算10秒。`dns_retry_count` 只计实际开始的重试，期限耗尽而未启动的不计；NXDOMAIN 不重试。DNS 失败日志区分 `dns_not_found`、`dns_timeout`、`dns_temporary` 和其他 `dns`。各次尝试的 DNS/TCP 时间累加；IP 字面量 dns=0。TCP 时间覆盖拨号地址尝试及双栈回退，不把并发尝试分别相加。DNS 时间包括系统解析器处理，不代表纯公网 DNS RTT；分项之和与总时间可能有调度开销差异。服务端运行时另有进程共享的短期 DNS 不存在缓存，规则见下文。
 
 ## 大流量吞吐基准
 
@@ -510,3 +510,14 @@ TCP关闭/失败日志新增 `first_up_duration/first_down_duration`，仅在对
 UDP客户端上行按目标公平调度，总容量仍256包、原配置字节/年龄和共享payload预算。最多256个目标索引，空目标在压力时回收；键只在新流成功准入时复制，元数据额外有界、不冒充payload预算。新增 `request_fair_evictions/request_peak_flows`。单目标容量不缩减，低积压目标可淘汰最大积压目标的包；evictions属于queue_full_drops，不能重复相加。
 
 QUIC发送保留一个大包，每8片允许另一个目标的队头小包先发，不重排同目标队头，不修改v1分片wire。最多一个大包和一个小包在途，仍受共享Resources计费、每批最多32个完整包。小包不延长正在发送的大包写期限；新完整包重新起算独立udp_write_timeout_ms，部分失败仍终止关联并回收所有所有权。TLS/TCP载体不交错其帧内容。QUIC的udp_tunnel_write_calls/max_duration现在以一次有界batch调用统计，不是每片或每包耗时，不能直接跨版本按调用数比较。
+
+
+### 突发握手、低需求备用与 DNS 不存在缓存
+
+客户端每次run对TLS新连接共用一个调度器：默认16次/秒、突发8、并发8（可用 `-tls-handshake-rate`、`-tls-handshake-burst`、`-tls-handshake-concurrency` 调整，必须与服务端策略匹配），其中后台最多min(2,并发数)；最多256个等待者，最长等待10秒且受原调用context及拨号总预算约束。前台优先于排队补池，同优先级FIFO；取得AUTH OK即释放名额，不占用目标拨号及业务转发时间。池命中不排队，不增加控制往返或业务重放；TLS UDP与TCP共用该预算，QUIC的独立握手保护不由此改变。限制按客户端进程计算，多个进程共用公网IP或服务端采用更紧限额时仍可能被拒绝。启动显示有效限制，周期stats补handshake_active/background_active/waiting/foreground/background/queued/rejected/canceled及wait_duration/max_wait_duration；这些字段均以handshake_为前缀；累计wait/max_wait包含已结束的成功和取消排队，rejected为队列满拒绝，不包含池命中。前台成功/失败日志补handshake_queue_duration（text hwait），只能解释为本地排队，不混入节点TCP/TLS或池ACK时间。
+
+默认 `-pool-adaptive-idle=true`。TCP与QUIC池独立按30秒窗口统计Take调用；窗口不超过2次为低需求，目标每30秒降低1条，默认下限1，显式pool-idle-size下限仍保留。一个窗口内第3次取用恢复正常pool-size下限，然后按原规则扩容；不等待后台填满。初始暖池保留，超额备用自然到期，原45秒TTL、上限、共享退避、提前替换和单所有者规则不变。quic-pool-size现在是正常目标和硬上限，低需求可向1收缩；TCP/QUIC各有low_demand与target统计。此策略统计取用，不检查应用内容，不能声称自动识别业务或探测。缩容可能增加突发前几次冷拨号，需结合命中、排队和首请求延迟观察；关闭此flag恢复旧策略。
+
+服务端TLS入口补ingress_ip_rate_limited、ingress_ip_concurrent_limited、ingress_ip_table_limited，分别表示速率、并发、表满；原ingress_ip_limited总计保留，防护规则与上限不变，不能把拒绝计数当公网丢包。
+
+服务端每run共享1024项、固定10秒的DNS不存在缓存，覆盖TCP及两种UDP目标拨号。只存net.DNSError.IsNotFound且非临时、非超时、调用未取消的结果；按主机名、IP地址族及Resolver实例隔离，保留末尾点/搜索域语义。相同解析语义跨端口/TCP-UDP共享负结果。条目首个到期时间不因并发失败不断顺延，容量满跳过新缓存；缓存不持有目标连接，不存正向地址、不缓存拨号拒绝/超时、不改变原Happy Eyeballs和临时DNS重试总预算。并发查询合并沿用标准Go解析器能力，并未新增会串行等待目标TCP拨号的singleflight。过期再次解析，不能将负缓存作为域名可用性修复。stats为dns_negative_cache_hits/stored/entries（entries含尚未惰性回收的过期项），TCP目标日志dns_negative_cache_hit标明命中，命中时DNS/TCP耗时为0；错误码仍为DNS，取消/到期优先。

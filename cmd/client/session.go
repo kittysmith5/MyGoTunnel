@@ -8,6 +8,7 @@ import (
 	"io"
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/datagram"
+	"mygotunnel/internal/handshake"
 	"mygotunnel/internal/preconnect"
 	"mygotunnel/internal/tunnel"
 	"mygotunnel/internal/utlsconn"
@@ -23,6 +24,7 @@ type remoteSession struct {
 	Reader                *bufio.Reader
 	Dial                  utlsconn.DialTimings
 	ControlDuration       time.Duration
+	HandshakeWait         time.Duration
 	QUICDuration          time.Duration
 	PoolAcquireDuration   time.Duration
 	AckDuration           time.Duration
@@ -94,6 +96,14 @@ func openRemoteCommand(ctx context.Context, cfg *config.ClientConfig, target str
 		}
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, remoteDialTimeout)
+	session.Stage = "handshake_queue"
+	release, wait, gateErr := handshake.FromContext(ctx).Acquire(dialCtx, false)
+	session.HandshakeWait = wait
+	if gateErr != nil {
+		cancel()
+		return session, gateErr
+	}
+	defer release()
 	conn, timings, err := utlsconn.DialWithOptions(dialCtx, cfg.RemoteAddr, cfg.SNI, cfg.CertificateFingerprint, utlsconn.Options{SessionCache: cfg.TLSSessionCache})
 	cancel()
 	session.Dial = timings
@@ -131,6 +141,7 @@ func openRemoteCommand(ctx context.Context, cfg *config.ClientConfig, target str
 	if response != "OK" {
 		return session, errAuthRejected
 	}
+	release()
 	// The server starts its CONNECT budget after AUTH. Reserve final reply time
 	// from the same phase boundary instead of consuming it during authentication.
 	if err = conn.SetDeadline(controlDeadline(ctx)); err != nil {

@@ -13,13 +13,14 @@ import (
 
 type Factory func(context.Context) (*Entry, error)
 type Options struct {
-	Size      int
-	MaxSize   int // zero keeps a fixed-size pool
-	IdleTTL   time.Duration
-	IdleSize  int // zero preserves Size as the idle floor
-	IdleAfter time.Duration
-	RetryMin  time.Duration
-	RetryMax  time.Duration
+	Size         int
+	MaxSize      int // zero keeps a fixed-size pool
+	IdleTTL      time.Duration
+	IdleSize     int // zero preserves Size as the idle floor
+	IdleAfter    time.Duration
+	AdaptiveIdle bool // reduce the floor after a low-demand 30-second window
+	RetryMin     time.Duration
+	RetryMax     time.Duration
 }
 
 // Pool owns only unused, authenticated connections. Used connections never return.
@@ -37,6 +38,9 @@ type Pool struct {
 	retry                   time.Duration
 	batchFailed             bool
 	renewed                 uint64
+	demandStart             time.Time
+	demandCount             int
+	lowDemand               bool
 	opts                    Options
 	factory                 Factory
 	logger                  *slog.Logger
@@ -76,7 +80,7 @@ func New(opts Options, factory Factory, logger *slog.Logger) (*Pool, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	now := time.Now()
-	p := &Pool{target: opts.Size, lastDemand: now, lastShrink: now, opts: opts, factory: factory, logger: logger, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1)}
+	p := &Pool{target: opts.Size, demandStart: now, lastDemand: now, lastShrink: now, opts: opts, factory: factory, logger: logger, ctx: ctx, cancel: cancel, wake: make(chan struct{}, 1)}
 	p.wg.Add(1)
 	go p.manage()
 	return p, nil
@@ -293,14 +297,20 @@ func (p *Pool) Take(ctx context.Context) *Entry {
 	}()
 	p.mu.Lock()
 	if ctx.Err() == nil && !p.closed {
-		p.lastDemand = time.Now()
-		if p.opts.IdleSize > 0 && p.target < p.opts.Size {
+		now := time.Now()
+		p.updateDemandLocked(now)
+		p.demandCount = min(3, p.demandCount+1)
+		if p.demandCount > 2 {
+			p.lowDemand = false
+		}
+		p.lastDemand = now
+		if (p.opts.IdleSize > 0 || p.opts.AdaptiveIdle) && !p.lowDemand && p.target < p.opts.Size {
 			// Demand restores the normal floor immediately without waiting for
 			// shrink ticks; callers still never wait for background refill.
 			p.target = p.opts.Size
 		}
 		// Grow only when demand exhausts ready capacity; never exceed MaxSize.
-		if len(p.idle) <= 1 && p.target < p.opts.MaxSize {
+		if (!p.opts.AdaptiveIdle || !p.lowDemand) && len(p.idle) <= 1 && p.target < p.opts.MaxSize {
 			p.target++
 		}
 	}
@@ -379,12 +389,13 @@ type Stats struct {
 	Retry                      time.Duration
 	Idle, Filling, Target, Max int
 	HitRate                    float64
+	LowDemand                  bool
 }
 
 func (p *Pool) Stats() Stats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	s := Stats{Renewed: p.renewed, Retry: p.retry, Hits: p.hits, Misses: p.misses, Fallbacks: p.fallbacks, Idle: len(p.idle), Filling: p.filling, Target: p.target, Max: p.opts.MaxSize}
+	s := Stats{LowDemand: p.lowDemand, Renewed: p.renewed, Retry: p.retry, Hits: p.hits, Misses: p.misses, Fallbacks: p.fallbacks, Idle: len(p.idle), Filling: p.filling, Target: p.target, Max: p.opts.MaxSize}
 	if n := s.Hits + s.Misses; n > 0 {
 		s.HitRate = 100 * float64(s.Hits) / float64(n)
 	}
@@ -426,12 +437,30 @@ func (p *Pool) renewalIndexLocked(now time.Time) int {
 }
 
 func (p *Pool) shrinkLocked(now time.Time) {
+	p.updateDemandLocked(now)
 	floor := p.opts.Size
-	if p.opts.IdleSize > 0 && now.Sub(p.lastDemand) >= p.opts.IdleAfter {
+	if p.opts.AdaptiveIdle && p.lowDemand {
+		floor = max(1, p.opts.IdleSize)
+	} else if p.opts.IdleSize > 0 && now.Sub(p.lastDemand) >= p.opts.IdleAfter {
 		floor = p.opts.IdleSize
 	}
-	if p.target > floor && now.Sub(p.lastDemand) >= 30*time.Second && now.Sub(p.lastShrink) >= 30*time.Second {
+	quiet := now.Sub(p.lastDemand) >= 30*time.Second || (p.opts.AdaptiveIdle && p.lowDemand)
+	if p.target > floor && quiet && now.Sub(p.lastShrink) >= 30*time.Second {
 		p.target--
 		p.lastShrink = now
+	}
+}
+
+// A few periodic probes must not keep a full pool warm forever. The third
+// request in a window immediately restores normal demand; only the floor and
+// future renewal change, never ownership or expiry of handed-off connections.
+func (p *Pool) updateDemandLocked(now time.Time) {
+	if !p.opts.AdaptiveIdle {
+		return
+	}
+	if now.Sub(p.demandStart) >= 30*time.Second {
+		p.lowDemand = p.demandCount <= 2 || now.Sub(p.demandStart) >= time.Minute
+		p.demandStart = now
+		p.demandCount = 0
 	}
 }

@@ -14,11 +14,18 @@ import (
 const dnsRetryDelay = 100 * time.Millisecond
 
 type Timings struct {
-	DNS, TCP   time.Duration
-	DNSRetries int
+	DNS, TCP       time.Duration
+	DNSRetries     int
+	DNSNegativeHit bool
 }
 
 func Dial(ctx context.Context, dialer *net.Dialer, network, address string) (net.Conn, Timings, error) {
+	ctx, cancel := dialBudget(ctx, dialer)
+	defer cancel()
+	return dialWith(ctx, dialer.DialContext, network, address)
+}
+
+func dialBudget(ctx context.Context, dialer *net.Dialer) (context.Context, context.CancelFunc) {
 	// Dialer.Timeout is otherwise restarted by each DialContext call. Keep the
 	// original timeout/deadline as one budget for DNS, backoff and both attempts.
 	deadline := dialer.Deadline
@@ -29,11 +36,9 @@ func Dial(ctx context.Context, dialer *net.Dialer, network, address string) (net
 		}
 	}
 	if !deadline.IsZero() {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
+		return context.WithDeadline(ctx, deadline)
 	}
-	return dialWith(ctx, dialer.DialContext, network, address)
+	return ctx, func() {}
 }
 
 // DialOnce observes DNS and TCP without adding retries or changing dialer policy.

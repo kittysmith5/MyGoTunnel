@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"mygotunnel/internal/config"
+	"mygotunnel/internal/handshake"
 	"mygotunnel/internal/tunnel"
 	"mygotunnel/internal/utlsconn"
 	"net"
@@ -39,9 +40,12 @@ func Prepare(ctx context.Context, cfg *config.ClientConfig) (entry *Entry, err e
 // NewPreparer scopes capability discovery to one configured pool. Old servers
 // get one legacy retry after authenticated unsupported negotiation; that result
 // is cached for a bounded interval, allowing subsequent server upgrades.
-func NewPreparer(cfg *config.ClientConfig) Factory {
+func NewPreparer(cfg *config.ClientConfig, schedulers ...*handshake.Scheduler) Factory {
 	var legacyUntil atomic.Int64
 	return func(ctx context.Context) (*Entry, error) {
+		if len(schedulers) > 0 {
+			ctx = handshake.WithScheduler(ctx, schedulers[0])
+		}
 		if time.Now().UnixNano() < legacyUntil.Load() {
 			return Prepare(ctx, cfg)
 		}
@@ -62,6 +66,12 @@ func NewPreparer(cfg *config.ClientConfig) Factory {
 
 func prepare(ctx context.Context, cfg *config.ClientConfig, ack bool) (entry *Entry, err error) {
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	release, _, err := handshake.FromContext(ctx).Acquire(dialCtx, true)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	defer release()
 	conn, timings, err := utlsconn.DialWithOptions(dialCtx, cfg.RemoteAddr, cfg.SNI, cfg.CertificateFingerprint, utlsconn.Options{SessionCache: cfg.TLSSessionCache})
 	cancel()
 	if err != nil {
@@ -102,6 +112,7 @@ func prepare(ctx context.Context, cfg *config.ClientConfig, ack bool) (entry *En
 	if response != "OK" {
 		return nil, tunnel.ErrAuthRejected
 	}
+	release()
 	response, err = tunnel.ReadLine(reader)
 	if err != nil {
 		// An old server closes after receiving its unknown PREPARE command.

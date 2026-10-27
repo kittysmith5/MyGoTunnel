@@ -19,6 +19,7 @@ import (
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/datagram"
 	"mygotunnel/internal/diagnostics"
+	"mygotunnel/internal/handshake"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/operations"
 	"mygotunnel/internal/preconnect"
@@ -42,10 +43,14 @@ func main() {
 	health := flag.Bool("health", false, "run bounded operational health check and exit")
 	configPath := flag.String("config", "configs/client.json", "config file path")
 	importCode := flag.Bool("import", false, "import connection code from stdin and exit")
-	poolMax := flag.Int("pool-max", 16, "maximum adaptive preconnections, size must not exceed this; 0 fixes pool at pool-size")
+	poolMax := flag.Int("pool-max", 16, "maximum adaptive preconnections, size must not exceed this; 0 caps normal pool at pool-size")
 	poolSize := flag.Int("pool-size", 4, "authenticated preconnections, 0 disables, maximum 32")
 	quicPoolSize := flag.Int("quic-pool-size", 2, "authenticated QUIC UDP preconnections, 0 disables, maximum 32")
-	poolIdleSize := flag.Int("pool-idle-size", 0, "optional idle pool floor, 1..pool-size; 0 keeps normal floor")
+	tlsHandshakeRate := flag.Int("tls-handshake-rate", 16, "maximum new TLS connections per second, shared with background pool")
+	tlsHandshakeBurst := flag.Int("tls-handshake-burst", 8, "new TLS connection burst allowance")
+	tlsHandshakeConcurrency := flag.Int("tls-handshake-concurrency", 8, "maximum concurrent new TLS/auth handshakes")
+	adaptiveIdle := flag.Bool("pool-adaptive-idle", true, "shrink lightly used TCP and QUIC pools toward a single keeper")
+	poolIdleSize := flag.Int("pool-idle-size", 0, "optional idle pool floor, 1..pool-size; 0 allows adaptive single keeper")
 	poolIdleAfter := flag.Duration("pool-idle-after", 2*time.Minute, "no-demand interval before shrinking toward pool-idle-size")
 	maxConnections := flag.Int("max-connections", 1024, "maximum accepted local connections")
 	maxSetup := flag.Int("max-setup", 128, "maximum concurrent connection setups; established tunnels do not count")
@@ -90,7 +95,7 @@ func main() {
 	defer stopMetrics()
 	ctx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
-	if err := runContext(ctx, *shutdownTimeout, *configPath, logger, *maxSetup, clientOptions{poolSize: *poolSize, quicPoolSize: *quicPoolSize, maxConnections: *maxConnections, poolMax: *poolMax, poolIdleSize: *poolIdleSize, poolIdleAfter: *poolIdleAfter}); err != nil {
+	if err := runContext(ctx, *shutdownTimeout, *configPath, logger, *maxSetup, clientOptions{poolSize: *poolSize, quicPoolSize: *quicPoolSize, maxConnections: *maxConnections, poolMax: *poolMax, poolIdleSize: *poolIdleSize, poolIdleAfter: *poolIdleAfter, adaptiveIdle: *adaptiveIdle, handshakeLimits: &handshake.Options{Rate: *tlsHandshakeRate, Burst: *tlsHandshakeBurst, Concurrent: *tlsHandshakeConcurrency, Background: min(2, *tlsHandshakeConcurrency), Queue: 256, MaxWait: 10 * time.Second}}); err != nil {
 		logger.Error("stopped", "error", err)
 		stopMetrics()
 		os.Exit(1)
@@ -100,6 +105,8 @@ func main() {
 type clientOptions struct {
 	poolSize, maxConnections, poolMax, poolIdleSize int
 	quicPoolSize                                    int
+	adaptiveIdle                                    bool
+	handshakeLimits                                 *handshake.Options
 	poolIdleAfter                                   time.Duration
 }
 
@@ -111,7 +118,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	if grace < 0 {
 		return fmt.Errorf("shutdown-timeout must not be negative")
 	}
-	opts := clientOptions{poolSize: 4, quicPoolSize: 2, maxConnections: 1024, poolMax: 16}
+	opts := clientOptions{poolSize: 4, quicPoolSize: 2, maxConnections: 1024, poolMax: 16, adaptiveIdle: true}
 	if len(options) > 0 {
 		opts = options[0]
 	}
@@ -131,6 +138,15 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	handshakeLimits := handshake.Defaults()
+	if opts.handshakeLimits != nil {
+		handshakeLimits = *opts.handshakeLimits
+	}
+	if err := handshakeLimits.Validate(); err != nil {
+		return err
+	}
+	scheduler := handshake.New(handshakeLimits)
+	ctx = handshake.WithScheduler(ctx, scheduler)
 	resources := datagram.NewResources(cfg.ProcessLimits())
 	authLimiter := authlimit.New(4096, 5, time.Minute, time.Minute)
 	defer resources.Close()
@@ -166,13 +182,14 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"max_connections", opts.maxConnections,
 		"max_setup", maxSetup,
 		"max_idle", poolLimit,
-		"pool_idle_size", opts.poolIdleSize,
+		"tls_handshake_rate", handshakeLimits.Rate, "tls_handshake_burst", handshakeLimits.Burst, "tls_handshake_concurrency", handshakeLimits.Concurrent, "tls_handshake_background", handshakeLimits.Background, "tls_handshake_queue", handshakeLimits.Queue, "tls_handshake_max_wait", handshakeLimits.MaxWait,
+		"pool_idle_size", opts.poolIdleSize, "pool_adaptive_idle", opts.adaptiveIdle,
 		"quic_pool_max", quicPoolLimit,
 	)
 
 	var pool *preconnect.Pool
 	if opts.poolSize > 0 && (cfg.TCPTransportMode() == "tcp" || cfg.UDPTransportMode() == "tcp") {
-		pool, err = preconnect.New(preconnect.Options{Size: opts.poolSize, MaxSize: opts.poolMax, IdleSize: opts.poolIdleSize, IdleAfter: opts.poolIdleAfter}, preconnect.NewPreparer(cfg), logger)
+		pool, err = preconnect.New(preconnect.Options{Size: opts.poolSize, MaxSize: opts.poolMax, IdleSize: opts.poolIdleSize, IdleAfter: opts.poolIdleAfter, AdaptiveIdle: opts.adaptiveIdle}, preconnect.NewPreparer(cfg, scheduler), logger)
 		if err != nil {
 			return err
 		}
@@ -182,7 +199,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 	}
 	var quicPool *preconnect.Pool
 	if quicPoolLimit > 0 {
-		quicPool, err = preconnect.New(preconnect.Options{Size: quicPoolLimit, MaxSize: quicPoolLimit}, preconnect.NewQUICPreparer(cfg, resources), logger.With("udp_tunnel_transport", "quic"))
+		quicPool, err = preconnect.New(preconnect.Options{Size: quicPoolLimit, MaxSize: quicPoolLimit, AdaptiveIdle: opts.adaptiveIdle}, preconnect.NewQUICPreparer(cfg, resources), logger.With("udp_tunnel_transport", "quic"))
 		if err != nil {
 			return err
 		}
@@ -215,18 +232,20 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 			ps = pool.Stats()
 			idle = ps.Idle
 		}
-		attrs := []any{"auth_rate_limited", authLimiter.Limited(), "active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", ps.Max, "rejected", metrics.Rejected.Load(), "pool_hits", ps.Hits, "pool_misses", ps.Misses, "pool_fallbacks", ps.Fallbacks, "pool_hit_rate", ps.HitRate, "pool_target", ps.Target, "pool_filling", ps.Filling, "pool_renewed", ps.Renewed, "pool_retry", ps.Retry}
+		attrs := []any{"auth_rate_limited", authLimiter.Limited(), "active_connections", metrics.Open.Load(), "max_connections", opts.maxConnections, "setup_connections", metrics.Setup.Load(), "max_setup", maxSetup, "idle_connections", idle, "max_idle", ps.Max, "rejected", metrics.Rejected.Load(), "pool_hits", ps.Hits, "pool_misses", ps.Misses, "pool_fallbacks", ps.Fallbacks, "pool_hit_rate", ps.HitRate, "pool_target", ps.Target, "pool_filling", ps.Filling, "pool_low_demand", ps.LowDemand, "pool_renewed", ps.Renewed, "pool_retry", ps.Retry}
 		var qs preconnect.Stats
 		if quicPool != nil {
 			qs = quicPool.Stats()
 		}
 		attrs = append(attrs, "quic_pool_idle", qs.Idle, "quic_pool_max", qs.Max, "quic_pool_filling", qs.Filling,
 			"quic_pool_hits", qs.Hits, "quic_pool_misses", qs.Misses, "quic_pool_fallbacks", qs.Fallbacks,
-			"quic_pool_hit_rate", qs.HitRate, "quic_pool_renewed", qs.Renewed, "quic_pool_retry", qs.Retry)
+			"quic_pool_low_demand", qs.LowDemand, "quic_pool_target", qs.Target, "quic_pool_hit_rate", qs.HitRate, "quic_pool_renewed", qs.Renewed, "quic_pool_retry", qs.Retry)
 		if streamPool != nil {
 			connections, streams := streamPool.Stats()
 			attrs = append(attrs, "tcp_quic_connections", connections, "tcp_quic_streams", streams)
 		}
+		hs := scheduler.Stats()
+		attrs = append(attrs, "handshake_active", hs.Active, "handshake_background_active", hs.BackgroundActive, "handshake_waiting", hs.Waiting, "handshake_foreground", hs.Foreground, "handshake_background", hs.Background, "handshake_queued", hs.Queued, "handshake_rejected", hs.Rejected, "handshake_canceled", hs.Canceled, "handshake_wait_duration", hs.Wait, "handshake_max_wait_duration", hs.MaxWait)
 		return append(attrs, logging.UDPResourceAttrs(resources)...)
 	})
 	defer stopStats()
@@ -339,7 +358,7 @@ func handleClientWithTransports(parent context.Context, clientConn net.Conn, cfg
 	}
 	cancel()
 	if err != nil {
-		logging.Failure(requestLogger, session.Stage, err, "tcp_quic_handshake_duration", session.QUICDuration, "tcp_quic_reused", session.StreamReused, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "pool_acquire_duration", session.PoolAcquireDuration, "pool_ack_duration", session.AckDuration, "tcp_duration", session.Dial.TCPDuration, "node_dns_duration", session.Dial.NodeDNSDuration, "node_tcp_duration", session.Dial.NodeTCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed, "setup_duration", time.Since(startedAt))
+		logging.Failure(requestLogger, session.Stage, err, "tcp_quic_handshake_duration", session.QUICDuration, "tcp_quic_reused", session.StreamReused, "pool_hit", session.PoolHit, "pool_fallback", session.PoolFallback, "socks_duration", socksDuration, "control_duration", session.ControlDuration, "handshake_queue_duration", session.HandshakeWait, "pool_acquire_duration", session.PoolAcquireDuration, "pool_ack_duration", session.AckDuration, "tcp_duration", session.Dial.TCPDuration, "node_dns_duration", session.Dial.NodeDNSDuration, "node_tcp_duration", session.Dial.NodeTCPDuration, "tls_duration", session.Dial.TLSDuration, "tls_resumed", session.Dial.TLSResumed, "setup_duration", time.Since(startedAt))
 		code := socks5.ReplyCode(err)
 		var typed *tunnel.TargetError
 		if !errors.As(err, &typed) && errors.Is(err, errTargetRejected) {
@@ -372,7 +391,7 @@ func handleClientWithTransports(parent context.Context, clientConn net.Conn, cfg
 		"control_duration", session.ControlDuration,
 		"tcp_quic_handshake_duration", session.QUICDuration, "tcp_quic_reused", session.StreamReused, "pool_hit", session.PoolHit,
 		"pool_fallback", session.PoolFallback,
-		"pool_acquire_duration", session.PoolAcquireDuration,
+		"handshake_queue_duration", session.HandshakeWait, "pool_acquire_duration", session.PoolAcquireDuration,
 		"pool_ack_duration", session.AckDuration,
 		"setup_duration", time.Since(startedAt))
 	abortContext := context.Background()
