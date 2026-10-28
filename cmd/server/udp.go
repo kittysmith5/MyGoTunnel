@@ -14,6 +14,7 @@ import (
 
 	"mygotunnel/internal/config"
 	"mygotunnel/internal/datagram"
+	"mygotunnel/internal/dialmetrics"
 	"mygotunnel/internal/logging"
 	"mygotunnel/internal/socks5"
 	"mygotunnel/internal/tunnel"
@@ -483,13 +484,14 @@ func (target *udpTarget) recordFailure(err error) {
 }
 
 // Share the process DNS negative cache across TCP, TLS UDP and QUIC UDP targets.
-func targetUDPDial(options *serverPoolOptions) udpDialFunc {
+func targetUDPDial(cfg *config.ServerConfig, options *serverPoolOptions) udpDialFunc {
 	d := &net.Dialer{}
-	if options == nil || options.dnsCache == nil {
-		return d.DialContext
+	var cache *dialmetrics.NegativeCache
+	if options != nil {
+		cache = options.dnsCache
 	}
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
-		conn, _, err := options.dnsCache.Dial(ctx, d, network, address)
+		conn, _, err := cache.Dial(ctx, d, cfg.OutboundNetwork(network), address)
 		return conn, err
 	}
 }

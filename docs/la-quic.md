@@ -79,6 +79,8 @@ UDP 会话日志保留 `transport=udp`，并通过 `udp_tunnel_transport=tcp/qui
 
 ## 健康检查
 
+服务端 `outbound_ip_family` 支持 `auto`（缺省双栈）或 `ipv4`。IPv4 模式同时约束普通 TCP、实验 TCP QUIC Stream 和两种 UDP 隧道的目标拨号；QUIC 外层入口与系统 IPv6 保持原配置。域名无 A 记录或目标为 IPv6 字面量时失败，不绕过出口策略。此项不进入连接码，修改后重启服务端即可，客户端无需改动。恢复双栈用 `auto`；证书 SIGHUP 不加载出口策略变化。
+
 `-check-config` 仍只做离线校验。客户端配置 `udp_transport=quic` 时，`-health` 在原 TCP 认证控制检查成功后，额外完成 QUIC 证书验证、AUTH 与 UDP setup 两条成功响应；失败返回固定错误码 `REMOTE_UDP_QUIC_UNHEALTHY`。服务端配置 QUIC 监听时，在原 TCP 监听检查成功后，用配置中证书的 SHA-256 指纹与当前 token 检查本机 QUIC 入口，失败返回 `UDP_QUIC_LISTENER_UNHEALTHY`。通配监听地址转为同地址族回环，IPv6 `::` 使用 `::1`。
 
 每次 QUIC 探测最多3秒，并遵守调用者更短的期限；取消会关闭连接并等待清理。探测使用独立的小型 UDP 资源预算，不发送业务 UDP，不拨号目标，因此只证明认证控制及关联建立正常，不证明目标 UDP 或整条业务路径可用。服务端可能记录该次短关联的建立与结束，应与实际用户流量区分。诊断输出仅含固定结果码，不包含 token、证书指纹或原始错误报文。

@@ -93,5 +93,5 @@ func handleQUICUDPTunnelWithPool(conn net.Conn, cfg *config.ServerConfig, logger
 			}
 		}
 	}
-	handleUDPTunnelWithDial(conn, reader, logger.With("pool_connection", prepared.pooled, "idle_duration", prepared.idleDuration), started, prepared.idleDuration, permit.Release, cfg.UDPQueueConfig, targetUDPDial(poolOptions), resources)
+	handleUDPTunnelWithDial(conn, reader, logger.With("pool_connection", prepared.pooled, "idle_duration", prepared.idleDuration), started, prepared.idleDuration, permit.Release, cfg.UDPQueueConfig, targetUDPDial(cfg, poolOptions), resources)
 }

@@ -171,6 +171,12 @@ func TestCertificateReloadPreservesConnectionsAndInvalidatesOldTickets(t *testin
 			if _, err := m.reload(); err == nil || m.current.Load() != published {
 				t.Fatal("reload accepted non-certificate change")
 			}
+			bad = next
+			bad.OutboundIPFamily = "ipv4"
+			writeReloadConfig(t, path, &bad)
+			if _, err := m.reload(); err == nil || m.current.Load() != published {
+				t.Fatal("certificate reload accepted outbound policy change")
+			}
 			os.WriteFile(path, []byte("{"), 0600)
 			if _, err := m.reload(); err == nil || m.current.Load() != published {
 				t.Fatal("malformed config changed live certificate")

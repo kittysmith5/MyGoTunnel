@@ -81,6 +81,7 @@ LA 分支另有可选的 UDP over QUIC DATAGRAM：可靠控制流认证，业务
 
 - `listen_addr`：可选，默认 `:9001`。
 - `auth_token`：必填，必须与客户端一致。
+- `outbound_ip_family`：可选 `auto`（省略/空值同原双栈）或 `ipv4`；只影响 TCP/TCP QUIC、TLS UDP/QUIC UDP 的服务端目标拨号网络 tcp4/udp4，不改系统 IPv6、监听或隧道。无 IPv4 的目标失败，不降级 IPv6。负缓存维持地址族隔离，修改需重启，证书重载拒绝非证书配置变化；不进入连接码。
 - `cert_file`：可选，默认 `certs/cert.pem`。
 - `key_file`：可选，默认 `certs/key.pem`。
 - `https_entry`：可选同端口 HTTPS 网页回退，缺省关闭。启用时增加认证前单 IP 并发/速率与 HTTP 容量保护；字段、默认值和边界见 README 与 `docs/https-entry-design.md`。

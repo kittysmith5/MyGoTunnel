@@ -224,6 +224,7 @@ func runContext(ctx context.Context, grace time.Duration, configPath string, log
 		"commit", buildinfo.Current().Commit,
 		"listen_addr", cfg.ListenAddr,
 		"udp_quic_listen_addr", cfg.UDPQUICListenAddr, "tcp_quic_listen_addr", cfg.TCPQUICListenAddr,
+		"outbound_ip_family", cfg.OutboundIPFamily,
 		"alpn", "http/1.1",
 		"timezone", "UTC",
 		"max_connections", opts.maxConnections,
@@ -381,7 +382,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 		handleUDPTunnelWithDial(tunnelConn, reader, connectionLogger.With(
 			"udp_tunnel_transport", "tcp",
 			"pool_connection", pooled, "auth_duration", authDuration, "idle_duration", idleDuration,
-			"wait_duration", time.Since(connectStarted)), startedAt, idleDuration, releaseSetup, cfg.UDPQueueConfig, targetUDPDial(poolOptions), resources...)
+			"wait_duration", time.Since(connectStarted)), startedAt, idleDuration, releaseSetup, cfg.UDPQueueConfig, targetUDPDial(cfg, poolOptions), resources...)
 		return
 	}
 
@@ -397,7 +398,8 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 	}
 
 	waitDuration := time.Since(connectStarted)
-	requestLogger := connectionLogger.With("target_addr", targetAddr)
+	network := cfg.OutboundNetwork("tcp")
+	requestLogger := connectionLogger.With("target_addr", targetAddr, "target_network", network)
 	requestLogger.Debug("connect")
 	if commandACK {
 		if err := acknowledgePrepared(tunnelConn, connectDeadline); err != nil {
@@ -414,7 +416,7 @@ func handleTunnelContextWithLimiter(parent context.Context, tunnelConn net.Conn,
 	if poolOptions != nil {
 		cache = poolOptions.dnsCache
 	}
-	targetConn, dialTimings, err := cache.Dial(ctx, dialer, "tcp", targetAddr)
+	targetConn, dialTimings, err := cache.Dial(ctx, dialer, network, targetAddr)
 	if watchErr := watch.Stop(connectDeadline); watchErr != nil {
 		if targetConn != nil {
 			_ = targetConn.Close()

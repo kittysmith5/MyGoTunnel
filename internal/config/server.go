@@ -18,6 +18,7 @@ type ServerConfig struct {
 	ListenAddr         string          `json:"listen_addr"`
 	TCPQUICListenAddr  string          `json:"tcp_quic_listen_addr,omitempty"`
 	UDPQUICListenAddr  string          `json:"udp_quic_listen_addr,omitempty"`
+	OutboundIPFamily   string          `json:"outbound_ip_family,omitempty"`
 	AuthToken          string          `json:"auth_token"`
 	PreviousAuthTokens []PreviousToken `json:"previous_auth_tokens,omitempty"`
 	CertFile           string          `json:"cert_file"`
@@ -38,6 +39,12 @@ func LoadServerConfig(path string) (*ServerConfig, error) {
 
 	if cfg.ListenAddr == "" {
 		cfg.ListenAddr = ":9001"
+	}
+	if cfg.OutboundIPFamily == "" {
+		cfg.OutboundIPFamily = "auto"
+	}
+	if cfg.OutboundIPFamily != "auto" && cfg.OutboundIPFamily != "ipv4" {
+		return nil, fmt.Errorf("outbound_ip_family must be auto or ipv4")
 	}
 	if err := validateListenAddress(cfg.ListenAddr); err != nil {
 		return nil, fmt.Errorf("invalid listen_addr: %w", err)
