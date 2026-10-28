@@ -1,10 +1,13 @@
 package admission
 
 import (
+	"context"
 	"errors"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -216,7 +219,7 @@ func TestMergedCloseUnblocksAcceptAndKeepsReturnedConnection(t *testing.T) {
 
 func TestMergedChildFailureStopsAllChildrenAndPreservesRootError(t *testing.T) {
 	fatal := errors.New("test child failure")
-	for _, failure := range []error{fatal, net.ErrClosed, temporaryError{}} {
+	for _, failure := range []error{fatal, net.ErrClosed} {
 		t.Run(failure.Error(), func(t *testing.T) {
 			first, second := newMergeTestListener(1), newMergeTestListener(2)
 			listener, err := MergeListeners(first, second)
@@ -241,6 +244,114 @@ func TestMergedChildFailureStopsAllChildrenAndPreservesRootError(t *testing.T) {
 				t.Fatal("failure did not reclaim pending connections and children exactly once")
 			}
 		})
+	}
+}
+
+func mergeTemporaryResourceError() error {
+	return &net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.EMFILE)}
+}
+
+func TestMergedTemporaryAcceptRecoversThroughServe(t *testing.T) {
+	first, second := newMergeTestListener(1), newMergeTestListener(2)
+	listener, err := MergeListeners(first, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	handled := make(chan net.Conn, 2)
+	metrics := &Counters{}
+	go func() {
+		finished <- ServeContext(ctx, 0, listener, 2, 4, func(c net.Conn, p *Permit) {
+			p.Release()
+			handled <- c
+			_ = c.Close()
+		}, nil, metrics)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		closeMerged(t, listener)
+		select {
+		case err := <-finished:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(time.Second):
+			t.Error("serve did not stop after resource error recovery")
+		}
+		if metrics.Open.Load() != 0 || metrics.Setup.Load() != 0 {
+			t.Error("resource error recovery leaked admission permits")
+		}
+	})
+	deliverMergeResult(t, first, mergeAcceptResult{err: mergeTemporaryResourceError()})
+	for _, child := range []*mergeTestListener{second, first} {
+		conn := newMergeTestConn(t)
+		deliverMergeResult(t, child, mergeAcceptResult{conn: conn})
+		select {
+		case got := <-handled:
+			if got != conn {
+				t.Fatal("wrong recovered connection")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("temporary failure stopped either transport")
+		}
+	}
+	if first.closes.Load() != 0 || second.closes.Load() != 0 {
+		t.Fatal("temporary failure closed a child listener")
+	}
+}
+
+func TestMergedPersistentTemporaryAcceptKeepsOtherChildAvailable(t *testing.T) {
+	first, second := newMergeTestListener(1), newMergeTestListener(2)
+	listener, err := MergeListeners(first, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { closeMerged(t, listener) })
+	started := time.Now()
+	for range 6 {
+		deliverMergeResult(t, first, mergeAcceptResult{err: mergeTemporaryResourceError()})
+		conn := newMergeTestConn(t)
+		deliverMergeResult(t, second, mergeAcceptResult{conn: conn})
+		got := acceptMerged(t, listener)
+		if got.err != nil || got.conn != conn {
+			t.Fatalf("healthy transport unavailable during backoff: %v", got.err)
+		}
+		_ = conn.Close()
+	}
+	// Six consecutive failures require at least the first five backoff waits.
+	if time.Since(started) < 155*time.Millisecond {
+		t.Fatal("persistent resource failure caused immediate retries")
+	}
+}
+
+func TestMergedCloseInterruptsMaximumTemporaryBackoff(t *testing.T) {
+	first, second := newMergeTestListener(1), newMergeTestListener(2)
+	listener, err := MergeListeners(first, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	// The ninth failure enters the capped one-second wait. Close must not wait
+	// for that timer to expire, and must join both child workers.
+	for range 9 {
+		deliverMergeResult(t, first, mergeAcceptResult{err: mergeTemporaryResourceError()})
+	}
+	finished := make(chan error, 1)
+	go func() { finished <- listener.Close() }()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Close did not interrupt temporary accept backoff")
+	}
+	if first.closes.Load() != 1 || second.closes.Load() != 1 {
+		t.Fatal("Close did not reclaim both child listeners")
+	}
+	if got := acceptMerged(t, listener); !errors.Is(got.err, net.ErrClosed) {
+		t.Fatalf("Accept after interrupting backoff: %v", got.err)
 	}
 }
 

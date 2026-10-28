@@ -37,14 +37,14 @@ func (q *KeyedQueue) PushKeyCopy(key, data []byte) bool {
 		q.reap()
 	}
 	f := q.NewFlow()
-	if !f.PushCopy(data) {
+	if !f.pushCopy(data, key, true) {
 		return false
 	}
 	// Admission may have emptied a victim; free its metadata before indexing.
 	if len(q.flows) >= q.limit {
 		q.reap()
 	}
-	q.flows[string(key)] = f
+	q.flows[f.key] = f
 	return true
 }
 func (q *KeyedQueue) Close() {

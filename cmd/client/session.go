@@ -60,13 +60,22 @@ func openRemoteCommand(ctx context.Context, cfg *config.ClientConfig, target str
 		if entry != nil {
 			session.Stage = "connect"
 			session.PoolHit = true
-			stop := context.AfterFunc(ctx, func() { closeUnusedRemote(entry.Conn) })
-			defer stop()
+			interrupted := make(chan struct{})
+			stop := context.AfterFunc(ctx, func() {
+				closeUnusedRemote(entry.Conn)
+				close(interrupted)
+			})
 			start = time.Now()
 			response, exchangeErr := exchangePrepared(ctx, entry, target, udp, session)
 			err = exchangeErr
 			session.ControlDuration = time.Since(start)
-			stop()
+			if !stop() {
+				<-interrupted
+			}
+			if contextErr := ctx.Err(); contextErr != nil {
+				closeUnusedRemote(entry.Conn)
+				return session, contextErr
+			}
 			if err == nil && response == "OK" {
 				session.Conn = entry.Conn
 				session.Reader = entry.Reader
@@ -109,15 +118,30 @@ func openRemoteCommand(ctx context.Context, cfg *config.ClientConfig, target str
 	session.Dial = timings
 	session.Stage = timings.Stage
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return session, contextErr
+		}
 		return session, fmt.Errorf("dial remote: %w", err)
 	}
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		closeUnusedRemote(conn)
+		close(interrupted)
+	})
 	defer func() {
+		// stop does not join a callback already running. Ownership cannot pass
+		// to relay until the cancellation closer has either stopped or exited.
+		if !stop() {
+			<-interrupted
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			err = contextErr
+		}
 		if err != nil {
+			session.Conn, session.Reader = nil, nil
 			closeUnusedRemote(conn)
 		}
 	}()
-	stop := context.AfterFunc(ctx, func() { closeUnusedRemote(conn) })
-	defer stop()
 	session.Stage = "control"
 	if err = conn.SetDeadline(controlDeadline(ctx)); err != nil {
 		return session, err

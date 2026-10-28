@@ -19,6 +19,7 @@ type Packet struct {
 	Data   []byte
 	At     time.Time
 	buffer *buffer
+	flow   *FairFlow // immutable destination identity while a fair packet is owned
 }
 
 // Release relinquishes this packet's ownership. Copies must not be released

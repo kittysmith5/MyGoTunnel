@@ -75,17 +75,27 @@ func prepare(ctx context.Context, cfg *config.ClientConfig, ack bool) (entry *En
 	conn, timings, err := utlsconn.DialWithOptions(dialCtx, cfg.RemoteAddr, cfg.SNI, cfg.CertificateFingerprint, utlsconn.Options{SessionCache: cfg.TLSSessionCache})
 	cancel()
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
 		return nil, err
 	}
-	stop := context.AfterFunc(ctx, func() { closeUnused(conn) })
-	defer stop()
+	interrupted := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		closeUnused(conn)
+		close(interrupted)
+	})
 	defer func() {
+		// A completed READY cannot transfer ownership while a cancellation
+		// callback still owns the right to close this connection.
+		if !stop() {
+			<-interrupted
+		}
+		if contextErr := ctx.Err(); contextErr != nil {
+			err = contextErr
+		}
 		if err != nil {
-			// Cancellation closes the socket to interrupt any setup I/O. That
-			// close can surface before the next protocol read checks ctx.Err.
-			if contextErr := ctx.Err(); contextErr != nil {
-				err = contextErr
-			}
+			entry = nil
 			closeUnused(conn)
 		}
 	}()
@@ -116,8 +126,11 @@ func prepare(ctx context.Context, cfg *config.ClientConfig, ack bool) (entry *En
 	response, err = tunnel.ReadLine(reader)
 	if err != nil {
 		// An old server closes after receiving its unknown PREPARE command.
-		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-			return nil, ctx.Err()
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+		if errors.Is(err, context.Canceled) {
+			return nil, err
 		}
 		var timeout net.Error
 		if errors.As(err, &timeout) && timeout.Timeout() {

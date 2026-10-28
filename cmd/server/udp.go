@@ -314,7 +314,7 @@ func handleUDPTunnelWithDial(tunnelConn net.Conn, reader *bufio.Reader, logger *
 				go func(targetCtx context.Context, target *udpTarget, address string) {
 					defer workers.Done()
 					defer func() { <-targetSlots; resources.ReleaseSocket() }()
-					flow := responses.NewFlow()
+					flow := responses.NewFlowKey(target.key)
 					defer flow.Close()
 					runUDPTarget(targetCtx, target, address, dial, dnsSlots, flow, &uploaded, &downloaded, &droppedResponses, logger, &targetFailures)
 				}(targetCtx, target, address)

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -157,6 +159,144 @@ func TestServeAcceptErrorsAndValidation(t *testing.T) {
 	}
 	if time.Since(start) < 5*time.Millisecond {
 		t.Fatal("temporary accept failure caused tight retry loop")
+	}
+}
+
+// Like a terminated aggregate listener, Close cannot change the saved error
+// returned by Accept. Serve must use its context to stop retrying that error.
+type savedTemporaryListener struct {
+	attempts chan struct{}
+	escape   atomic.Bool
+	closes   atomic.Int32
+}
+
+func (l *savedTemporaryListener) Accept() (net.Conn, error) {
+	if l.escape.Load() {
+		return nil, net.ErrClosed
+	}
+	select {
+	case l.attempts <- struct{}{}:
+	default:
+	}
+	return nil, temporaryError{}
+}
+func (l *savedTemporaryListener) Close() error { l.closes.Add(1); return nil }
+func (*savedTemporaryListener) Addr() net.Addr { return &net.TCPAddr{} }
+
+func TestServeAlreadyCanceledClosesListenerWithoutAccepting(t *testing.T) {
+	listener := &savedTemporaryListener{attempts: make(chan struct{}, 16)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := ServeContext(ctx, 0, listener, 1, 1, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if listener.closes.Load() != 1 || len(listener.attempts) != 0 {
+		t.Fatal("canceled service did not close its listener before returning")
+	}
+}
+
+func TestServeCancellationInterruptsTemporaryAcceptBackoff(t *testing.T) {
+	listener := &savedTemporaryListener{attempts: make(chan struct{}, 16)}
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		finished <- ServeContext(ctx, 0, listener, 1, 1, nil, nil, nil)
+	}()
+	t.Cleanup(func() {
+		listener.escape.Store(true)
+		cancel()
+		select {
+		case <-stopped:
+		case <-time.After(3 * time.Second):
+			t.Error("temporary accept test did not join its serve loop")
+		}
+	})
+	// Eight failures enter a 640ms backoff. Cancellation should return well
+	// before it expires, even if Accept keeps exposing the temporary error.
+	for range 8 {
+		select {
+		case <-listener.attempts:
+		case <-time.After(2 * time.Second):
+			t.Fatal("temporary accept retry did not progress")
+		}
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+		if listener.closes.Load() != 1 {
+			t.Fatal("backoff cancellation returned before listener closure")
+		}
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("cancellation did not interrupt temporary accept backoff")
+	}
+}
+
+type delayedListenerClose struct {
+	acceptStarted, closeStarted chan struct{}
+	allowAccept, allowClose     chan struct{}
+	closeOnce                   sync.Once
+	closes                      atomic.Int32
+}
+
+func (l *delayedListenerClose) Accept() (net.Conn, error) {
+	close(l.acceptStarted)
+	<-l.allowAccept
+	return nil, temporaryError{}
+}
+func (l *delayedListenerClose) Close() error {
+	l.closeOnce.Do(func() { close(l.closeStarted) })
+	<-l.allowClose
+	l.closes.Add(1)
+	return nil
+}
+func (*delayedListenerClose) Addr() net.Addr { return &net.TCPAddr{} }
+
+func TestServeCancellationJoinsStartedListenerClose(t *testing.T) {
+	listener := &delayedListenerClose{
+		acceptStarted: make(chan struct{}), closeStarted: make(chan struct{}),
+		allowAccept: make(chan struct{}), allowClose: make(chan struct{}),
+	}
+	releaseAccept := sync.OnceFunc(func() { close(listener.allowAccept) })
+	releaseClose := sync.OnceFunc(func() { close(listener.allowClose) })
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		finished <- ServeContext(ctx, 0, listener, 1, 1, nil, nil, nil)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		releaseAccept()
+		releaseClose()
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Error("listener close test did not join its serve loop")
+		}
+	})
+	wait(t, listener.acceptStarted)
+	cancel()
+	wait(t, listener.closeStarted)
+	releaseAccept()
+	select {
+	case <-finished:
+		t.Fatal("Serve returned while cancellation was still closing the listener")
+	case <-time.After(20 * time.Millisecond):
+	}
+	releaseClose()
+	select {
+	case err := <-finished:
+		if err != nil || listener.closes.Load() != 1 {
+			t.Fatalf("cancellation close result: %v, closes=%d", err, listener.closes.Load())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not finish after listener Close completed")
 	}
 }
 

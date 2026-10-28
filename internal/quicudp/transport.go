@@ -379,14 +379,15 @@ func (c *Conn) WritePacketQueue(queue interface {
 }, timeout time.Duration) (int, error) {
 	sent := 0
 	err := c.writeSession(func() error {
+		var inFlight datagram.Packet
 		interleave := func() error {
 			small, ok := queue.(interface {
-				TryPopSmall(int) (datagram.Packet, bool)
+				TryPopSmallExcept(int, datagram.Packet) (datagram.Packet, bool)
 			})
 			if !ok || sent >= 32 {
 				return nil
 			}
-			packet, ok := small.TryPopSmall(compactWireSize - 2)
+			packet, ok := small.TryPopSmallExcept(compactWireSize-2, inFlight)
 			if !ok {
 				return nil
 			}
@@ -400,11 +401,13 @@ func (c *Conn) WritePacketQueue(queue interface {
 				return nil
 			}
 			sent++
+			inFlight = packet
 			e := c.SetWriteDeadline(time.Now().Add(timeout))
 			if e == nil {
 				e = c.writePacketLocked(packet.Data, interleave)
 			}
 			packet.Release()
+			inFlight = datagram.Packet{}
 			if e != nil {
 				return e
 			}

@@ -33,6 +33,8 @@ type FairFlow struct {
 	head, tail, packets, bytes, heapIndex int
 	next, prev                            *FairFlow
 	closed                                bool
+	keyed                                 bool
+	key                                   string // immutable, shared by all generations of a destination
 }
 type flowHeap []*FairFlow
 
@@ -70,6 +72,19 @@ func NewFairQueue(packets, bytes int, age time.Duration, resources *Resources) *
 }
 func (q *FairQueue) NewFlow() *FairFlow {
 	return &FairFlow{parent: q, head: -1, tail: -1, heapIndex: -1}
+}
+
+// NewFlowKey identifies a destination across producer/flow replacement. The
+// string must already be owned by the caller; it is retained, never mutated or
+// copied per packet. Anonymous NewFlow producers retain their distinct identity.
+func (q *FairQueue) NewFlowKey(key string) *FairFlow {
+	f := q.NewFlow()
+	f.key, f.keyed = key, true
+	return f
+}
+
+func (f *FairFlow) sameDestination(other *FairFlow) bool {
+	return f == other || other != nil && f.parent == other.parent && f.keyed && other.keyed && f.key == other.key
 }
 func (q *FairQueue) Ready() <-chan struct{}         { return q.ready }
 func (q *FairQueue) ExpiryChanged() <-chan struct{} { return q.expiryChanged }
@@ -160,6 +175,13 @@ func (q *FairQueue) Expire(now time.Time) time.Time {
 	return q.expireAll(now)
 }
 func (f *FairFlow) PushCopy(data []byte) bool {
+	return f.pushCopy(data, nil, false)
+}
+
+// KeyedQueue publishes a new owned key only after payload admission succeeds,
+// under the same lock as enqueue. A dequeuer must never observe its new flow
+// without the stable identity of an older, already in-flight generation.
+func (f *FairFlow) pushCopy(data, key []byte, ownKey bool) bool {
 	q := f.parent
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -196,8 +218,12 @@ func (f *FairFlow) PushCopy(data []byte) bool {
 		q.stats.ResourceDrops++
 		return false
 	}
+	if ownKey {
+		f.key, f.keyed = string(key), true
+	}
 	copy(p.Data, data)
 	p.At = now
+	p.flow = f
 	i := q.free
 	q.free = q.nodes[i].next
 	q.nodes[i] = fairNode{packet: p, next: -1}
@@ -287,10 +313,20 @@ func (q *FairQueue) Stats() Stats {
 	return s
 }
 
-// TryPopSmall selects only a flow's head, never reordering one destination.
-// A QUIC fragment sender uses it between bounded quanta while retaining one
-// large packet. The scan is bounded by packet capacity and adds no metadata.
+// TryPopSmall selects only a flow's queued head. Consumers retaining an in-flight
+// packet must use TryPopSmallExcept to keep its destination from overtaking it.
 func (q *FairQueue) TryPopSmall(maxSize int) (Packet, bool) {
+	return q.tryPopSmall(maxSize, nil)
+}
+
+// TryPopSmallExcept preserves destination order around a retained packet, even
+// if its flow was emptied, reaped, and replaced while it was in flight. Only a
+// flow reference is retained per packet; keys are never copied on dequeue.
+func (q *FairQueue) TryPopSmallExcept(maxSize int, excluded Packet) (Packet, bool) {
+	return q.tryPopSmall(maxSize, excluded.flow)
+}
+
+func (q *FairQueue) tryPopSmall(maxSize int, excluded *FairFlow) (Packet, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	now := time.Now()
@@ -299,7 +335,7 @@ func (q *FairQueue) TryPopSmall(maxSize int) (Packet, bool) {
 	for i := 0; i < remaining && f != nil; i++ {
 		next := f.next
 		q.expireFlow(f, now)
-		if f.packets > 0 && len(q.nodes[f.head].packet.Data) <= maxSize {
+		if f.packets > 0 && !f.sameDestination(excluded) && len(q.nodes[f.head].packet.Data) <= maxSize {
 			p := q.removeHead(f)
 			if f.packets > 0 {
 				q.first = f.next

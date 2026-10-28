@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 // MergeListeners takes ownership of the listeners on success. Each child is
@@ -48,11 +49,27 @@ type mergedListener struct {
 
 func (m *mergedListener) acceptChild(listener net.Listener) {
 	defer m.workers.Done()
+	var delay time.Duration
 	for {
+		select {
+		case <-m.done:
+			return
+		default:
+		}
 		conn, err := listener.Accept()
 		if err != nil {
 			if conn != nil {
 				_ = conn.Close()
+			}
+			var temporary net.Error
+			if errors.As(err, &temporary) && temporary.Temporary() {
+				// Keep transient resource failures local to this child. The
+				// other transport may still be able to accept connections.
+				delay = nextAcceptDelay(delay)
+				if !waitAcceptRetry(m.done, delay) {
+					return
+				}
+				continue
 			}
 			// A child that closes independently is also fatal: otherwise the
 			// merged listener would silently stop serving one transport.
@@ -63,6 +80,7 @@ func (m *mergedListener) acceptChild(listener net.Listener) {
 			m.stop(fmt.Errorf("listener accepted a nil connection"))
 			return
 		}
+		delay = 0
 		select {
 		case m.accepted <- conn:
 		case <-m.done:

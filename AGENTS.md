@@ -324,7 +324,7 @@ UDPHeader 借用报文中的域名切片，不能跨 Packet.Release 保存；有
 
 NewPreparer按pool探测ACK，仅AUTH OK后的纯EOF/ERR可在新连接重试一次legacy，成功旧READY才缓存5分钟；AUTH/BUSY/timeout/cancel/畸形/截断响应不降级。ACK命令发送+读取共2秒，ACK后独立等待目标20秒+1秒回复，夹parent期限；ACK前OK或未知/过长/控制字符响应均协议失败不可回退。父deadline已到即使ctx.Err尚未发布也不可重试。前台总setup38秒，本地SOCKS回复另留5秒；UDP解析共享此总预算。旧未协商连接不施加ACK期限。
 
-预连接 setup 任意阶段被 context 取消而关闭 socket 时，返回 context 根错误，不能把关闭产生的 net.ErrClosed 误归为普通传输错误或协商降级。
+预连接 setup 任意阶段被 context 取消而关闭 socket 时，返回 context 根错误，不能把关闭产生的 net.ErrClosed 误归为普通传输错误或协商降级。TLS前台普通/池命中和后台prepare在成功交接前必须stop并join已启动的AfterFunc回调、检查context；取消时清空失效Conn/Reader/Entry，正常交接后原setup context取消不得关闭业务连接。
 
 目标OK/ERR（含重取setup拒绝、UDP成功）用SendTargetResult独立1秒写期限，不能继承已耗尽控制/旧idle写期限，发送失败要记录；成功进入转发前清除全部期限。客户端AUTH OK/ACK后重新起算目标等待，给回复留余量。ACK发送后服务端不等待客户端确认，认证、指纹、预读Reader、半关闭与转发不变量保留。
 
@@ -367,6 +367,10 @@ SOCKS 凭据 provider 在方法选择和完整读取凭据后的实际比较前�
 客户端KeyedQueue复用FairQueue，payload容量仍256包/原字节年龄/共享预算；目标索引<=256，仅压力时回收空项，不能保留借用域名切片。req_evictions属于full拒绝事件，不重复计数。QUIC batch最多32完整包，每8大包分片允许其他目标队头<=1413字节的完整小包插入；最多一个大包加一个小包在途，发送scratch由同一writeMu保护，每新完整包起算独立write timeout，插入小包不得延长大包期限；部分失败关闭关联，所有Packet归还。无界writer goroutine、扩大队列或修改TLS帧边界均禁止。验证混发时小包先完成、大包完整、同目标顺序、过期/预算/关闭、TCP/QUIC半关闭、错误认证/证书/取消隔离及资源回收。
 
 TCP QUIC健康探测在AUTH后发专用HEALTH，双OK后结束，不拨目标、不制造connect/EOF失败；仅独立TCP QUIC ALPN入口支持，旧TLS wire不变。
+
+QUIC片间插入必须排除当前在途大包所属目标；KeyedQueue索引回收和服务端目标worker重建后仍按稳定目标键排除，匿名flow按引用排除。Packet只增加固定flow引用，键只在新流成功准入后、同一队列锁内复制和发布，失败不保留索引；不能通过延长队列/写期限或扩大payload容量修复。实际QUIC测试需同时覆盖同目标不插队及不同目标的小包优先。
+
+合并监听子Accept的Temporary错误仅在该子worker内按5ms..1s退避，Close可中断，其他入口继续工作；致命错误仍全关并join。ServeContext错误重试和退避必须响应取消，不能永久重试已终止的聚合监听。
 
 ## LA 突发握手与低需求、DNS负缓存
 

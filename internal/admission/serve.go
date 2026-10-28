@@ -86,6 +86,25 @@ func Serve(listener net.Listener, maxSetup int, handler func(net.Conn, func()), 
 
 type Counters struct{ Open, Setup, Rejected atomic.Int64 }
 
+func nextAcceptDelay(delay time.Duration) time.Duration {
+	if delay == 0 {
+		return 5 * time.Millisecond
+	}
+	return min(delay*2, time.Second)
+}
+
+// A closed done channel interrupts resource-pressure backoff immediately.
+func waitAcceptRetry(done <-chan struct{}, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 func ServeWithPermit(listener net.Listener, maxSetup, maxConnections int, handler func(net.Conn, *Permit), onOverload func()) error {
 	return ServeWithMetrics(listener, maxSetup, maxConnections, handler, onOverload, nil)
 }
@@ -108,8 +127,22 @@ func ServeContext(ctx context.Context, grace time.Duration, listener net.Listene
 	var handlers sync.WaitGroup
 	var mu sync.Mutex
 	active := make(map[net.Conn]struct{})
-	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
-	defer stop()
+	listenerClosed := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(listenerClosed)
+		_ = listener.Close()
+	})
+	defer func() {
+		if stop() {
+			// An early cancellation check can beat the scheduled callback.
+			// It still owns listener closure once cancellation was observed.
+			if ctx.Err() != nil {
+				_ = listener.Close()
+			}
+			return
+		}
+		<-listenerClosed
+	}()
 	defer func() {
 		done := make(chan struct{})
 		go func() { handlers.Wait(); close(done) }()
@@ -159,22 +192,23 @@ func ServeContext(ctx context.Context, grace time.Duration, listener net.Listene
 	}
 	var delay time.Duration
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		c, err := listener.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			var temporary net.Error
 			if errors.As(err, &temporary) && temporary.Temporary() {
-				if delay == 0 {
-					delay = 5 * time.Millisecond
-				} else {
-					delay *= 2
+				delay = nextAcceptDelay(delay)
+				if !waitAcceptRetry(ctx.Done(), delay) {
+					return nil
 				}
-				if delay > time.Second {
-					delay = time.Second
-				}
-				time.Sleep(delay)
 				continue
 			}
 			return fmt.Errorf("accept connection: %w", err)
